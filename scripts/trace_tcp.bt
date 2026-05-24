@@ -1,0 +1,35 @@
+#!/usr/bin/env bpftrace
+
+BEGIN { printf("tracing tcp send/recv/skb_copy.\n"); }
+
+kprobe:tcp_sendmsg /comm == "baseline-server"/ { @s[tid] = nsecs; }
+kretprobe:tcp_sendmsg /@s[tid]/
+{
+    @sendmsg_us = hist((nsecs - @s[tid]) / 1000);
+    delete(@s[tid]);
+    @sendmsg_qps = count();
+}
+
+kprobe:tcp_recvmsg /comm == "baseline-server"/ { @r[tid] = nsecs; }
+kretprobe:tcp_recvmsg /@r[tid]/
+{
+    @recvmsg_us = hist((nsecs - @r[tid]) / 1000);
+    delete(@r[tid]);
+    @recvmsg_qps = count();
+}
+
+kprobe:skb_copy_datagram_iter /comm == "baseline-server"/ { @c[tid] = nsecs; }
+kretprobe:skb_copy_datagram_iter /@c[tid]/
+{
+    @skb_copy_us = hist((nsecs - @c[tid]) / 1000);
+    delete(@c[tid]);
+}
+
+interval:s:5
+{
+    printf("send/s=%lld recv/s=%lld\n", @sendmsg_qps, @recvmsg_qps);
+    clear(@sendmsg_qps);
+    clear(@recvmsg_qps);
+}
+
+END { clear(@s); clear(@r); clear(@c); }

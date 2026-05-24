@@ -1,0 +1,31 @@
+#!/usr/bin/env bpftrace
+
+BEGIN { printf("tracing vfs/page-cache/block. Ctrl-C to dump.\n"); }
+
+kprobe:vfs_read /comm == "baseline-server"/ { @vr[tid] = nsecs; }
+kretprobe:vfs_read /@vr[tid]/
+{
+    @vfs_read_us = hist((nsecs - @vr[tid]) / 1000);
+    @vfs_read_bytes = sum(retval > 0 ? retval : 0);
+    delete(@vr[tid]);
+}
+
+kprobe:filemap_get_pages /comm == "baseline-server"/ { @fg[tid] = nsecs; }
+kretprobe:filemap_get_pages /@fg[tid]/
+{
+    @get_pages_us = hist((nsecs - @fg[tid]) / 1000);
+    delete(@fg[tid]);
+}
+
+kprobe:submit_bio /comm == "baseline-server"/
+{
+    @sb[tid] = nsecs;
+    @bio_count = count();
+}
+kretprobe:submit_bio /@sb[tid]/
+{
+    @submit_bio_us = hist((nsecs - @sb[tid]) / 1000);
+    delete(@sb[tid]);
+}
+
+END { clear(@vr); clear(@fg); clear(@sb); }

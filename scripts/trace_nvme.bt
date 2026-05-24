@@ -1,0 +1,17 @@
+#!/usr/bin/env bpftrace
+
+BEGIN { printf("tracing block layer.\n"); }
+
+tracepoint:block:block_rq_issue
+{
+    @issue[args->dev, args->sector] = nsecs;
+    @bytes_dev[args->dev] = sum(args->bytes);
+}
+
+tracepoint:block:block_rq_complete /@issue[args->dev, args->sector]/
+{
+    @bio_lat_us = hist((nsecs - @issue[args->dev, args->sector]) / 1000);
+    delete(@issue[args->dev, args->sector]);
+}
+
+END { clear(@issue); }
