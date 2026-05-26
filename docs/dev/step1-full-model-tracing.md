@@ -1,6 +1,7 @@
 # Step 1: Full Model Weight Tracing with Real CUDA on WSL2
 
 **Date:** 2026-05-26
+**Last Modified:** 2026-05-26
 
 ## Changes Made
 
@@ -26,35 +27,44 @@ $ readelf -d ./target/release/baseline-server | grep RUNPATH
 
 WSL2's `libcuda.so` functions are zero-size stub symbols that trap into the
 kernel via the DXGKRNL driver immediately — they never execute a standard
-function prologue.  bpftrace `--unsafe` attaches the uprobe but the probes
-never fire.  This is a fundamental WSL2 GPU-PV limitation.  CUDA timing data
+function prologue. bpftrace `--unsafe` attaches the uprobe but the probes
+never fire. This is a fundamental WSL2 GPU-PV limitation. CUDA timing data
 comes from Rust's `LoadMetrics` instead.
 
-### 3. Trace Data Collected
+### 3. Trace Data Collected (Updated 2026-05-26)
 
-Two complete trace runs with the full 2.1 GB TinyLlama model:
+Two complete trace runs with the full 2.1 GB TinyLlama model (rerun at 19:18):
 
 | Run | Cache | submit_bio | block I/O | Load Time | Throughput |
 |-----|-------|-----------|-----------|-----------|------------|
-| Cold | dropped | 2,321 | 2,306 | 4,266 ms | 516 MB/s |
-| Warm | hot | 2,209 | 2,270 | 4,166 ms | 528 MB/s |
+| Cold | dropped | 2,313 | 2,500 | 5,101 ms | 431 MB/s |
+| Warm | hot | 2,206 | 2,224 | 4,208 ms | 523 MB/s |
 
-Key finding: WSL2 page cache provides negligible benefit (~2%) for large
-sequential reads due to the storvsc virtual disk layer.  Bare metal is needed
-to measure the true page cache benefit (projected 5-10x warm speedup).
+**Key finding (revised):** WSL2 page cache provides a moderate ~17.5% warm-cache
+speedup on this run — significantly more than the previously observed ~2%.
+The Linux guest page cache retains some pages between runs, and the host-side
+NTFS standby list absorbs the worst physical seeks (97% reduction in 4-8K µs
+block I/O tail). However, benefit is inconsistent (range 2-18% across runs),
+and bare metal is still needed for the true 5-10x warm speedup.
 
-### 4. LoadMetrics Cross-Validation
+### 4. LoadMetrics Cross-Validation (Updated 2026-05-26)
 
 Rust LoadMetrics successfully fills the gap where WSL2 blocks CUDA uprobes:
 
 | Metric | Cold | Warm |
 |--------|------|------|
-| read_ms | 3,460 | 3,369 |
-| parse_ms | 1.09 | 1.02 |
-| alloc_ms | 62.0 | 59.6 |
-| h2d_ms | 490 | 488 |
-| total_ms | 4,266 | 4,166 |
-| throughput_mbps | 516 | 528 |
+| read_ms | 4,124 | 3,548 |
+| parse_ms | 1.17 | 1.08 |
+| alloc_ms | 61.9 | 51.9 |
+| h2d_ms | 666 | 388 |
+| cpu_user_ms | 595 | 367 |
+| cpu_sys_ms | 4,194 | 3,871 |
+| total_ms | 5,101 | 4,208 |
+| throughput_mbps | 431 | 523 |
+
+Notable: h2d_ms dropped 41.7% on the warm run (666 → 388 ms), suggesting GPU-PV
+DMA path has a non-trivial first-run setup cost on WSL2. Multiple warm-up runs
+are needed for stable GPU transfer benchmarking.
 
 ## Usage After This Session
 
@@ -65,13 +75,13 @@ cargo build --release
 # Cold cache trace
 sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
 sudo bpftrace --unsafe scripts/trace_all.bt \
-  -c "timeout 10 ./target/release/baseline-server \
+  -c "timeout 15 ./target/release/baseline-server \
       --model-path /home/vitalrubbish/models/tinyllama \
       --model-type tinyllama --loader read"
 
 # Warm cache trace (immediately after cold)
 sudo bpftrace --unsafe scripts/trace_all.bt \
-  -c "timeout 10 ./target/release/baseline-server \
+  -c "timeout 15 ./target/release/baseline-server \
       --model-path /home/vitalrubbish/models/tinyllama \
       --model-type tinyllama --loader read"
 ```
