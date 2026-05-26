@@ -1,31 +1,138 @@
 #!/usr/bin/env bpftrace
+/*
+ * trace_vfs.bt — Trace the full VFS → page-cache → block I/O path
+ * for the baseline-server process during model weight loading.
+ *
+ * Usage: sudo bpftrace scripts/trace_vfs.bt -c "./target/release/baseline-server --model-path <path> --loader read"
+ *    or: sudo bpftrace scripts/trace_vfs.bt -p <pid>
+ *
+ * Traces: vfs_read, filemap_get_pages, submit_bio, block_rq_issue, block_rq_complete
+ *
+ * Works on both real Linux (NVMe) and WSL2 (Hyper-V storvsc).
+ * WSL2 note: the virtual disk path goes through storvsc rather than nvme.ko,
+ * so the block layer tracepoints (block_rq_issue/complete) are the portable interface.
+ */
 
-BEGIN { printf("tracing vfs/page-cache/block. Ctrl-C to dump.\n"); }
-
-kprobe:vfs_read /comm == "baseline-server"/ { @vr[tid] = nsecs; }
-kretprobe:vfs_read /@vr[tid]/
+BEGIN
 {
-    @vfs_read_us = hist((nsecs - @vr[tid]) / 1000);
-    @vfs_read_bytes = sum(retval > 0 ? retval : 0);
-    delete(@vr[tid]);
+    printf("=== tracing VFS → page-cache → block I/O path ===\n");
+    printf("%-10s %-28s %12s %12s\n", "EVENT", "FUNCTION", "LAT_US", "BYTES/SECT");
 }
 
-kprobe:filemap_get_pages /comm == "baseline-server"/ { @fg[tid] = nsecs; }
-kretprobe:filemap_get_pages /@fg[tid]/
+/* ── VFS layer ──────────────────────────────────────────────────── */
+kprobe:vfs_read /comm == "baseline-server"/
 {
-    @get_pages_us = hist((nsecs - @fg[tid]) / 1000);
-    delete(@fg[tid]);
+    @vr_start[tid] = nsecs;
+    @vr_bytes[tid] = arg2;
 }
 
+kretprobe:vfs_read /@vr_start[tid] != 0/
+{
+    $dur_us = (nsecs - @vr_start[tid]) / 1000;
+    @vfs_read_lat = hist($dur_us);
+    @vfs_total_bytes = sum((int64)@vr_bytes[tid]);
+    @vfs_count = count();
+    if ($dur_us > 1000) {
+        printf("%-10s %-28s %12d %12d\n", "READ", "vfs_read", $dur_us, @vr_bytes[tid]);
+    }
+    delete(@vr_start[tid]);
+    delete(@vr_bytes[tid]);
+}
+
+/* ── Page cache layer ────────────────────────────────────────────── */
+kprobe:filemap_get_pages /comm == "baseline-server"/
+{
+    @fgp_start[tid] = nsecs;
+}
+
+kretprobe:filemap_get_pages /@fgp_start[tid] != 0/
+{
+    $dur_us = (nsecs - @fgp_start[tid]) / 1000;
+    @filemap_get_pages_lat = hist($dur_us);
+    @fgp_count = count();
+    delete(@fgp_start[tid]);
+}
+
+/* ── Page cache allocation (cold reads) ─────────────────────────── */
+kprobe:add_to_page_cache_lru /comm == "baseline-server"/
+{
+    @page_cache_alloc = count();
+}
+
+kprobe:mark_page_accessed /comm == "baseline-server"/
+{
+    @page_accessed = count();
+}
+
+/* ── Block I/O layer ─────────────────────────────────────────────── */
 kprobe:submit_bio /comm == "baseline-server"/
 {
-    @sb[tid] = nsecs;
+    @sb_start[tid] = nsecs;
     @bio_count = count();
 }
-kretprobe:submit_bio /@sb[tid]/
+
+kretprobe:submit_bio /@sb_start[tid] != 0/
 {
-    @submit_bio_us = hist((nsecs - @sb[tid]) / 1000);
-    delete(@sb[tid]);
+    $dur_us = (nsecs - @sb_start[tid]) / 1000;
+    @submit_bio_lat = hist($dur_us);
+    delete(@sb_start[tid]);
 }
 
-END { clear(@vr); clear(@fg); clear(@sb); }
+/* ── Generic block layer tracepoints (portable across drivers) ──── */
+tracepoint:block:block_rq_issue
+{
+    @issue_ts[args->dev, args->sector] = nsecs;
+    @bytes_per_dev[args->dev] = sum(args->bytes);
+    @rq_issue_count = count();
+}
+
+tracepoint:block:block_rq_complete
+/@issue_ts[args->dev, args->sector] != 0/
+{
+    $dur_us = (nsecs - @issue_ts[args->dev, args->sector]) / 1000;
+    @block_io_lat = hist($dur_us);
+    delete(@issue_ts[args->dev, args->sector]);
+    @rq_complete_count = count();
+}
+
+/* ── Periodic status (every second) ──────────────────────────────── */
+interval:s:1
+{
+    printf("[%ds] bio submitted: %lld, completed: %lld, vfs_reads: %lld\n",
+        elapsed / 1000000000, @rq_issue_count, @rq_complete_count, @vfs_count);
+}
+
+/* ── Final report ───────────────────────────────────────────────── */
+END
+{
+    clear(@vr_start); clear(@vr_bytes);
+    clear(@fgp_start);
+    clear(@sb_start);
+    clear(@issue_ts);
+
+    printf("\n========== SUMMARY ==========\n");
+    printf("vfs_read calls        : %lld\n", @vfs_count);
+    printf("total bytes read      : %lld (%.2f GB)\n",
+        @vfs_total_bytes, @vfs_total_bytes / 1073741824.0);
+    printf("filemap_get_pages calls: %lld\n", @fgp_count);
+    printf("page_cache_alloc (new): %lld\n", @page_cache_alloc);
+    printf("page_accessed         : %lld\n", @page_accessed);
+    printf("submit_bio calls      : %lld\n", @bio_count);
+    printf("block_rq_issue        : %lld\n", @rq_issue_count);
+    printf("block_rq_complete     : %lld\n", @rq_complete_count);
+
+    printf("\n=== vfs_read latency (us) ===\n");
+    print(@vfs_read_lat);
+
+    printf("\n=== filemap_get_pages latency (us) ===\n");
+    print(@filemap_get_pages_lat);
+
+    printf("\n=== submit_bio latency (us) ===\n");
+    print(@submit_bio_lat);
+
+    printf("\n=== block I/O latency (us): issue→complete ===\n");
+    print(@block_io_lat);
+
+    printf("\n=== bytes per block device ===\n");
+    print(@bytes_per_dev);
+}

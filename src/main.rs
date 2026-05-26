@@ -29,6 +29,9 @@ struct Cli {
 
     #[arg(long, default_value_t = 0)]
     device: usize,
+
+    #[arg(long, default_value = "llama7b")]
+    model_type: String,
 }
 
 #[tokio::main]
@@ -42,13 +45,18 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let ctx = Arc::new(CudaContext::new(cli.device)?);
-    let cfg = ModelConfig::llama_7b_like();
+    let cfg = match cli.model_type.as_str() {
+        "tinyllama" => ModelConfig::tiny_llama(),
+        _ => ModelConfig::llama_7b_like(),
+    };
 
     let kind = LoaderKind::parse(&cli.loader)?;
     let weights = if cli.model_path.to_string_lossy() == "dummy" {
         ModelWeights::empty(&cfg)
     } else {
-        ModelLoader::new(&ctx, &cfg, kind).load(&cli.model_path)?
+        let (w, metrics) = ModelLoader::new(&ctx, &cfg, kind).load(&cli.model_path)?;
+        metrics.log();
+        w
     };
     tracing::info!(bytes = weights.total_bytes(), "weights ready");
 

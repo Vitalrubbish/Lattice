@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use cudarc::driver::sys::{cuMemcpyDtoDAsync_v2, CUdeviceptr};
+use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{CudaSlice, DevicePtr};
 use half::f16;
 use parking_lot::Mutex;
@@ -115,11 +115,11 @@ impl KvCache {
             let src = src_base + (src_off * eb) as u64;
 
             unsafe {
-                let r = cuMemcpyDtoDAsync_v2(dk, src, nbytes, std::ptr::null_mut());
+                let r = cudarc::driver::sys::lib().cuMemcpyDtoDAsync_v2(dk, src, nbytes, std::ptr::null_mut());
                 if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                     return Err(anyhow!("cuMemcpyDtoDAsync K: {:?}", r));
                 }
-                let r = cuMemcpyDtoDAsync_v2(dv, src, nbytes, std::ptr::null_mut());
+                let r = cudarc::driver::sys::lib().cuMemcpyDtoDAsync_v2(dv, src, nbytes, std::ptr::null_mut());
                 if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                     return Err(anyhow!("cuMemcpyDtoDAsync V: {:?}", r));
                 }

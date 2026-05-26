@@ -5,11 +5,13 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
 bytemuck = "1.16"
 clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
-cudarc = { version = "0.11", features = ["std", "cuda-12020", "cublas", "driver", "runtime", "f16"] }
+cudarc = { version = "0.11", features = ["std", "cuda-12020", "cublas", "driver", "f16"] }
 half = { version = "2.4", features = ["bytemuck"] }
+memmap2 = "0.9"
 parking_lot = "0.12"
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +19,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+gds = []
 
 [[bin]]
 name = "baseline-server"

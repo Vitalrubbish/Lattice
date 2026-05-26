@@ -1,4 +1,4 @@
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DeviceSlice};
 use std::collections::HashMap;
 
 use crate::config::ModelConfig;

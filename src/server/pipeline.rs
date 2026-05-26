@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bytemuck::cast_slice;
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DeviceSlice};
 use half::f16;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

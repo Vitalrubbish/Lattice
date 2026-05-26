@@ -45,6 +45,20 @@ impl ModelConfig {
             torch_dtype: "float16".to_string(),
         }
     }
+
+    pub fn tiny_llama() -> Self {
+        Self {
+            hidden_size: 2048,
+            intermediate_size: 5632,
+            num_hidden_layers: 22,
+            num_attention_heads: 32,
+            num_key_value_heads: Some(4),
+            vocab_size: 32000,
+            max_position_embeddings: 2048,
+            rope_theta: 10000.0,
+            torch_dtype: "bfloat16".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

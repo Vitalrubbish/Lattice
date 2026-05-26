@@ -1,0 +1,250 @@
+#!/usr/bin/env bpftrace
+/*
+ * trace_all.bt — Master trace script that includes the VFS, page-cache,
+ * and CUDA memcpy probes all in one invocation. Use this for a complete
+ * picture of the model loading I/O path.
+ *
+ * Usage:
+ *   # Cold cache measurement:
+ *   sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+ *   sudo bpftrace scripts/trace_all.bt -c "./target/release/baseline-server --model-path <dir> --loader read"
+ *
+ *   # Warm cache measurement (just run a second time):
+ *   sudo bpftrace scripts/trace_all.bt -c "./target/release/baseline-server --model-path <dir> --loader read"
+ *
+ *   # Attach to already-running process:
+ *   sudo bpftrace scripts/trace_all.bt -p $(pgrep baseline-server)
+ *
+ *   # Trace with mmap loader:
+ *   sudo bpftrace scripts/trace_all.bt -c "./target/release/baseline-server --model-path <dir> --loader mmap"
+ *
+ * Individual scripts are also available for targeted tracing:
+ *   trace_vfs.bt          — VFS + page-cache + block layer
+ *   trace_page_cache.bt   — page cache hit/miss/readahead analysis
+ *   trace_cuda_memcpy.bt  — CUDA driver API calls
+ */
+
+
+BEGIN
+{
+    printf("=========================================================\n");
+    printf("===  LLM Model Weight Loading — Full I/O Path Trace  ===\n");
+    printf("=========================================================\n");
+    printf("Start: %s\n", strftime("%H:%M:%S", nsecs));
+    printf("Attaching: VFS + page-cache + block + CUDA driver\n");
+    printf("---------------------------------------------------------\n");
+}
+
+/* =================================================================
+ *  SECTION 1: VFS → Page Cache → Block Layer
+ *  (same probes as trace_vfs.bt)
+ * ================================================================= */
+
+/* ── VFS layer ──────────────────────────────────────────────────── */
+kprobe:vfs_read /comm == "baseline-server"/
+{
+    @vr_start[tid] = nsecs;
+    @vr_bytes[tid] = arg2;
+}
+
+kretprobe:vfs_read /@vr_start[tid] != 0/
+{
+    $dur_us = (nsecs - @vr_start[tid]) / 1000;
+    @vfs_read_lat = hist($dur_us);
+    @vfs_total_bytes = sum((int64)@vr_bytes[tid]);
+    @vfs_count = count();
+    delete(@vr_start[tid]);
+    delete(@vr_bytes[tid]);
+}
+
+/* ── Page cache ─────────────────────────────────────────────────── */
+kprobe:filemap_get_pages /comm == "baseline-server"/
+{
+    @fgp_start[tid] = nsecs;
+}
+
+kretprobe:filemap_get_pages /@fgp_start[tid] != 0/
+{
+    $dur_us = (nsecs - @fgp_start[tid]) / 1000;
+    @filemap_get_pages_lat = hist($dur_us);
+    @fgp_count = count();
+    delete(@fgp_start[tid]);
+}
+
+kprobe:add_to_page_cache_lru /comm == "baseline-server"/
+{
+    @page_cache_alloc = count();
+}
+
+kprobe:page_cache_ra_order /comm == "baseline-server"/
+{
+    @readahead_calls = count();
+}
+
+/* ── Block layer ────────────────────────────────────────────────── */
+kprobe:submit_bio /comm == "baseline-server"/
+{
+    @sb_start[tid] = nsecs;
+    @bio_count = count();
+}
+
+kretprobe:submit_bio /@sb_start[tid] != 0/
+{
+    $dur_us = (nsecs - @sb_start[tid]) / 1000;
+    @submit_bio_lat = hist($dur_us);
+    delete(@sb_start[tid]);
+}
+
+tracepoint:block:block_rq_issue
+{
+    @issue_ts[args->dev, args->sector] = nsecs;
+    @bytes_per_dev[args->dev] = sum(args->bytes);
+    @rq_issue_count = count();
+}
+
+tracepoint:block:block_rq_complete
+/@issue_ts[args->dev, args->sector] != 0/
+{
+    $dur_us = (nsecs - @issue_ts[args->dev, args->sector]) / 1000;
+    @block_io_lat = hist($dur_us);
+    delete(@issue_ts[args->dev, args->sector]);
+    @rq_complete_count = count();
+}
+
+/* =================================================================
+ *  SECTION 2: CUDA Driver API
+ *  (same probes as trace_cuda_memcpy.bt)
+ * ================================================================= */
+
+/* ── cuMemcpyHtoD ───────────────────────────────────────────────── */
+uprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyHtoD_v2
+{
+    @h2d_start[tid] = nsecs;
+    @h2d_bytes[tid] = arg2;
+}
+
+uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyHtoD_v2 /@h2d_start[tid] != 0/
+{
+    $dur_us = (nsecs - @h2d_start[tid]) / 1000;
+    @h2d_lat = hist($dur_us);
+    @h2d_total_bytes = sum((int64)@h2d_bytes[tid]);
+    @h2d_count = count();
+    delete(@h2d_start[tid]);
+    delete(@h2d_bytes[tid]);
+}
+
+/* ── cuMemcpyDtoH ───────────────────────────────────────────────── */
+uprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyDtoH_v2
+{
+    @d2h_start[tid] = nsecs;
+    @d2h_bytes[tid] = arg2;
+}
+
+uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyDtoH_v2 /@d2h_start[tid] != 0/
+{
+    $dur_us = (nsecs - @d2h_start[tid]) / 1000;
+    @d2h_lat = hist($dur_us);
+    @d2h_total_bytes = sum((int64)@d2h_bytes[tid]);
+    @d2h_count = count();
+    delete(@d2h_start[tid]);
+    delete(@d2h_bytes[tid]);
+}
+
+/* ── cuMemAlloc ─────────────────────────────────────────────────── */
+uprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemAlloc_v2
+{
+    @alloc_start[tid] = nsecs;
+    @alloc_bytes[tid] = arg1;
+}
+
+uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemAlloc_v2 /@alloc_start[tid] != 0/
+{
+    $dur_us = (nsecs - @alloc_start[tid]) / 1000;
+    @alloc_lat = hist($dur_us);
+    @alloc_total_bytes = sum((int64)@alloc_bytes[tid]);
+    @alloc_count = count();
+    delete(@alloc_start[tid]);
+    delete(@alloc_bytes[tid]);
+}
+
+/* =================================================================
+ *  Periodic status
+ * ================================================================= */
+interval:s:1
+{
+    $elapsed = elapsed / 1000000000;
+    printf("[%llds] ", $elapsed);
+    printf("vfs="); print(@vfs_count);
+    printf(" bio="); print(@bio_count);
+    printf(" blk-iss="); print(@rq_issue_count);
+    printf(" blk-done="); print(@rq_complete_count);
+    printf(" h2d="); print(@h2d_count);
+    printf(" d2h="); print(@d2h_count);
+    printf(" alloc="); print(@alloc_count);
+    printf(" pg-new="); print(@page_cache_alloc);
+    printf("\n");
+}
+
+/* =================================================================
+ *  Final Report
+ * ================================================================= */
+END
+{
+    clear(@vr_start); clear(@vr_bytes);
+    clear(@fgp_start); clear(@sb_start);
+    clear(@issue_ts);
+    clear(@h2d_start); clear(@h2d_bytes);
+    clear(@d2h_start); clear(@d2h_bytes);
+    clear(@alloc_start); clear(@alloc_bytes);
+
+    printf("\n");
+    printf("=========================================================\n");
+    printf("===                 FINAL REPORT                       ===\n");
+    printf("=========================================================\n");
+
+    printf("\n-- Linux I/O Stack (counts) --\n");
+    printf("vfs_read calls:    "); print(@vfs_count);
+    printf("vfs_read bytes:    "); print(@vfs_total_bytes);
+    printf("filemap_get_pages: "); print(@fgp_count);
+    printf("page_cache_alloc:  "); print(@page_cache_alloc);
+    printf("readahead calls:   "); print(@readahead_calls);
+    printf("submit_bio calls:  "); print(@bio_count);
+    printf("block_rq_issue:    "); print(@rq_issue_count);
+    printf("block_rq_complete: "); print(@rq_complete_count);
+
+    printf("\n-- CUDA Driver (counts) --\n");
+    printf("cuMemAlloc_v2:     "); print(@alloc_count);
+    printf("cuMemAlloc bytes:  "); print(@alloc_total_bytes);
+    printf("cuMemcpyHtoD_v2:   "); print(@h2d_count);
+    printf("cuMemcpyHtoD bytes:"); print(@h2d_total_bytes);
+    printf("cuMemcpyDtoH_v2:   "); print(@d2h_count);
+    printf("cuMemcpyDtoH bytes:"); print(@d2h_total_bytes);
+
+    printf("\n-- Latency Histograms (us) --\n");
+
+    printf("\nvfs_read:\n");
+    print(@vfs_read_lat);
+
+    printf("\nfilemap_get_pages:\n");
+    print(@filemap_get_pages_lat);
+
+    printf("\nsubmit_bio:\n");
+    print(@submit_bio_lat);
+
+    printf("\nblock I/O (issue->complete):\n");
+    print(@block_io_lat);
+
+    printf("\ncuMemAlloc_v2:\n");
+    print(@alloc_lat);
+
+    printf("\ncuMemcpyHtoD_v2:\n");
+    print(@h2d_lat);
+
+    printf("\ncuMemcpyDtoH_v2:\n");
+    print(@d2h_lat);
+
+    printf("\n-- bytes per block device --\n");
+    print(@bytes_per_dev);
+
+    printf("\n========== END ==========\n");
+}

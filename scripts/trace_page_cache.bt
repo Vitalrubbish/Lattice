@@ -1,0 +1,149 @@
+#!/usr/bin/env bpftrace
+/*
+ * trace_page_cache.bt — Analyse page cache hit/miss behaviour
+ * during model weight loading.
+ *
+ * Usage: sudo bpftrace scripts/trace_page_cache.bt -c "./target/release/baseline-server --model-path <path> --loader read"
+ *
+ * Answers: "does the page cache help or hurt during model loading?"
+ *
+ * Key metrics:
+ *   - Page cache allocations (miss → read from disk)
+ *   - Page cache hits (filemap_get_pages with minimal bio count)
+ *   - Read-ahead pages brought in
+ *   - Page eviction activity (if memory pressure)
+ *
+ * For a comparison of cold vs warm cache:
+ *   cold: sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches; bpftrace scripts/trace_page_cache.bt -c "<cmd>"'
+ *   warm: sudo bpftrace scripts/trace_page_cache.bt -c "<cmd>"  (second run, no drop_caches)
+ */
+
+BEGIN
+{
+    printf("=== tracing page cache activity ===\n");
+    printf("run: %s\n", strftime("%H:%M:%S", nsecs));
+    printf("%-10s %-32s %12s\n", "EVENT", "FUNCTION", "DETAIL");
+}
+
+/* ── Page faults: major (I/O) vs minor (cache hit) ──────────────── */
+/* Major fault: disk I/O required */
+kprobe:do_fault /comm == "baseline-server"/
+{
+    @major_faults = count();
+    @mf_tid[tid] = nsecs;
+}
+
+kretprobe:do_fault /@mf_tid[tid] != 0/
+{
+    $dur_us = (nsecs - @mf_tid[tid]) / 1000;
+    @major_fault_lat = hist($dur_us);
+    delete(@mf_tid[tid]);
+}
+
+/* ── Page cache insertion (new pages from disk) ─────────────────── */
+kprobe:add_to_page_cache_lru /comm == "baseline-server"/
+{
+    @pages_added_to_cache = count();
+}
+
+/* ── Page cache lookup ───────────────────────────────────────────── */
+kprobe:find_get_page /comm == "baseline-server"/
+{
+    @find_get_page_calls = count();
+}
+
+/* ── Read-ahead activity ─────────────────────────────────────────── */
+kprobe:page_cache_sync_readahead /comm == "baseline-server"/
+{
+    $nr = arg1;  /* number of pages requested */
+    @readahead_calls = count();
+    @readahead_pages = sum((int64)$nr);
+    printf("%-10s %-32s %12d pages\n", "RA", "page_cache_sync_readahead", $nr);
+}
+
+kprobe:page_cache_async_readahead /comm == "baseline-server"/
+{
+    $nr = arg1;
+    @async_readahead_calls = count();
+    @async_readahead_pages = sum((int64)$nr);
+    printf("%-10s %-32s %12d pages\n", "RA-ASYNC", "page_cache_async_readahead", $nr);
+}
+
+/* ── Page dirty/writeback (should NOT happen during pure read) ──── */
+kprobe:mark_buffer_dirty /comm == "baseline-server"/
+{
+    @dirty_pages = count();
+    printf("%-10s %-32s\n", "WARN", "mark_buffer_dirty (unexpected during load)");
+}
+
+/* ── Direct reclaim / eviction under pressure ───────────────────── */
+kprobe:shrink_page_list /comm == "baseline-server"/
+{
+    @pages_evicted = count();
+    printf("%-10s %-32s (memory pressure!)\n", "EVICT", "shrink_page_list");
+}
+
+/* ── Periodic status ─────────────────────────────────────────────── */
+interval:s:2
+{
+    printf("[%ds] major-faults=%lld pages-in=%lld find=%lld ra=%lld evict=%lld\n",
+        elapsed / 1000000000,
+        @major_faults, @pages_added_to_cache,
+        @find_get_page_calls, @readahead_pages, @pages_evicted);
+}
+
+/* ── Final report ───────────────────────────────────────────────── */
+END
+{
+    clear(@mf_tid);
+
+    printf("\n========== PAGE CACHE SUMMARY ==========\n");
+
+    printf("\n--- Page Faults ---\n");
+    printf("major faults (disk I/O):  %lld\n", @major_faults);
+    print(@major_fault_lat);
+
+    printf("\n--- Page Cache Operations ---\n");
+    printf("pages added to cache:      %lld (%.2f MB)\n",
+        @pages_added_to_cache,
+        @pages_added_to_cache * 4096.0 / 1048576.0);
+    printf("find_get_page lookups:     %lld\n", @find_get_page_calls);
+
+    printf("\n--- Read-Ahead ---\n");
+    printf("sync readahead calls:      %lld\n", @readahead_calls);
+    printf("sync readahead pages:      %lld (%.2f MB)\n",
+        @readahead_pages,
+        @readahead_pages * 4096.0 / 1048576.0);
+    printf("async readahead calls:     %lld\n", @async_readahead_calls);
+    printf("async readahead pages:     %lld (%.2f MB)\n",
+        @async_readahead_pages,
+        @async_readahead_pages * 4096.0 / 1048576.0);
+
+    printf("\n--- Pressure indicators ---\n");
+    printf("dirty pages (unexpected):  %lld\n", @dirty_pages);
+    printf("pages evicted (pressure):  %lld\n", @pages_evicted);
+
+    $total_io_pages = @pages_added_to_cache;
+    $total_ra_pages = @readahead_pages + @async_readahead_pages;
+
+    if ($total_io_pages > 0) {
+        $ratio = $total_ra_pages * 100 / $total_io_pages;
+        printf("\n--- Analysis ---\n");
+        printf("readahead / io pages ratio: %lld%%\n", $ratio);
+        printf("Interpretation: ");
+        if ($ratio > 150) {
+            printf("high readahead — sequential read detected, extra pages prefetched\n");
+        } else if ($ratio > 80) {
+            printf("moderate readahead — good sequential detection\n");
+        } else {
+            printf("low readahead — may be random I/O or small reads\n");
+        }
+    }
+    if (@pages_evicted > 0) {
+        printf("WARNING: %lld pages evicted — model data displaced other cache entries\n",
+            @pages_evicted);
+    }
+    if (@major_faults > 0 && @pages_added_to_cache == @major_faults * 4) {
+        printf("NOTE: all page faults were major → cold cache (first load)\n");
+    }
+}
