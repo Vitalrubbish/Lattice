@@ -1,0 +1,403 @@
+Attaching 19 probes...
+=========================================================
+===  LLM Model Weight Loading — Full I/O Path Trace  ===
+=========================================================
+Start: 17:28:28
+Attaching: VFS + page-cache + block + CUDA driver
+---------------------------------------------------------
+[1s] vfs=@vfs_count: 63
+ bio=@bio_count: 476
+ blk-iss=@rq_issue_count: 427
+ blk-done=@rq_complete_count: 427
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[2s] vfs=@vfs_count: 63
+ bio=@bio_count: 981
+ blk-iss=@rq_issue_count: 937
+ blk-done=@rq_complete_count: 936
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[3s] vfs=@vfs_count: 63
+ bio=@bio_count: 1489
+ blk-iss=@rq_issue_count: 1445
+ blk-done=@rq_complete_count: 1445
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[2m2026-05-27T09:28:32.166109Z[0m [32m INFO[0m [2mbaseline_llm_os::model::loader[0m[2m:[0m shard read [3mfile[0m[2m=[0m"/home/vitalrubbish/models/tinyllama/model.safetensors" [3mn[0m[2m=[0m2200119864 [3mread_ms[0m[2m=[0m3185.6193
+[4s] vfs=@vfs_count: 66
+ bio=@bio_count: 1754
+ blk-iss=@rq_issue_count: 1714
+ blk-done=@rq_complete_count: 1712
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[2m2026-05-27T09:28:32.938366Z[0m [32m INFO[0m [2mbaseline_llm_os::model::loader[0m[2m:[0m load metrics [3mloader[0m[2m=[0mread [3mtotal_ms[0m[2m=[0m3961.257483 [3mread_ms[0m[2m=[0m3185.6193 [3mparse_ms[0m[2m=[0m1.185831 [3malloc_ms[0m[2m=[0m51.52810000000001 [3mh2d_ms[0m[2m=[0m489.19644600000004 [3mcpu_user_ms[0m[2m=[0m462.097 [3mcpu_sys_ms[0m[2m=[0m3298.416 [3mtotal_bytes[0m[2m=[0m2200119864 [3mthroughput_mbps[0m[2m=[0m555.4094560734718
+[2m2026-05-27T09:28:32.938429Z[0m [32m INFO[0m [2mbaseline_llm_os::model::loader[0m[2m:[0m load metrics [3mloader[0m[2m=[0mread [3mtotal_ms[0m[2m=[0m3961.257483 [3mread_ms[0m[2m=[0m3185.6193 [3mparse_ms[0m[2m=[0m1.185831 [3malloc_ms[0m[2m=[0m51.52810000000001 [3mh2d_ms[0m[2m=[0m489.19644600000004 [3mcpu_user_ms[0m[2m=[0m462.097 [3mcpu_sys_ms[0m[2m=[0m3298.416 [3mtotal_bytes[0m[2m=[0m2200119864 [3mthroughput_mbps[0m[2m=[0m555.4094560734718
+[2m2026-05-27T09:28:32.938438Z[0m [32m INFO[0m [2mbaseline_server[0m[2m:[0m weights ready [3mbytes[0m[2m=[0m2200096768
+Error: Address already in use (os error 98)
+[5s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2054
+ blk-done=@rq_complete_count: 2052
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[6s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2054
+ blk-done=@rq_complete_count: 2052
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[7s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2054
+ blk-done=@rq_complete_count: 2052
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[8s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2054
+ blk-done=@rq_complete_count: 2052
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[9s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2399
+ blk-done=@rq_complete_count: 2377
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[10s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2399
+ blk-done=@rq_complete_count: 2377
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[11s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2399
+ blk-done=@rq_complete_count: 2377
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[12s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2399
+ blk-done=@rq_complete_count: 2377
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[13s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2399
+ blk-done=@rq_complete_count: 2377
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[14s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2410
+ blk-done=@rq_complete_count: 2388
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[15s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2418
+ blk-done=@rq_complete_count: 2394
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[16s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2418
+ blk-done=@rq_complete_count: 2394
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[17s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2418
+ blk-done=@rq_complete_count: 2394
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[18s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2418
+ blk-done=@rq_complete_count: 2394
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[19s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2418
+ blk-done=@rq_complete_count: 2394
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+[20s] vfs=@vfs_count: 71
+ bio=@bio_count: 2242
+ blk-iss=@rq_issue_count: 2439
+ blk-done=@rq_complete_count: 2413
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 0
+
+
+=========================================================
+===                 FINAL REPORT                       ===
+=========================================================
+
+-- Linux I/O Stack (counts) --
+vfs_read calls:    @vfs_count: 71
+vfs_read bytes:    @vfs_total_bytes: 2262685410
+filemap_get_pages: @fgp_count: 36943
+page_cache_alloc:  @page_cache_alloc: 0
+readahead calls:   @readahead_calls: 2086
+submit_bio calls:  @bio_count: 2242
+block_rq_issue:    @rq_issue_count: 2439
+block_rq_complete: @rq_complete_count: 2413
+
+-- CUDA Driver (counts) --
+cuMemAlloc_v2:     @alloc_count: 0
+cuMemAlloc bytes:  
+cuMemcpyHtoD_v2:   @h2d_count: 0
+cuMemcpyHtoD bytes:
+cuMemcpyDtoH_v2:   @d2h_count: 0
+cuMemcpyDtoH bytes:
+
+-- Latency Histograms (us) --
+
+vfs_read:
+@vfs_read_lat: 
+[1]                    4 |@@@@@@                                              |
+[2, 4)                 9 |@@@@@@@@@@@@@@@                                     |
+[4, 8)                31 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[8, 16)                7 |@@@@@@@@@@@                                         |
+[16, 32)               2 |@@@                                                 |
+[32, 64)               0 |                                                    |
+[64, 128)              5 |@@@@@@@@                                            |
+[128, 256)             4 |@@@@@@                                              |
+[256, 512)             4 |@@@@@@                                              |
+[512, 1K)              1 |@                                                   |
+[1K, 2K)               1 |@                                                   |
+[2K, 4K)               0 |                                                    |
+[4K, 8K)               0 |                                                    |
+[8K, 16K)              0 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             1 |@                                                   |
+[64K, 128K)            1 |@                                                   |
+[128K, 256K)           0 |                                                    |
+[256K, 512K)           0 |                                                    |
+[512K, 1M)             0 |                                                    |
+[1M, 2M)               0 |                                                    |
+[2M, 4M)               1 |@                                                   |
+
+
+filemap_get_pages:
+@filemap_get_pages_lat: 
+[0]                 9154 |@@@@@@@@@@@@@@@@@@                                  |
+[1]                25421 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[2, 4)               571 |@                                                   |
+[4, 8)                70 |                                                    |
+[8, 16)               37 |                                                    |
+[16, 32)               7 |                                                    |
+[32, 64)               1 |                                                    |
+[64, 128)              0 |                                                    |
+[128, 256)             2 |                                                    |
+[256, 512)           375 |                                                    |
+[512, 1K)           1279 |@@                                                  |
+[1K, 2K)              20 |                                                    |
+[2K, 4K)               1 |                                                    |
+[4K, 8K)               1 |                                                    |
+[8K, 16K)              1 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             1 |                                                    |
+[64K, 128K)            2 |                                                    |
+
+
+submit_bio:
+@submit_bio_lat: 
+[0]                  156 |@@@@                                                |
+[1]                   68 |@                                                   |
+[2, 4)              1878 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[4, 8)               104 |@@                                                  |
+[8, 16)               21 |                                                    |
+[16, 32)              14 |                                                    |
+[32, 64)               1 |                                                    |
+
+
+block I/O (issue->complete):
+@block_io_lat: 
+[32, 64)               2 |                                                    |
+[64, 128)             25 |                                                    |
+[128, 256)           260 |@@@@@@@@@                                           |
+[256, 512)           371 |@@@@@@@@@@@@@                                       |
+[512, 1K)           1457 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[1K, 2K)             276 |@@@@@@@@@                                           |
+[2K, 4K)               3 |                                                    |
+[4K, 8K)              12 |                                                    |
+[8K, 16K)              1 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             2 |                                                    |
+[64K, 128K)            4 |                                                    |
+
+
+cuMemAlloc_v2:
+
+
+cuMemcpyHtoD_v2:
+
+
+cuMemcpyDtoH_v2:
+
+
+-- bytes per block device --
+@bytes_per_dev[8388656]: 2390601728
+
+========== END ==========
+
+
+
+@alloc_count: 0
+
+
+
+@bio_count: 2242
+@block_io_lat: 
+[32, 64)               2 |                                                    |
+[64, 128)             25 |                                                    |
+[128, 256)           260 |@@@@@@@@@                                           |
+[256, 512)           371 |@@@@@@@@@@@@@                                       |
+[512, 1K)           1457 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[1K, 2K)             276 |@@@@@@@@@                                           |
+[2K, 4K)               3 |                                                    |
+[4K, 8K)              12 |                                                    |
+[8K, 16K)              1 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             2 |                                                    |
+[64K, 128K)            4 |                                                    |
+
+@bytes_per_dev[8388656]: 2390601728
+
+@d2h_count: 0
+
+
+
+@fgp_count: 36943
+
+@filemap_get_pages_lat: 
+[0]                 9154 |@@@@@@@@@@@@@@@@@@                                  |
+[1]                25421 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[2, 4)               571 |@                                                   |
+[4, 8)                70 |                                                    |
+[8, 16)               37 |                                                    |
+[16, 32)               7 |                                                    |
+[32, 64)               1 |                                                    |
+[64, 128)              0 |                                                    |
+[128, 256)             2 |                                                    |
+[256, 512)           375 |                                                    |
+[512, 1K)           1279 |@@                                                  |
+[1K, 2K)              20 |                                                    |
+[2K, 4K)               1 |                                                    |
+[4K, 8K)               1 |                                                    |
+[8K, 16K)              1 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             1 |                                                    |
+[64K, 128K)            2 |                                                    |
+
+
+@h2d_count: 0
+
+
+
+
+@page_cache_alloc: 0
+@readahead_calls: 2086
+@rq_complete_count: 2413
+@rq_issue_count: 2439
+
+@submit_bio_lat: 
+[0]                  156 |@@@@                                                |
+[1]                   68 |@                                                   |
+[2, 4)              1878 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[4, 8)               104 |@@                                                  |
+[8, 16)               21 |                                                    |
+[16, 32)              14 |                                                    |
+[32, 64)               1 |                                                    |
+
+@vfs_count: 71
+@vfs_read_lat: 
+[1]                    4 |@@@@@@                                              |
+[2, 4)                 9 |@@@@@@@@@@@@@@@                                     |
+[4, 8)                31 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[8, 16)                7 |@@@@@@@@@@@                                         |
+[16, 32)               2 |@@@                                                 |
+[32, 64)               0 |                                                    |
+[64, 128)              5 |@@@@@@@@                                            |
+[128, 256)             4 |@@@@@@                                              |
+[256, 512)             4 |@@@@@@                                              |
+[512, 1K)              1 |@                                                   |
+[1K, 2K)               1 |@                                                   |
+[2K, 4K)               0 |                                                    |
+[4K, 8K)               0 |                                                    |
+[8K, 16K)              0 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             1 |@                                                   |
+[64K, 128K)            1 |@                                                   |
+[128K, 256K)           0 |                                                    |
+[256K, 512K)           0 |                                                    |
+[512K, 1M)             0 |                                                    |
+[1M, 2M)               0 |                                                    |
+[2M, 4M)               1 |@                                                   |
+
+@vfs_total_bytes: 2262685410
+
+

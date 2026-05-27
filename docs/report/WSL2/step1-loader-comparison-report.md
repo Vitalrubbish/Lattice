@@ -95,23 +95,47 @@ Warm-cache benefit  yes                   yes (strongest)         no
 
 ## 4. How to Run This Test
 
-### 4.1 Build
+### 4.1 Quick Run (Automated)
+
+```bash
+cd /mnt/d/os/llm-rust-ebpf
+bash scripts/step1_test_wsl2.sh
+```
+
+This runs cold trace, warm trace, and loader comparison in one shot. Output goes to `results/wsl2/<timestamp>/`.
+
+To run only the loader comparison:
+
+```bash
+MODEL_PATH=/home/vitalrubbish/models/tinyllama SUDO_PASS="<password>" \
+  sudo -E ./target/release/examples/bench_loaders
+```
+
+### 4.2 Manual Build
 
 ```bash
 cargo build --release --example bench_loaders
 ```
 
-### 4.2 Run
+### 4.3 Run
 
-The benchmark drops the kernel page cache between methods (cold runs), so it needs the sudo password via the `SUDO_PASS` env var:
+The benchmark drops the kernel page cache between methods (cold runs), so it needs the sudo password. The `MODEL_PATH` env var sets the model location (defaults to `./models/tinyllama`):
 
 ```bash
-SUDO_PASS="yourpassword" cargo run --release --example bench_loaders
+MODEL_PATH=/home/vitalrubbish/models/tinyllama SUDO_PASS="<password>" \
+  sudo -E ./target/release/examples/bench_loaders
+```
+
+If sudo requires a terminal, pipe the password via stdin:
+
+```bash
+echo "<password>" | sudo -S env MODEL_PATH=/home/vitalrubbish/models/tinyllama \
+  SUDO_PASS="<password>" ./target/release/examples/bench_loaders
 ```
 
 If sudo is not available or you want to skip cache drop, set `SUDO_PASS=""` — the benchmark will still run but cold/warm distinction will blur.
 
-### 4.3 What it does
+### 4.4 What it does
 
 1. For each loader (`read`, `mmap`, `direct`):
    - Drops page cache (`echo 3 > /proc/sys/vm/drop_caches`)
@@ -126,11 +150,12 @@ If sudo is not available or you want to skip cache drop, set `SUDO_PASS=""` — 
    - `cpu_user_ms` / `cpu_sys_ms` — per-thread CPU time from `getrusage`
    - `throughput` — total bytes / total time in MB/s
 
-### 4.4 Model path
+### 4.5 Model path
 
-The default model path is `/home/vitalrubbish/models/tinyllama/model.safetensors`. Edit `MODEL_PATH` in `examples/bench_loaders.rs` to test a different model.
+Set the `MODEL_PATH` env var to point to a safetensors file or directory. Default is `./models/tinyllama`. The path accepts both single `.safetensors` files and directories containing sharded `.safetensors` files.
 
-### 4.5 Troubleshooting
+### 4.6 Troubleshooting
 
-- **CUDA_ERROR_NO_DEVICE on WSL2:** The binary needs `rpath` to `/usr/lib/wsl/lib`. The `build.rs` handles this.
+- **CUDA_ERROR_NO_DEVICE on WSL2:** The binary needs `rpath` to `/usr/lib/wsl/lib`. The `build.rs` handles this automatically.
 - **sudo prompt hangs:** Make sure `SUDO_PASS` is set correctly or the user has passwordless sudo for `sh -c "sync && echo 3 > /proc/sys/vm/drop_caches"`.
+- **MODEL_PATH not found:** Verify the path exists and contains `.safetensors` files. The loader accepts both single files and directories.

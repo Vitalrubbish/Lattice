@@ -22,6 +22,11 @@
  *   trace_vfs.bt          — VFS + page-cache + block layer
  *   trace_page_cache.bt   — page cache hit/miss/readahead analysis
  *   trace_cuda_memcpy.bt  — CUDA driver API calls
+ *
+ * CUDA uprobe path: /usr/lib/wsl/lib/libcuda.so.1.1 (WSL2 default)
+ * Bare metal:        /usr/lib/x86_64-linux-gnu/libcuda.so.1
+ * Override for bare metal:
+ *   sed -i 's|/usr/lib/wsl/lib/libcuda.so.1.1|/usr/lib/x86_64-linux-gnu/libcuda.so.1|g' scripts/trace_all.bt
  */
 
 

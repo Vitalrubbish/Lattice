@@ -5,7 +5,7 @@
 
 LOADER="${1:-read}"
 MODEL_TYPE="${2:-tinyllama}"
-MODEL_PATH="${3:-/home/vitalrubbish/models/tinyllama}"
+MODEL_PATH="${3:-${MODEL_PATH:-./models/tinyllama}}"
 
 ./target/release/baseline-server \
     --model-path "$MODEL_PATH" \

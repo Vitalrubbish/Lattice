@@ -11,34 +11,26 @@
  *   - cuMemcpyDtoH_v2: device → host (result retrieval)
  *   - cuMemAlloc_v2: GPU memory allocation timing
  *
- * NOTE: The libcuda.so path is auto-detected via the running process's
- * memory maps. If bpftrace can't resolve the uprobe automatically, set
- * the CUDA_LIB environment variable to the full path.
- *
- * WSL2 typical: /usr/lib/wsl/lib/libcuda.so.1.1
- * Native typical: /usr/local/cuda/lib64/libcuda.so or
- *                 /usr/lib/x86_64-linux-gnu/libcuda.so.1
+ * CUDA uprobe path: /usr/lib/wsl/lib/libcuda.so.1.1 (WSL2 default)
+ * Bare metal:        /usr/lib/x86_64-linux-gnu/libcuda.so.1
+ * Override for bare metal:
+ *   sed -i 's|/usr/lib/wsl/lib/libcuda.so.1.1|/usr/lib/x86_64-linux-gnu/libcuda.so.1|g' scripts/trace_cuda_memcpy.bt
  */
-
-#ifndef CUDA_LIB
-#define CUDA_LIB /usr/lib/wsl/lib/libcuda.so.1.1
-#endif
 
 BEGIN
 {
     printf("=== tracing CUDA driver API calls ===\n");
-    printf("libcuda path: %s\n", str(CUDA_LIB));
     printf("%-10s %-30s %12s %12s\n", "CALL", "FUNCTION", "LAT_US", "BYTES");
 }
 
 /* ── cuMemcpyHtoD: host → device ────────────────────────────────── */
-uprobe:CUDA_LIB:cuMemcpyHtoD_v2
+uprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyHtoD_v2
 {
     @h2d_start[tid] = nsecs;
     @h2d_bytes[tid] = arg2;          // ByteCount parameter
 }
 
-uretprobe:CUDA_LIB:cuMemcpyHtoD_v2 /@h2d_start[tid] != 0/
+uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyHtoD_v2 /@h2d_start[tid] != 0/
 {
     $dur_us = (nsecs - @h2d_start[tid]) / 1000;
     @h2d_lat = hist($dur_us);
@@ -53,13 +45,13 @@ uretprobe:CUDA_LIB:cuMemcpyHtoD_v2 /@h2d_start[tid] != 0/
 }
 
 /* ── cuMemcpyDtoH: device → host ────────────────────────────────── */
-uprobe:CUDA_LIB:cuMemcpyDtoH_v2
+uprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyDtoH_v2
 {
     @d2h_start[tid] = nsecs;
     @d2h_bytes[tid] = arg2;
 }
 
-uretprobe:CUDA_LIB:cuMemcpyDtoH_v2 /@d2h_start[tid] != 0/
+uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyDtoH_v2 /@d2h_start[tid] != 0/
 {
     $dur_us = (nsecs - @d2h_start[tid]) / 1000;
     @d2h_lat = hist($dur_us);
@@ -74,13 +66,13 @@ uretprobe:CUDA_LIB:cuMemcpyDtoH_v2 /@d2h_start[tid] != 0/
 }
 
 /* ── cuMemAlloc: GPU memory allocation ──────────────────────────── */
-uprobe:CUDA_LIB:cuMemAlloc_v2
+uprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemAlloc_v2
 {
     @alloc_start[tid] = nsecs;
     @alloc_bytes[tid] = arg1;         // bytesize parameter
 }
 
-uretprobe:CUDA_LIB:cuMemAlloc_v2 /@alloc_start[tid] != 0/
+uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemAlloc_v2 /@alloc_start[tid] != 0/
 {
     $dur_us = (nsecs - @alloc_start[tid]) / 1000;
     @alloc_lat = hist($dur_us);

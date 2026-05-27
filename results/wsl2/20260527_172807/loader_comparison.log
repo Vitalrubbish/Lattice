@@ -1,0 +1,50 @@
+
+=== read(2) ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=3880ms read=3169ms parse=1ms alloc=55ms h2d=425ms cpu_user=367ms cpu_sys=3262ms bytes=2200119864 throughput=567 MB/s
+  run 2/3:
+  [cold] total=2081ms read=1411ms parse=0ms alloc=34ms h2d=413ms cpu_user=379ms cpu_sys=1583ms bytes=2200119864 throughput=1057 MB/s
+  run 3/3:
+  [cold] total=1953ms read=1244ms parse=0ms alloc=36ms h2d=410ms cpu_user=350ms cpu_sys=1488ms bytes=2200119864 throughput=1126 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=1799ms read=1160ms parse=0ms alloc=33ms h2d=387ms cpu_user=367ms cpu_sys=1377ms bytes=2200119864 throughput=1223 MB/s
+  run 2/3:
+  [warm] total=1745ms read=1112ms parse=0ms alloc=32ms h2d=383ms cpu_user=357ms cpu_sys=1365ms bytes=2200119864 throughput=1261 MB/s
+  run 3/3:
+  [warm] total=1833ms read=1163ms parse=0ms alloc=30ms h2d=417ms cpu_user=391ms cpu_sys=1426ms bytes=2200119864 throughput=1200 MB/s
+
+=== mmap(2) ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=3800ms read=0ms parse=1ms alloc=40ms h2d=3671ms cpu_user=209ms cpu_sys=1494ms bytes=2200119864 throughput=579 MB/s
+  run 2/3:
+  [cold] total=778ms read=0ms parse=0ms alloc=30ms h2d=447ms cpu_user=275ms cpu_sys=551ms bytes=2200119864 throughput=2828 MB/s
+  run 3/3:
+  [cold] total=505ms read=0ms parse=0ms alloc=28ms h2d=396ms cpu_user=281ms cpu_sys=249ms bytes=2200119864 throughput=4357 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=522ms read=0ms parse=0ms alloc=29ms h2d=406ms cpu_user=279ms cpu_sys=269ms bytes=2200119864 throughput=4219 MB/s
+  run 2/3:
+  [warm] total=613ms read=0ms parse=0ms alloc=27ms h2d=487ms cpu_user=317ms cpu_sys=336ms bytes=2200119864 throughput=3587 MB/s
+  run 3/3:
+  [warm] total=900ms read=0ms parse=0ms alloc=25ms h2d=793ms cpu_user=617ms cpu_sys=346ms bytes=2200119864 throughput=2444 MB/s
+
+=== O_DIRECT ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=3085ms read=2432ms parse=0ms alloc=32ms h2d=389ms cpu_user=391ms cpu_sys=1287ms bytes=2200119864 throughput=713 MB/s
+  run 2/3:
+  [cold] total=3186ms read=2521ms parse=0ms alloc=32ms h2d=409ms cpu_user=374ms cpu_sys=1457ms bytes=2200119864 throughput=691 MB/s
+  run 3/3:
+  [cold] total=2978ms read=2338ms parse=0ms alloc=32ms h2d=391ms cpu_user=378ms cpu_sys=1233ms bytes=2200119864 throughput=739 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=2913ms read=2271ms parse=0ms alloc=34ms h2d=389ms cpu_user=353ms cpu_sys=1207ms bytes=2200119864 throughput=755 MB/s
+  run 2/3:
+  [warm] total=2975ms read=2342ms parse=0ms alloc=31ms h2d=377ms cpu_user=406ms cpu_sys=1225ms bytes=2200119864 throughput=740 MB/s
+  run 3/3:
+  [warm] total=3016ms read=2362ms parse=0ms alloc=33ms h2d=394ms cpu_user=421ms cpu_sys=1208ms bytes=2200119864 throughput=730 MB/s
+
+Done.

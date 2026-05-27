@@ -549,60 +549,59 @@ On bare metal with direct PCIe peer-to-peer, H→D throughput should reach
 - Rust toolchain (stable)
 - `bpftrace` installed (`sudo apt install bpftrace`)
 
-### 10.2 Build
+### 10.2 Quick Run (Automated)
+
+```bash
+cd /mnt/d/os/llm-rust-ebpf
+bash scripts/step1_test_wsl2.sh
+```
+
+This runs the cold trace, warm trace, and loader comparison in one shot. Output goes to `results/wsl2/<timestamp>/`.
+
+To override the model path or sudo password:
+
+```bash
+MODEL_PATH=/path/to/model SUDO_PASS="mypass" bash scripts/step1_test_wsl2.sh
+```
+
+### 10.3 Manual Run
+
+#### 10.3.1 Build
 
 ```bash
 cd /mnt/d/os/llm-rust-ebpf
 cargo build --release
 ```
 
-The `build.rs` automatically sets `-Wl,-rpath,/usr/lib/wsl/lib` so the binary
+The `build.rs` automatically detects WSL2 and sets `-Wl,-rpath,/usr/lib/wsl/lib` so the binary
 links against the WSL2 GPU-PV `libcuda.so` instead of the 535 stub.
 
-### 10.3 Cold Cache Run
+#### 10.3.2 Cold Cache Run
 
 ```bash
 # 1. Drop the Linux guest page cache
 echo <sudo-password> | sudo -S sh -c 'echo 3 > /proc/sys/vm/drop_caches'
 
-# 2. Run bpftrace with the baseline-server as the traced child process
+# 2. Run bpftrace with baseline-server as the traced child
 echo <sudo-password> | sudo -S bpftrace --unsafe scripts/trace_all.bt \
-  -c "timeout 15 ./target/release/baseline-server \
-      --model-path /home/vitalrubbish/models/tinyllama \
-      --model-type tinyllama --loader read"
+  -c "timeout 20 bash scripts/load_and_exit.sh read tinyllama /home/vitalrubbish/models/tinyllama"
 ```
 
 The `--unsafe` flag is needed on WSL2 for the `libcuda.so` uprobes (even though
 they won't fire — bpftrace still requires it for zero-size symbol attachment).
-`timeout 15` ensures the server process exits after loading so the bpftrace
+The `load_and_exit.sh` wrapper ensures the server process exits after loading so the bpftrace
 `END` block fires and prints the final report.
 
-### 10.4 Warm Cache Run
+#### 10.3.3 Warm Cache Run
 
 Immediately after the cold run completes (do not drop caches):
 
 ```bash
 echo <sudo-password> | sudo -S bpftrace --unsafe scripts/trace_all.bt \
-  -c "timeout 15 ./target/release/baseline-server \
-      --model-path /home/vitalrubbish/models/tinyllama \
-      --model-type tinyllama --loader read"
+  -c "timeout 20 bash scripts/load_and_exit.sh read tinyllama /home/vitalrubbish/models/tinyllama"
 ```
 
-### 10.5 Standalone LoadMetrics (No bpftrace)
-
-To collect Rust-side `LoadMetrics` without bpftrace overhead, use the
-`bench_loaders` example:
-
-```bash
-cargo build --release --example bench_loaders
-SUDO_PASS=<sudo-password> sudo -E ./target/release/examples/bench_loaders
-```
-
-This runs 3 cold + 3 warm iterations for each loader method (read, mmap, direct)
-and prints per-run `LoadMetrics` including `total_ms`, `read_ms`, `h2d_ms`, and
-computed throughput.
-
-### 10.6 Output Interpretation
+### 10.4 Output Interpretation
 
 | Output Source | Key Metrics | Location |
 |---------------|-------------|----------|

@@ -7,7 +7,12 @@ use baseline_llm_os::config::ModelConfig;
 use baseline_llm_os::cuda::CudaContext;
 use baseline_llm_os::model::{LoaderKind, ModelLoader};
 
-const MODEL_PATH: &str = "/home/vitalrubbish/models/tinyllama/model.safetensors";
+fn model_path() -> String {
+    std::env::var("MODEL_PATH").unwrap_or_else(|_| {
+        eprintln!("MODEL_PATH env var not set, defaulting to ./models/tinyllama");
+        "./models/tinyllama".to_string()
+    })
+}
 const RUNS_PER_METHOD: usize = 3;
 
 fn drop_caches() {
@@ -39,7 +44,7 @@ fn run_one(kind: LoaderKind, label: &str) -> Result<()> {
     let cfg = ModelConfig::tiny_llama();
     let t0 = Instant::now();
     let (_weights, metrics) = ModelLoader::new(&ctx, &cfg, kind)
-        .load(MODEL_PATH)
+        .load(&model_path())
         .with_context(|| format!("load with {}", kind.as_str()))?;
     let wall = t0.elapsed().as_secs_f64() * 1e3;
 
