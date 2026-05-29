@@ -178,3 +178,175 @@ impl StaticScheduler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::cache::KvCache;
+    use crate::config::ModelConfig;
+    use crate::cuda::CudaContext;
+    use crate::model::{ModelWeights, NaiveTransformer};
+
+    /// Small non-GQA config for fast integration tests.
+    /// kv_heads == num_attention_heads so KvCache.append_step assertion passes.
+    fn small_config() -> ModelConfig {
+        ModelConfig {
+            hidden_size: 512,
+            intermediate_size: 2048,
+            num_hidden_layers: 4,
+            num_attention_heads: 8,
+            num_key_value_heads: Some(8),
+            vocab_size: 1000,
+            max_position_embeddings: 256,
+            rope_theta: 10000.0,
+            torch_dtype: "float16".to_string(),
+        }
+    }
+
+    #[test]
+    fn e2e_single_request_lifecycle() {
+        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+        let cfg = small_config();
+        let max_batch = 4;
+        let max_seq_len = 64;
+
+        let weights = ModelWeights::empty(&cfg);
+        let model = Arc::new(
+            NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights).expect("model"),
+        );
+
+        let cache = KvCache::new(ctx.clone(), cfg.clone(), max_batch, max_seq_len).expect("cache");
+        let queue = Arc::new(InferenceQueue::new());
+
+        let sched = StaticScheduler::new(
+            cfg.clone(),
+            ctx.clone(),
+            model,
+            cache,
+            max_batch,
+            max_seq_len,
+            queue.clone(),
+        );
+        let _h = sched.spawn();
+
+        // With zero weights, greedy_sample always picks token 0.
+        // Use eos_token_id != 0 so decode doesn't terminate immediately.
+        let req = InferenceRequest {
+            id: 42,
+            prompt_tokens: vec![1, 2, 3, 4, 5],
+            max_new_tokens: 5,
+            eos_token_id: 2,
+        };
+
+        let resp = queue.submit_blocking(req).expect("response");
+
+        assert_eq!(resp.id, 42);
+        assert_eq!(resp.generated_tokens.len(), 5, "should generate max_new_tokens");
+        assert!(
+            resp.generated_tokens.iter().all(|&t| t == 0),
+            "zero weights produce token 0, got {:?}",
+            resp.generated_tokens
+        );
+        assert!(resp.prefill_ms >= 0.0, "prefill_ms should be non-negative");
+        assert!(resp.decode_ms >= 0.0, "decode_ms should be non-negative");
+    }
+
+    #[test]
+    fn e2e_batch_two_requests() {
+        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+        let cfg = small_config();
+        let max_batch = 4;
+        let max_seq_len = 64;
+
+        let weights = ModelWeights::empty(&cfg);
+        let model = Arc::new(
+            NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights).expect("model"),
+        );
+
+        let cache = KvCache::new(ctx.clone(), cfg.clone(), max_batch, max_seq_len).expect("cache");
+        let queue = Arc::new(InferenceQueue::new());
+
+        let sched = StaticScheduler::new(
+            cfg.clone(),
+            ctx.clone(),
+            model,
+            cache,
+            max_batch,
+            max_seq_len,
+            queue.clone(),
+        );
+        let _h = sched.spawn();
+
+        // Submit two requests. The scheduler batches them together.
+        let req1 = InferenceRequest {
+            id: 1,
+            prompt_tokens: vec![10, 20],
+            max_new_tokens: 3,
+            eos_token_id: 2,
+        };
+        let req2 = InferenceRequest {
+            id: 2,
+            prompt_tokens: vec![30, 40, 50],
+            max_new_tokens: 4,
+            eos_token_id: 2,
+        };
+
+        // Submit both before the scheduler wakes up, so they batch.
+        let queue1 = queue.clone();
+        let queue2 = queue.clone();
+        let h1 = std::thread::spawn(move || queue1.submit_blocking(req1));
+        let h2 = std::thread::spawn(move || queue2.submit_blocking(req2));
+
+        let r1 = h1.join().unwrap().expect("resp1");
+        let r2 = h2.join().unwrap().expect("resp2");
+
+        assert_eq!(r1.id, 1);
+        assert_eq!(r1.generated_tokens.len(), 3);
+        assert!(r1.generated_tokens.iter().all(|&t| t == 0));
+
+        assert_eq!(r2.id, 2);
+        assert_eq!(r2.generated_tokens.len(), 4);
+        assert!(r2.generated_tokens.iter().all(|&t| t == 0));
+    }
+
+    #[test]
+    fn e2e_eos_termination() {
+        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+        let cfg = small_config();
+        let max_batch = 4;
+        let max_seq_len = 64;
+
+        let weights = ModelWeights::empty(&cfg);
+        let model = Arc::new(
+            NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights).expect("model"),
+        );
+
+        let cache = KvCache::new(ctx.clone(), cfg.clone(), max_batch, max_seq_len).expect("cache");
+        let queue = Arc::new(InferenceQueue::new());
+
+        let sched = StaticScheduler::new(
+            cfg.clone(),
+            ctx.clone(),
+            model,
+            cache,
+            max_batch,
+            max_seq_len,
+            queue.clone(),
+        );
+        let _h = sched.spawn();
+
+        // With zero weights, token 0 is always generated.
+        // Set eos_token_id=0 to verify early termination works.
+        let req = InferenceRequest {
+            id: 99,
+            prompt_tokens: vec![7, 8, 9],
+            max_new_tokens: 100,
+            eos_token_id: 0, // matches the zero-weight output, so stops after 1 token
+        };
+
+        let resp = queue.submit_blocking(req).expect("response");
+        assert_eq!(resp.id, 99);
+        assert_eq!(resp.generated_tokens.len(), 1, "should stop at EOS token 0");
+        assert_eq!(resp.generated_tokens[0], 0);
+    }
+}

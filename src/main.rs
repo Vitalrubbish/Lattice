@@ -3,7 +3,8 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use baseline_llm_os::batch::{InferenceQueue, StaticScheduler};
+use baseline_llm_os::batch::{ContinuousScheduler, InferenceQueue, StaticScheduler};
+use baseline_llm_os::cache::paged_kv::PagedKvCache;
 use baseline_llm_os::cache::KvCache;
 use baseline_llm_os::config::ModelConfig;
 use baseline_llm_os::cuda::CudaContext;
@@ -32,6 +33,10 @@ struct Cli {
 
     #[arg(long, default_value = "llama7b")]
     model_type: String,
+
+    /// Use continuous batching with paged KV cache (CUDA VMM).
+    #[arg(long)]
+    continuous: bool,
 }
 
 #[tokio::main]
@@ -61,19 +66,39 @@ async fn main() -> Result<()> {
     tracing::info!(bytes = weights.total_bytes(), "weights ready");
 
     let model = Arc::new(NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights)?);
-    let cache = KvCache::new(ctx.clone(), cfg.clone(), cli.max_batch, cli.max_seq_len)?;
-
     let queue = Arc::new(InferenceQueue::new());
-    let sched = StaticScheduler::new(
-        cfg.clone(),
-        ctx.clone(),
-        model.clone(),
-        cache,
-        cli.max_batch,
-        cli.max_seq_len,
-        queue.clone(),
-    );
-    let _h = sched.spawn();
+
+    if cli.continuous {
+        let cache = PagedKvCache::new(
+            ctx.clone(),
+            cfg.clone(),
+            cli.max_batch,
+            cli.max_seq_len,
+            16, // BLOCK_SIZE
+        )?;
+        let sched = ContinuousScheduler::new(
+            cfg.clone(),
+            ctx.clone(),
+            model.clone(),
+            cache,
+            cli.max_batch,
+            cli.max_seq_len,
+            queue.clone(),
+        );
+        let _h = sched.spawn();
+    } else {
+        let cache = KvCache::new(ctx.clone(), cfg.clone(), cli.max_batch, cli.max_seq_len)?;
+        let sched = StaticScheduler::new(
+            cfg.clone(),
+            ctx.clone(),
+            model.clone(),
+            cache,
+            cli.max_batch,
+            cli.max_seq_len,
+            queue.clone(),
+        );
+        let _h = sched.spawn();
+    }
 
     serve_http(&cli.listen, queue).await?;
     Ok(())
