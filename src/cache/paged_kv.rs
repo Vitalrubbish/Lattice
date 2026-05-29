@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 use super::cuda_vmm::CudaVmm;
+use super::swap::current_epoch;
 use crate::config::ModelConfig;
 use crate::cuda::CudaContext;
 
@@ -29,7 +30,7 @@ pub struct BlockHandle {
 }
 
 pub struct PhysicalBlockAllocator {
-    block_bytes: usize,
+    pub block_bytes: usize,
     pub blocks_per_superblock: usize,
     free_blocks: Mutex<Vec<BlockHandle>>,
     /// Number of superblocks allocated.
@@ -164,6 +165,9 @@ pub struct PagedKvCache {
     /// Per-sequence metadata.
     seq_metadata: Mutex<Vec<SeqMetadata>>,
 
+    /// Per-sequence last-access epoch (LRU tracking).
+    seq_last_epoch: Mutex<Vec<u64>>,
+
     /// Precomputed sizes.
     pub elem_per_block: usize,
     pub block_bytes: usize,
@@ -211,6 +215,7 @@ impl PagedKvCache {
             block_info: Mutex::new(Vec::new()),
             free_block_indices: Mutex::new(Vec::new()),
             seq_metadata: Mutex::new(Vec::new()),
+            seq_last_epoch: Mutex::new(Vec::new()),
             elem_per_block,
             block_bytes,
             max_blocks_total,
@@ -238,6 +243,53 @@ impl PagedKvCache {
         });
 
         Ok(va_base)
+    }
+
+    /// Allocate a single block. Returns the block index.
+    /// Used during decode when a sequence needs to grow its block table.
+    pub fn alloc_block(&self) -> Result<u32> {
+        let (handle, new_phys) = self.block_allocator.allocate(&self.vmm)?;
+
+        if let Some(phys_handle) = new_phys {
+            self.map_superblock(phys_handle, handle.superblock_idx as usize)?;
+        }
+
+        let sb = &self.superblocks.lock()[handle.superblock_idx as usize];
+        let va_offset = sb.va_base + handle.block_index as usize * self.block_bytes;
+
+        let block_idx = {
+            let mut free = self.free_block_indices.lock();
+            if let Some(idx) = free.pop() {
+                let mut info = self.block_info.lock();
+                info[idx as usize] = BlockInfo {
+                    va_offset,
+                    superblock_idx: handle.superblock_idx,
+                    block_index_in_sb: handle.block_index,
+                    in_use: true,
+                };
+                idx
+            } else {
+                let mut info = self.block_info.lock();
+                let idx = info.len() as u32;
+                info.push(BlockInfo {
+                    va_offset,
+                    superblock_idx: handle.superblock_idx,
+                    block_index_in_sb: handle.block_index,
+                    in_use: true,
+                });
+                idx
+            }
+        };
+
+        Ok(block_idx)
+    }
+
+    /// Append a block to an existing sequence's block table.
+    pub fn append_block_to_sequence(&self, seq_idx: usize, block_idx: u32) {
+        let mut meta = self.seq_metadata.lock();
+        if seq_idx < meta.len() {
+            meta[seq_idx].block_table.push(block_idx);
+        }
     }
 
     /// Allocate `num_blocks` for a new sequence. Returns the block table.
@@ -311,11 +363,13 @@ impl PagedKvCache {
     /// Register a new sequence with its block table. Returns the sequence index.
     pub fn register_sequence(&self, block_table: Vec<u32>) -> usize {
         let mut meta = self.seq_metadata.lock();
+        let mut epoch = self.seq_last_epoch.lock();
         let idx = meta.len();
         meta.push(SeqMetadata {
             block_table,
             seq_len: 0,
         });
+        epoch.push(current_epoch());
         idx
     }
 
@@ -337,6 +391,72 @@ impl PagedKvCache {
         if seq_idx < meta.len() {
             meta[seq_idx].seq_len = len;
         }
+    }
+
+    /// Record that the sequence was accessed at the current epoch.
+    /// Used for LRU victim selection.
+    pub fn record_epoch(&self, seq_idx: usize) {
+        let mut epoch = self.seq_last_epoch.lock();
+        if seq_idx < epoch.len() {
+            epoch[seq_idx] = current_epoch();
+        }
+    }
+
+    /// Get the epoch when this sequence was last accessed.
+    /// Lower value = older = better victim candidate.
+    pub fn get_seq_epoch(&self, seq_idx: usize) -> Option<u64> {
+        let epoch = self.seq_last_epoch.lock();
+        if seq_idx < epoch.len() {
+            Some(epoch[seq_idx])
+        } else {
+            None
+        }
+    }
+
+    /// Get the block table for a given sequence index.
+    pub fn get_block_table(&self, seq_idx: usize) -> Option<Vec<u32>> {
+        let meta = self.seq_metadata.lock();
+        if seq_idx < meta.len() {
+            Some(meta[seq_idx].block_table.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Get the VA offset for a given block index.
+    pub fn get_block_va_offset(&self, block_idx: u32) -> Option<usize> {
+        let info = self.block_info.lock();
+        let bi = info.get(block_idx as usize)?;
+        if bi.in_use {
+            Some(bi.va_offset)
+        } else {
+            None
+        }
+    }
+
+    /// Get the K-cache virtual address base for a given layer.
+    pub fn va_k(&self, layer: usize) -> u64 {
+        self.va_k[layer]
+    }
+
+    /// Get the V-cache virtual address base for a given layer.
+    pub fn va_v(&self, layer: usize) -> u64 {
+        self.va_v[layer]
+    }
+
+    /// Get the sequence length.
+    pub fn get_seq_len(&self, seq_idx: usize) -> usize {
+        let meta = self.seq_metadata.lock();
+        if seq_idx < meta.len() {
+            meta[seq_idx].seq_len
+        } else {
+            0
+        }
+    }
+
+    /// Number of active (registered) sequences.
+    pub fn active_sequences(&self) -> usize {
+        self.seq_metadata.lock().len()
     }
 
     pub fn block_allocator(&self) -> &Arc<PhysicalBlockAllocator> {

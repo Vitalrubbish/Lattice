@@ -6,12 +6,16 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::cache::paged_kv::{PagedKvCache, BLOCK_SIZE};
+use crate::cache::{EvictedSeqData, SwapManager, advance_epoch};
 use crate::config::ModelConfig;
 use crate::cuda::CudaContext;
 use crate::decoder::greedy_sample;
 use crate::model::NaiveTransformer;
 
 use super::static_batch::{InferenceQueue, InferenceRequest, InferenceResponse};
+
+/// Maximum number of sequences allowed in the swapped queue.
+const MAX_SWAPPED_SEQS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestState {
@@ -29,8 +33,21 @@ struct RunningRequest {
     position: usize,
     /// Index into PagedKvCache.seq_metadata.
     seq_idx: usize,
+    /// Number of KV blocks allocated for this sequence.
+    num_blocks: usize,
     /// Generated token ids.
     generated: Vec<u32>,
+}
+
+/// A sequence that has been evicted to host memory and awaits restoration.
+struct SwappedRequest {
+    request: InferenceRequest,
+    tx: Sender<InferenceResponse>,
+    generated: Vec<u32>,
+    state: RequestState,
+    position: usize,
+    num_blocks: usize,
+    kv_data: EvictedSeqData,
 }
 
 pub struct ContinuousScheduler {
@@ -42,6 +59,9 @@ pub struct ContinuousScheduler {
     pub max_seq_len: usize,
     pub max_prefill_tokens: usize,
     queue: Arc<InferenceQueue>,
+    swap_manager: SwapManager,
+    /// Swapped-out sequences waiting for GPU memory to become available.
+    swapped: Vec<SwappedRequest>,
 }
 
 impl ContinuousScheduler {
@@ -56,13 +76,15 @@ impl ContinuousScheduler {
     ) -> Self {
         Self {
             cfg,
-            ctx,
+            ctx: ctx.clone(),
             model,
             cache: Arc::new(cache),
             max_batch,
             max_seq_len,
-            max_prefill_tokens: 512, // reasonable default for prefill chunking
+            max_prefill_tokens: 512,
             queue,
+            swap_manager: SwapManager::new(),
+            swapped: Vec::new(),
         }
     }
 
@@ -83,6 +105,9 @@ impl ContinuousScheduler {
         let mut waiting: Vec<(InferenceRequest, Sender<InferenceResponse>)> = Vec::new();
 
         loop {
+            // -- Advance global epoch for LRU --
+            let _epoch = advance_epoch();
+
             // 1. Drain incoming requests into waiting queue
             loop {
                 match rx.try_recv() {
@@ -91,43 +116,14 @@ impl ContinuousScheduler {
                 }
             }
 
-            // 2. Admit waiting requests if budget allows
-            while !waiting.is_empty() && running.len() < self.max_batch {
-                if let Some((req, _tx)) = waiting.first() {
-                    let prompt_len = req.prompt_tokens.len();
-                    let blocks_needed = (prompt_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            // 2. Admit waiting requests (with eviction if needed)
+            self.admit_waiting(&mut running, &mut waiting);
 
-                    match self.cache.alloc_sequence(blocks_needed) {
-                        Ok(block_table) => {
-                            let seq_idx = self.cache.register_sequence(block_table);
-                            tracing::debug!(
-                                req_id = req.id,
-                                seq_idx,
-                                blocks = blocks_needed,
-                                "admitted request"
-                            );
-                            let (req, tx) = waiting.remove(0);
-                            running.push(RunningRequest {
-                                req,
-                                tx,
-                                state: RequestState::Prefill { prompt_pos: 0 },
-                                position: 0,
-                                seq_idx,
-                                generated: Vec::new(),
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!("insufficient blocks for request: {e}");
-                            break; // stop admitting until blocks are freed
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
+            // 3. Try to restore swapped sequences after completions freed blocks
+            self.try_restore_swapped(&mut running);
 
-            // 3. If nothing running, block on the queue
-            if running.is_empty() {
+            // 4. If nothing running, block on the queue
+            if running.is_empty() && self.swapped.is_empty() {
                 match rx.recv() {
                     Ok(v) => waiting.push(v),
                     Err(_) => return Ok(()),
@@ -135,38 +131,265 @@ impl ContinuousScheduler {
                 continue;
             }
 
-            // 4. Run one forward step for all running requests
-            self.run_step(&mut running)?;
-
-            // 5. Remove completed requests
-            let mut i = 0;
-            while i < running.len() {
-                let r = &running[i];
-                let is_done = match r.state {
-                    RequestState::Decode => {
-                        let last_token = r.generated.last().copied();
-                        last_token == Some(r.req.eos_token_id)
-                            || r.generated.len() >= r.req.max_new_tokens
-                            || r.position >= self.max_seq_len
+            // If nothing running but there are swapped sequences, try restoring
+            if running.is_empty() {
+                self.try_restore_swapped(&mut running);
+                if running.is_empty() {
+                    match rx.recv() {
+                        Ok(v) => waiting.push(v),
+                        Err(_) => return Ok(()),
                     }
-                    RequestState::Prefill { .. } => false,
-                };
-                if is_done {
-                    let r = running.remove(i);
-                    self.cache.unregister_sequence(r.seq_idx);
-                    let prefill_ms = 0.0; // simplified — tracked per batch
-                    let decode_ms = 0.0;
-                    let _ = r.tx.send(InferenceResponse {
-                        id: r.req.id,
-                        generated_tokens: r.generated,
-                        prefill_ms,
-                        decode_ms,
-                    });
-                    tracing::debug!(req_id = r.req.id, "request completed");
-                } else {
-                    i += 1;
+                    continue;
                 }
             }
+
+            // 5. Run one forward step for all running requests
+            self.run_step(&mut running)?;
+
+            // 6. Remove completed requests, attempt restoration
+            self.drain_completed_swapped();
+            let freed = self.remove_completed(&mut running);
+            if freed > 0 {
+                self.try_restore_swapped(&mut running);
+            }
+        }
+    }
+
+    /// Attempt to admit waiting requests, evicting running sequences if VRAM is full.
+    fn admit_waiting(
+        &mut self,
+        running: &mut Vec<RunningRequest>,
+        waiting: &mut Vec<(InferenceRequest, Sender<InferenceResponse>)>,
+    ) {
+        let mut i = 0;
+        while i < waiting.len() && running.len() < self.max_batch {
+            let prompt_len = waiting[i].0.prompt_tokens.len();
+            let blocks_needed = (prompt_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            match self.cache.alloc_sequence(blocks_needed) {
+                Ok(block_table) => {
+                    let seq_idx = self.cache.register_sequence(block_table);
+                    tracing::debug!(
+                        req_id = waiting[i].0.id,
+                        seq_idx,
+                        blocks = blocks_needed,
+                        "admitted request"
+                    );
+                    let (req, tx) = waiting.remove(i);
+                    running.push(RunningRequest {
+                        req,
+                        tx,
+                        state: RequestState::Prefill { prompt_pos: 0 },
+                        position: 0,
+                        seq_idx,
+                        num_blocks: blocks_needed,
+                        generated: Vec::new(),
+                    });
+                    // No increment of i since we removed element at index i
+                }
+                Err(_e) => {
+                    if free_blocks_available(self.cache.as_ref()) {
+                        // Free blocks exist but alloc_sequence failed —
+                        // likely a different error (not OOM). Skip this request.
+                        tracing::warn!(
+                            req_id = waiting[i].0.id,
+                            "allocation failed despite free blocks, delaying request"
+                        );
+                        i += 1;
+                        continue;
+                    }
+
+                    // VRAM exhausted — try to evict a running sequence
+                    if let Some(victim_idx) = select_victim(running, self.cache.as_ref()) {
+                        let victim = &running[victim_idx];
+                        tracing::info!(
+                            req_id = victim.req.id,
+                            seq_idx = victim.seq_idx,
+                            blocks = victim.num_blocks,
+                            "preempting sequence to free VRAM"
+                        );
+
+                        match self.swap_manager.evict_sequence(
+                            self.cache.as_ref(),
+                            victim.seq_idx,
+                        ) {
+                            Ok(kv_data) => {
+                                let v = running.remove(victim_idx);
+                                self.cache.unregister_sequence(v.seq_idx);
+                                tracing::debug!(
+                                    req_id = v.req.id,
+                                    "sequence evicted to host, will resume later"
+                                );
+                                self.swapped.push(SwappedRequest {
+                                    request: v.req,
+                                    tx: v.tx,
+                                    generated: v.generated,
+                                    state: v.state,
+                                    position: v.position,
+                                    num_blocks: v.num_blocks,
+                                    kv_data,
+                                });
+                                // Now retry alloc_sequence for the waiting request
+                                continue; // retry same i
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    req_id = victim.req.id,
+                                    "eviction failed: {e}"
+                                );
+                                i += 1;
+                            }
+                        }
+                    } else {
+                        // No sequence to evict — truly OOM
+                        tracing::warn!(
+                            req_id = waiting[i].0.id,
+                            blocks_needed,
+                            running = running.len(),
+                            swapped = self.swapped.len(),
+                            "cannot allocate blocks, no evictable sequences"
+                        );
+                        i += 1;
+                    }
+                }
+            }
+
+            // Safety valve: don't overflow the swapped queue
+            if self.swapped.len() >= MAX_SWAPPED_SEQS {
+                tracing::warn!(
+                    swapped = self.swapped.len(),
+                    "swapped queue full, deferring admissions"
+                );
+                break;
+            }
+        }
+    }
+
+    /// After completions freed blocks, try to restore evicted sequences.
+    fn try_restore_swapped(&mut self, running: &mut Vec<RunningRequest>) {
+        if self.swapped.is_empty() || running.len() >= self.max_batch {
+            return;
+        }
+
+        let mut restored = Vec::new();
+
+        for i in 0..self.swapped.len() {
+            if running.len() >= self.max_batch {
+                break;
+            }
+
+            let sw = &self.swapped[i];
+            match self
+                .swap_manager
+                .restore_sequence(self.cache.as_ref(), &sw.kv_data)
+            {
+                Ok(new_block_table) => {
+                    // Drop host-side buffers
+                    self.swap_manager.drop_swapped(&sw.kv_data);
+
+                    let seq_idx = self.cache.register_sequence(new_block_table);
+                    self.cache.update_seq_len(seq_idx, sw.position);
+                    tracing::debug!(
+                        req_id = sw.request.id,
+                        seq_idx,
+                        position = sw.position,
+                        "restored swapped sequence"
+                    );
+
+                    running.push(RunningRequest {
+                        req: sw.request.clone(),
+                        tx: sw.tx.clone(),
+                        state: sw.state,
+                        position: sw.position,
+                        seq_idx,
+                        num_blocks: sw.num_blocks,
+                        generated: sw.generated.clone(),
+                    });
+                    restored.push(i);
+                }
+                Err(_e) => {
+                    // Still no space — stop trying
+                    break;
+                }
+            }
+        }
+
+        // Remove restored entries from swapped (in reverse order to preserve indices)
+        for i in restored.into_iter().rev() {
+            self.swapped.remove(i);
+        }
+    }
+
+    /// Remove completed requests from running set.
+    /// Returns the number of blocks freed (for triggering restoration).
+    fn remove_completed(&mut self, running: &mut Vec<RunningRequest>) -> usize {
+        let mut freed_blocks = 0usize;
+        let mut i = 0;
+        while i < running.len() {
+            let r = &running[i];
+            let is_done = match r.state {
+                RequestState::Decode => {
+                    let last_token = r.generated.last().copied();
+                    last_token == Some(r.req.eos_token_id)
+                        || r.generated.len() >= r.req.max_new_tokens
+                        || r.position >= self.max_seq_len
+                }
+                RequestState::Prefill { .. } => false,
+            };
+            if is_done {
+                let r = running.remove(i);
+                freed_blocks += r.num_blocks;
+                self.cache.unregister_sequence(r.seq_idx);
+                let _ = r.tx.send(InferenceResponse {
+                    id: r.req.id,
+                    generated_tokens: r.generated,
+                    prefill_ms: 0.0,
+                    decode_ms: 0.0,
+                });
+                tracing::debug!(req_id = r.req.id, "request completed");
+            } else {
+                i += 1;
+            }
+        }
+        freed_blocks
+    }
+
+    /// Check for completed swapped sequences (e.g., exceeded max_new_tokens or max_seq_len
+    /// during swap). Send their responses with whatever was generated so far.
+    ///
+    /// Currently swapped sequences that haven't started generating keep waiting.
+    /// In the future this could be extended to timeout long-swapped requests.
+    fn drain_completed_swapped(&mut self) {
+        let mut done = Vec::new();
+        for i in 0..self.swapped.len() {
+            let sw = &self.swapped[i];
+            let is_done = match sw.state {
+                RequestState::Decode => {
+                    let last_token = sw.generated.last().copied();
+                    last_token == Some(sw.request.eos_token_id)
+                        || sw.generated.len() >= sw.request.max_new_tokens
+                        || sw.position >= self.max_seq_len
+                }
+                RequestState::Prefill { .. } => false,
+            };
+            if is_done {
+                done.push(i);
+            }
+        }
+
+        for i in done.into_iter().rev() {
+            let sw = self.swapped.remove(i);
+            self.swap_manager.drop_swapped(&sw.kv_data);
+            let _ = sw.tx.send(InferenceResponse {
+                id: sw.request.id,
+                generated_tokens: sw.generated,
+                prefill_ms: 0.0,
+                decode_ms: 0.0,
+            });
+            tracing::debug!(
+                req_id = sw.request.id,
+                "swapped sequence completed while evicted"
+            );
         }
     }
 
@@ -177,6 +400,36 @@ impl ContinuousScheduler {
         let mut hidden: CudaSlice<f16> = self.ctx.device.alloc_zeros::<f16>(batch * h)?;
         let seq_indices: Vec<usize> = running.iter().map(|r| r.seq_idx).collect();
         let positions: Vec<usize> = running.iter().map(|r| r.position).collect();
+
+        // Allocate additional blocks BEFORE forward step.
+        // The initial alloc_sequence gave ceil(prompt_len/BLOCK_SIZE) blocks.
+        // During decode, position may cross a block boundary — we need blocks
+        // for the current position's logical block.
+        for r in running.iter_mut() {
+            let blocks_needed = (r.position / BLOCK_SIZE) + 1;
+            while blocks_needed > r.num_blocks {
+                match self.cache.alloc_block() {
+                    Ok(block_idx) => {
+                        self.cache.append_block_to_sequence(r.seq_idx, block_idx);
+                        r.num_blocks += 1;
+                    }
+                    Err(_e) => {
+                        tracing::warn!(
+                            req_id = r.req.id,
+                            position = r.position,
+                            blocks = r.num_blocks,
+                            "cannot grow KV cache, capping sequence"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Mark all running sequences as accessed at current epoch
+        for r in running.iter() {
+            self.cache.record_epoch(r.seq_idx);
+        }
 
         // Run the transformer forward step (per-layer GEMM + KV cache write)
         let logits = self.model.forward_step_paged(
@@ -193,8 +446,6 @@ impl ContinuousScheduler {
         for (b, r) in running.iter_mut().enumerate() {
             match r.state {
                 RequestState::Prefill { prompt_pos } => {
-                    // During prefill, we feed prompt tokens (not sampled tokens)
-                    // Simplified: each prefill step processes one token position
                     let new_pos = prompt_pos + 1;
                     r.position = new_pos;
                     if new_pos >= r.req.prompt_tokens.len() {
@@ -218,6 +469,68 @@ impl ContinuousScheduler {
 
         Ok(())
     }
+}
+
+/// Check if there are free blocks available in the allocator pool.
+fn free_blocks_available(cache: &PagedKvCache) -> bool {
+    cache.block_allocator().free_count() > 0
+}
+
+/// Select a victim sequence from the running set for eviction.
+/// Returns the index in the running Vec, or None if no sequence can be evicted.
+///
+/// Policy: LRU — the sequence with the smallest (oldest) epoch.
+/// Among sequences with the same epoch, prefer those with more blocks
+/// (fewer evictions needed to free a given amount of memory).
+fn select_victim(running: &[RunningRequest], cache: &PagedKvCache) -> Option<usize> {
+    if running.is_empty() {
+        return None;
+    }
+
+    // Don't preempt sequences still in Prefill — they haven't generated tokens yet
+    // and evicting them wastes prompt processing work.
+    let mut best: Option<(usize, u64, isize)> = None; // (idx, epoch, -blocks)
+
+    for (i, r) in running.iter().enumerate() {
+        // Only preempt decode-stage sequences (prefill is cheap to replay but we skip for simplicity)
+        if matches!(r.state, RequestState::Prefill { .. }) {
+            continue;
+        }
+
+        let epoch = cache.get_seq_epoch(r.seq_idx).unwrap_or(0);
+        let blocks = -(r.num_blocks as isize); // negate so more blocks = smaller = better
+
+        match best {
+            None => {
+                best = Some((i, epoch, blocks));
+            }
+            Some((_, best_epoch, best_blocks)) => {
+                if epoch < best_epoch || (epoch == best_epoch && blocks < best_blocks) {
+                    best = Some((i, epoch, blocks));
+                }
+            }
+        }
+    }
+
+    // Fall back to any running sequence if no decode-stage ones exist
+    if best.is_none() {
+        for (i, r) in running.iter().enumerate() {
+            let epoch = cache.get_seq_epoch(r.seq_idx).unwrap_or(0);
+            let blocks = -(r.num_blocks as isize);
+            match best {
+                None => {
+                    best = Some((i, epoch, blocks));
+                }
+                Some((_, best_epoch, best_blocks)) => {
+                    if epoch < best_epoch || (epoch == best_epoch && blocks < best_blocks) {
+                        best = Some((i, epoch, blocks));
+                    }
+                }
+            }
+        }
+    }
+
+    best.map(|(i, _, _)| i)
 }
 
 #[cfg(test)]
