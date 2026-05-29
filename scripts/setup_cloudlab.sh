@@ -79,25 +79,67 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --defaul
 source "$HOME/.cargo/env"
 rustup component add clippy rustfmt
 
-# 5. Setup Python Environment and Download Model
+# 5. Install Miniconda3 for Python Environment Management
+echo ">>> Installing Miniconda3..."
+if [ ! -d "/opt/miniconda3" ]; then
+    wget -qO /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+    bash /tmp/miniconda.sh -b -p /opt/miniconda3
+    rm -f /tmp/miniconda.sh
+fi
+
+# Load conda for current session
+eval "$(/opt/miniconda3/bin/conda shell.bash hook)"
+conda init bash 2>/dev/null || true
+
+# 6. Create vLLM Benchmark Environment
+echo ">>> Creating vLLM benchmark environment..."
+if ! conda env list 2>/dev/null | grep -q "^vllm-bench "; then
+    conda create -n vllm-bench python=3.12 -y
+fi
+conda activate vllm-bench
+
+echo ">>> Installing vLLM with FlashInfer..."
+pip install --no-cache-dir vllm
+
+# 7. Configure FlashInfer for A30 (Compute Capability 8.0)
+echo ">>> Configuring FlashInfer for A30 (sm_80)..."
+SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+CCCL_FILE="$SITE_PACKAGES/flashinfer/compilation_context.py"
+if [ -f "$CCCL_FILE" ] && ! grep -q "CCCL_DISABLE_CTK_COMPATIBILITY_CHECK" "$CCCL_FILE" 2>/dev/null; then
+    echo "    Applying CCCL compatibility patch..."
+    sed -i 's/COMMON_NVCC_FLAGS = \[/COMMON_NVCC_FLAGS = ["-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",/' "$CCCL_FILE"
+fi
+
+# Pre-compile FlashInfer for A30 sm_80
+export FLASHINFER_CUDA_ARCH_LIST="8.0"
+export CUDA_HOME="/usr/local/cuda-12.2"
+
+# Trigger FlashInfer JIT compilation
+echo ">>> Pre-compiling FlashInfer kernels for A30..."
+python3 -c "import flashinfer; print('FlashInfer version:', flashinfer.__version__)" 2>&1 || true
+
+# 8. Download TinyLlama Model
 echo ">>> Downloading TinyLlama model..."
-pip3 install --no-cache-dir huggingface_hub
+pip install --no-cache-dir huggingface_hub
 
 mkdir -p "$MODEL_DIR"
-# Use huggingface-cli to download the model excluding large non-essential weights
-huggingface-cli download TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-    --local-dir "$MODEL_DIR/tinyllama" \
-    --exclude "*.bin" "*.pt" "*.msgpack" "*.h5"
+if [ ! -f "$MODEL_DIR/tinyllama/model.safetensors" ] && [ ! -f "$MODEL_DIR/tinyllama/model.safetensors.index.json" ]; then
+    huggingface-cli download TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+        --local-dir "$MODEL_DIR/tinyllama" \
+        --exclude "*.bin" "*.pt" "*.msgpack" "*.h5"
+else
+    echo "    Model already exists, skipping download."
+fi
 
-# 6. Clone and Build Project
+# 9. Clone and Build Project
 echo ">>> Cloning and building the benchmark project..."
 if [ ! -d "$REPO_DIR" ]; then
     git clone "$REPO_URL" "$REPO_DIR"
 fi
 
 cd "$REPO_DIR"
-# Build the project in release mode
 cargo build --release
+cargo build --release --example bench_throughput
 
 echo ""
 echo "======================================================================"
@@ -106,6 +148,8 @@ echo "======================================================================"
 echo " 1. ACTION REQUIRED: Run 'reboot' to activate the NVIDIA drivers."
 echo " 2. After reboot, verify the GPU using 'nvidia-smi'."
 echo " 3. Verify CUDA: 'nvcc --version' should show 12.2."
-echo " 4. Project Directory: $REPO_DIR"
-echo " 5. Model Directory:   $MODEL_DIR/tinyllama"
+echo " 4. Activate vLLM env:  conda activate vllm-bench"
+echo " 5. Project Directory:  $REPO_DIR"
+echo " 6. Model Directory:    $MODEL_DIR/tinyllama"
+echo " 7. Run benchmark:      $REPO_DIR/scripts/run_step3_bench_baremetal.sh {baseline|vllm|compare}"
 echo "======================================================================"

@@ -16,7 +16,6 @@ Provide automatic GPU memory offloading and on-demand loading mechanisms at the 
 
 Support advanced decoding algorithms such as Beam Search that require generating multiple candidate sequences. Implement a highly optimized Copy-on-Write (COW) mechanism in the kernel, allowing multiple candidate sequences to share the same underlying physical KV Cache data pages before forking. The kernel must maintain rigorous physical page reference counts and trigger actual memory allocation and data copying only when a sequence attempts to modify the data.
 
-### eBPF-Based Network Offloading
 
 Embed eBPF hooks in the kernel's network data path. When external network packets containing inference requests arrive at the NIC, your eBPF program should parse the data in kernel space and trigger GPU computation, achieving zero-copy data flow that bypasses the traditional socket buffer layer.
 

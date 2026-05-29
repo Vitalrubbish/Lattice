@@ -6,5 +6,5 @@ Cargo.lock
 *.profraw
 perf.data*
 flamegraph.svg
-CLAUDE.md
+AGENTS.md
 .claude
