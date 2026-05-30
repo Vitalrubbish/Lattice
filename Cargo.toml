@@ -9,7 +9,7 @@ libc = "0.2"
 bytemuck = "1.16"
 clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
-cudarc = { version = "0.11", features = ["std", "cuda-12020", "cublas", "driver", "f16"] }
+cudarc = { version = "0.11", features = ["std", "cuda-12020", "cublas", "driver", "f16", "nvrtc"] }
 half = { version = "2.4", features = ["bytemuck"] }
 memmap2 = "0.9"
 parking_lot = "0.12"

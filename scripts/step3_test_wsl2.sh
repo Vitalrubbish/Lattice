@@ -77,6 +77,24 @@ wait_port() {
     return 1
 }
 
+# ── Helper: kill process listening on a given port ──
+kill_port() {
+    local port="$1"
+    local pids
+    pids=$(ss -tlnp 2>/dev/null | grep -Po ":$port\s+.*pid=\K\d+" | sort -u || true)
+    if [ -n "$pids" ]; then
+        echo "   (killing existing process on port $port: $pids)"
+        for pid in $pids; do
+            kill "$pid" 2>/dev/null || true
+        done
+        sleep 1
+        for pid in $pids; do
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        done
+    fi
+}
+
 # ── Helper: send SIGTERM, then SIGKILL ──
 graceful_kill() {
     local pid="$1"
@@ -92,6 +110,9 @@ cleanup() {
     echo ">>> Cleaning up..."
     [ -n "${BASELINE_PID:-}" ] && graceful_kill "$BASELINE_PID"
     [ -n "${VLLM_PID:-}" ] && graceful_kill "$VLLM_PID"
+    # Fallback: kill anything still listening on our ports.
+    kill_port "$BASELINE_PORT"
+    kill_port "$VLLM_PORT"
     pkill -9 -f "EngineCore" 2>/dev/null || true
     echo "Done."
 }
@@ -123,8 +144,10 @@ echo ">>> Running Rust GPU tests (fragmentation, max concurrency, cuMemMap overh
 cargo test --release --package baseline-llm-os -- \
     step3_max_concurrent_requests \
     step3_fragmentation_rate \
+    step3_runtime_fragmentation \
     step3_cumemmap_overhead \
     step3_internal_fragmentation_analysis \
+    --test-threads=1 \
     --nocapture 2>&1 | tee "$RESULTS_DIR/baseline_gpu_tests.txt"
 
 # ═══════════════════════════════════════════════════════════════
@@ -133,6 +156,9 @@ run_baseline() {
     echo "──────────────────────────────────────────────"
     echo " Baseline Server  (port $BASELINE_PORT)"
     echo "──────────────────────────────────────────────"
+
+    # Kill any stale process on the port from a previous run.
+    kill_port "$BASELINE_PORT"
 
     RUST_LOG=error "$PROJ_DIR/target/release/baseline-server" \
         --listen "127.0.0.1:$BASELINE_PORT" \
@@ -145,7 +171,14 @@ run_baseline() {
     echo "   PID: $BASELINE_PID"
 
     if ! wait_port "$BASELINE_PORT" 30; then
-        echo "ERROR: baseline server did not start"
+        echo "ERROR: baseline server did not start (port not listening)"
+        cat "$RESULTS_DIR/baseline_server.log"
+        exit 1
+    fi
+
+    # Verify the PID we started is still alive (not a stale listener).
+    if ! kill -0 "$BASELINE_PID" 2>/dev/null; then
+        echo "ERROR: baseline server PID $BASELINE_PID died after start"
         cat "$RESULTS_DIR/baseline_server.log"
         exit 1
     fi
@@ -187,6 +220,10 @@ collect_gpu_test_metrics() {
     int_frag=$(grep -Po 'internal_fragmentation:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
     echo "  internal_fragmentation:   $int_frag"
 
+    local phys_waste
+    phys_waste=$(grep -Po 'physical memory waste ratio:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  physical_memory_waste:    $phys_waste"
+
     local map_overhead
     map_overhead=$(grep -Po 'avg per 2MB map/unmap:\s+\K[\d.]+' "$file" 2>/dev/null || echo "N/A")
     echo "  avg_2MB_map_unmap_us:     $map_overhead"
@@ -198,6 +235,18 @@ collect_gpu_test_metrics() {
     local map_calls
     map_calls=$(grep -Po 'total cuMemMap calls:\s+\K\d+' "$file" 2>/dev/null || echo "N/A")
     echo "  total_cuMemMap_calls:     $map_calls"
+
+    local runtime_frag_avg
+    runtime_frag_avg=$(grep -Po 'avg runtime fragmentation ratio:\s+\K[\d.]+' "$file" 2>/dev/null || echo "N/A")
+    echo "  runtime_frag_avg_ratio:   $runtime_frag_avg"
+
+    local runtime_frag_peak
+    runtime_frag_peak=$(grep -Po 'peak \(worst\):\s+\K[\d.]+' "$file" 2>/dev/null || echo "N/A")
+    echo "  runtime_frag_peak_ratio:  $runtime_frag_peak"
+
+    local runtime_frag_stddev
+    runtime_frag_stddev=$(grep -Po 'stddev:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  runtime_frag_stddev:      $runtime_frag_stddev"
 }
 
 # ═══════════════════════════════════════════════════════════════

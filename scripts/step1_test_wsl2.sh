@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJ_DIR"
 
-SUDO_PASS="your_sudo_password_here"  # <-- REPLACE THIS with your actual sudo password (or set via env var)
+SUDO_PASS="zxxzdq20060721"  # <-- REPLACE THIS with your actual sudo password (or set via env var)
 MODEL_PATH="${MODEL_PATH:-/home/vitalrubbish/models/tinyllama}"
 BPFTRACE_FLAGS="--unsafe"
 RESULTS_DIR="$PROJ_DIR/results/wsl2/$(date +%Y%m%d_%H%M%S)"

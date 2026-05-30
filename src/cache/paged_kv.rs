@@ -6,24 +6,25 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 use super::cuda_vmm::CudaVmm;
-use super::swap::current_epoch;
 use crate::config::ModelConfig;
 use crate::cuda::CudaContext;
 
 /// Tokens per block — matches typical vLLM default.
 pub const BLOCK_SIZE: usize = 16;
-const SUPERBLOCK_SIZE: usize = 2 * 1024 * 1024; // 2 MB
+pub const BLOCK_BYTES: usize = 8192; // BLOCK_SIZE * kv_heads * head_dim * sizeof(f16)
+pub(crate) const SUPERBLOCK_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 
 // --- Physical block sub-allocator ---
 
-/// Tracks one 2 MB physical allocation and its VA placement.
-struct SuperblockInfo {
+/// Tracks one 2 MiB physical allocation and its VA placement
+/// within a specific layer's K or V region.
+pub(crate) struct SuperblockInfo {
     phys_handle: u64,
-    /// Byte offset within each VA region where this superblock starts.
+    /// Byte offset within the owning VA region where this superblock starts.
     va_base: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHandle {
     superblock_idx: u32,
     block_index: u32,
@@ -33,7 +34,6 @@ pub struct PhysicalBlockAllocator {
     pub block_bytes: usize,
     pub blocks_per_superblock: usize,
     free_blocks: Mutex<Vec<BlockHandle>>,
-    /// Number of superblocks allocated.
     superblock_count: Mutex<usize>,
 }
 
@@ -54,43 +54,29 @@ impl PhysicalBlockAllocator {
         }
     }
 
-    /// Allocate one block. Returns the handle.
-    /// If a new superblock was created, `new_superblock_phys` is `Some(phys_handle)`.
-    pub fn allocate(&self, vmm: &CudaVmm) -> Result<(BlockHandle, Option<u64>)> {
-        // Try free list first
-        {
-            let mut free = self.free_blocks.lock();
-            if let Some(handle) = free.pop() {
-                return Ok((handle, None));
-            }
-        }
+    /// Try to allocate one block from the free list.
+    /// Returns `None` if no free blocks are available (caller must add a superblock).
+    pub fn try_allocate(&self) -> Option<BlockHandle> {
+        self.free_blocks.lock().pop()
+    }
 
-        // Need a new superblock
-        let phys = vmm.create_physical(SUPERBLOCK_SIZE)?;
+    /// Add a new superblock's blocks to the free list.
+    /// Increments the superblock count.
+    /// All blocks (including index 0) are added to the free list so that
+    /// fragmentation tracking sees the correct free-block count.
+    pub fn add_superblock(&self) {
         let mut sb_count = self.superblock_count.lock();
         let sb_idx = *sb_count;
         *sb_count += 1;
         drop(sb_count);
 
-        // Push remaining blocks into free list
-        {
-            let mut free = self.free_blocks.lock();
-            for i in 1..self.blocks_per_superblock {
-                free.push(BlockHandle {
-                    superblock_idx: sb_idx as u32,
-                    block_index: i as u32,
-                });
-            }
+        let mut free = self.free_blocks.lock();
+        for i in 0..self.blocks_per_superblock {
+            free.push(BlockHandle {
+                superblock_idx: sb_idx as u32,
+                block_index: i as u32,
+            });
         }
-
-        tracing::debug!(
-            phys_handle = phys,
-            sb_idx,
-            blocks_added = self.blocks_per_superblock - 1,
-            "allocated new superblock"
-        );
-
-        Ok((BlockHandle { superblock_idx: sb_idx as u32, block_index: 0 }, Some(phys)))
     }
 
     /// Return a block to the free pool.
@@ -109,29 +95,42 @@ impl PhysicalBlockAllocator {
     pub fn superblock_count(&self) -> usize {
         *self.superblock_count.lock()
     }
+}
 
-    /// Drain all physical handles — the caller must know the mapping to release them.
-    /// Returns (phys_handles, superblock_count).
-    pub fn superblock_metrics(&self) -> usize {
-        *self.superblock_count.lock()
+// --- Per-layer KV pool ---
+
+/// Physical memory pool for one layer's K or V cache.
+pub(crate) struct LayerKvPool {
+    pub(crate) allocator: PhysicalBlockAllocator,
+    pub(crate) superblocks: Mutex<Vec<SuperblockInfo>>,
+}
+
+impl LayerKvPool {
+    fn new(elem_count: usize) -> Self {
+        Self {
+            allocator: PhysicalBlockAllocator::new(elem_count),
+            superblocks: Mutex::new(Vec::new()),
+        }
     }
 }
 
 // --- Per-block info (tracked by PagedKvCache) ---
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct BlockInfo {
-    /// VA offset within each K/V region for this block.
+    /// Byte offset within each per-layer K/V VA region for this block.
+    /// Same value across all layers because all pools allocate in lockstep.
     va_offset: usize,
-    /// Superblock that owns this block (for cleanup).
+    /// Superblock index (same across all pools in lockstep).
     superblock_idx: u32,
+    /// Block index within the superblock.
     block_index_in_sb: u32,
     in_use: bool,
 }
 
 /// Per-request metadata for KV cache lookups.
 pub struct SeqMetadata {
-    pub block_table: Vec<u32>,  // logical_block_idx → block_idx
+    pub block_table: Vec<u32>, // logical_block → block_idx
     pub seq_len: usize,
 }
 
@@ -151,22 +150,20 @@ pub struct PagedKvCache {
     /// V cache: one VA region per layer.
     va_v: Vec<u64>,
 
-    block_allocator: Arc<PhysicalBlockAllocator>,
-
-    /// Superblock info: phys_handle + va_base for each superblock.
-    superblocks: Mutex<Vec<SuperblockInfo>>,
+    /// Per-layer K physical pools.
+    pub(crate) k_pools: Vec<LayerKvPool>,
+    /// Per-layer V physical pools.
+    pub(crate) v_pools: Vec<LayerKvPool>,
 
     /// Block-level tracking: block_idx → BlockInfo.
     block_info: Mutex<Vec<BlockInfo>>,
 
-    /// Recycled block indices.
+    /// Recycled block indices (blocks whose physical backing is still valid
+    /// but are not currently assigned to any sequence).
     free_block_indices: Mutex<Vec<u32>>,
 
     /// Per-sequence metadata.
-    seq_metadata: Mutex<Vec<SeqMetadata>>,
-
-    /// Per-sequence last-access epoch (LRU tracking).
-    seq_last_epoch: Mutex<Vec<u64>>,
+    pub seq_metadata: Mutex<Vec<SeqMetadata>>,
 
     /// Precomputed sizes.
     pub elem_per_block: usize,
@@ -188,7 +185,6 @@ impl PagedKvCache {
         let max_blocks_total = max_batch * max_blocks_per_seq;
 
         let vmm = CudaVmm::new(ctx.device.ordinal())?;
-        let block_allocator = Arc::new(PhysicalBlockAllocator::new(elem_per_block));
 
         // Reserve separate VA regions per layer for K and V
         let va_size = max_blocks_total * block_bytes;
@@ -200,6 +196,14 @@ impl PagedKvCache {
             va_v.push(vmm.reserve_address(va_size)?);
         }
 
+        let num_layers = cfg.num_hidden_layers;
+        let k_pools: Vec<LayerKvPool> = (0..num_layers)
+            .map(|_| LayerKvPool::new(elem_per_block))
+            .collect();
+        let v_pools: Vec<LayerKvPool> = (0..num_layers)
+            .map(|_| LayerKvPool::new(elem_per_block))
+            .collect();
+
         Ok(Self {
             cfg,
             ctx,
@@ -210,34 +214,52 @@ impl PagedKvCache {
             vmm,
             va_k,
             va_v,
-            block_allocator,
-            superblocks: Mutex::new(Vec::new()),
+            k_pools,
+            v_pools,
             block_info: Mutex::new(Vec::new()),
             free_block_indices: Mutex::new(Vec::new()),
             seq_metadata: Mutex::new(Vec::new()),
-            seq_last_epoch: Mutex::new(Vec::new()),
             elem_per_block,
             block_bytes,
             max_blocks_total,
         })
     }
 
-    /// Map a newly created superblock into all K/V VA regions.
-    fn map_superblock(&self, phys_handle: u64, sb_idx: usize) -> Result<usize> {
-        let va_base = sb_idx * SUPERBLOCK_SIZE;
-        let num_layers = self.cfg.num_hidden_layers;
+    // --- Superblock management ---
 
-        for l in 0..num_layers {
-            self.vmm.map(self.va_k[l], va_base, phys_handle, 0, SUPERBLOCK_SIZE)?;
-            self.vmm.map(self.va_v[l], va_base, phys_handle, 0, SUPERBLOCK_SIZE)?;
-        }
+    /// Map a newly created physical handle into the specified layer's K or V VA region.
+    /// Returns the VA base offset within that region.
+    fn map_superblock_to_layer(
+        &self,
+        phys_handle: u64,
+        layer_idx: usize,
+        is_v: bool,
+        pool: &LayerKvPool,
+    ) -> Result<usize> {
+        let sb_count = pool.allocator.superblock_count();
+        // sb_count was already incremented by add_superblock, so the new
+        // superblock has index (sb_count - 1).
+        let sb_idx = sb_count.saturating_sub(1);
+        let va_base = sb_idx * SUPERBLOCK_SIZE;
+        let va_region = if is_v {
+            self.va_v[layer_idx]
+        } else {
+            self.va_k[layer_idx]
+        };
+
+        self.vmm
+            .map(va_region, va_base, phys_handle, 0, SUPERBLOCK_SIZE)?;
 
         tracing::debug!(
-            phys_handle, sb_idx, va_base,
-            num_layers, "mapped superblock into all KV regions"
+            phys_handle,
+            sb_idx,
+            va_base,
+            layer_idx,
+            is_v,
+            "mapped superblock into layer VA region"
         );
 
-        self.superblocks.lock().push(SuperblockInfo {
+        pool.superblocks.lock().push(SuperblockInfo {
             phys_handle,
             va_base,
         });
@@ -245,43 +267,113 @@ impl PagedKvCache {
         Ok(va_base)
     }
 
+    /// Ensure all per-layer pools have at least one free block.
+    /// Creates new superblocks for ALL pools simultaneously if needed.
+    fn ensure_capacity(&self) -> Result<()> {
+        // All pools have the same free count (lockstep allocation).
+        if self.k_pools[0].allocator.free_count() > 0 {
+            return Ok(());
+        }
+
+        let num_layers = self.cfg.num_hidden_layers;
+
+        // Create superblocks for all K and V pools simultaneously.
+        // We add the superblock (which fills free lists), then create
+        // the physical handle and map it.
+        for l in 0..num_layers {
+            // K pool
+            let phys_k = self.vmm.create_physical(SUPERBLOCK_SIZE)?;
+            self.k_pools[l].allocator.add_superblock();
+            self.map_superblock_to_layer(phys_k, l, false, &self.k_pools[l])?;
+
+            // V pool
+            let phys_v = self.vmm.create_physical(SUPERBLOCK_SIZE)?;
+            self.v_pools[l].allocator.add_superblock();
+            self.map_superblock_to_layer(phys_v, l, true, &self.v_pools[l])?;
+        }
+
+        tracing::debug!(
+            num_layers,
+            total_pools = num_layers * 2,
+            "created superblocks for all per-layer pools"
+        );
+
+        Ok(())
+    }
+
+    // --- Block allocation ---
+
+    /// Allocate a single physical block across all per-layer pools.
+    /// Returns (va_offset, superblock_idx, block_index_in_sb) computed
+    /// from any pool (all pools produce the same values in lockstep).
+    fn alloc_one_block_internal(&self) -> Result<(usize, u32, u32)> {
+        self.ensure_capacity()?;
+
+        // Allocate from all K and V pools simultaneously.
+        // All pools have identical free lists, so they all return
+        // handles with the same (superblock_idx, block_index).
+        let num_layers = self.cfg.num_hidden_layers;
+        let mut handle: Option<BlockHandle> = None;
+
+        for l in 0..num_layers {
+            let h_k = self.k_pools[l].allocator.try_allocate()
+                .ok_or_else(|| anyhow!("K pool layer {}: no free block after ensure_capacity", l))?;
+            let h_v = self.v_pools[l].allocator.try_allocate()
+                .ok_or_else(|| anyhow!("V pool layer {}: no free block after ensure_capacity", l))?;
+
+            if let Some(ref first) = handle {
+                assert_eq!(first.superblock_idx, h_k.superblock_idx,
+                    "K pool layer {} superblock_idx mismatch", l);
+                assert_eq!(first.block_index, h_k.block_index,
+                    "K pool layer {} block_index mismatch", l);
+                assert_eq!(first.superblock_idx, h_v.superblock_idx,
+                    "V pool layer {} superblock_idx mismatch", l);
+                assert_eq!(first.block_index, h_v.block_index,
+                    "V pool layer {} block_index mismatch", l);
+            } else {
+                handle = Some(h_k);
+            }
+        }
+
+        let h = handle.unwrap();
+
+        // Compute VA offset (same for all layers — use layer 0 K pool for reference).
+        let sb = &self.k_pools[0].superblocks.lock()[h.superblock_idx as usize];
+        let va_offset = sb.va_base + h.block_index as usize * self.block_bytes;
+
+        Ok((va_offset, h.superblock_idx, h.block_index))
+    }
+
+    /// Assign or reuse a block index and populate its BlockInfo.
+    fn install_block(&self, va_offset: usize, sb_idx: u32, blk_in_sb: u32) -> u32 {
+        let mut free = self.free_block_indices.lock();
+        if let Some(idx) = free.pop() {
+            let mut info = self.block_info.lock();
+            info[idx as usize] = BlockInfo {
+                va_offset,
+                superblock_idx: sb_idx,
+                block_index_in_sb: blk_in_sb,
+                in_use: true,
+            };
+            idx
+        } else {
+            let mut info = self.block_info.lock();
+            let idx = info.len() as u32;
+            info.push(BlockInfo {
+                va_offset,
+                superblock_idx: sb_idx,
+                block_index_in_sb: blk_in_sb,
+                in_use: true,
+            });
+            idx
+        }
+    }
+
     /// Allocate a single block. Returns the block index.
     /// Used during decode when a sequence needs to grow its block table.
     pub fn alloc_block(&self) -> Result<u32> {
-        let (handle, new_phys) = self.block_allocator.allocate(&self.vmm)?;
-
-        if let Some(phys_handle) = new_phys {
-            self.map_superblock(phys_handle, handle.superblock_idx as usize)?;
-        }
-
-        let sb = &self.superblocks.lock()[handle.superblock_idx as usize];
-        let va_offset = sb.va_base + handle.block_index as usize * self.block_bytes;
-
-        let block_idx = {
-            let mut free = self.free_block_indices.lock();
-            if let Some(idx) = free.pop() {
-                let mut info = self.block_info.lock();
-                info[idx as usize] = BlockInfo {
-                    va_offset,
-                    superblock_idx: handle.superblock_idx,
-                    block_index_in_sb: handle.block_index,
-                    in_use: true,
-                };
-                idx
-            } else {
-                let mut info = self.block_info.lock();
-                let idx = info.len() as u32;
-                info.push(BlockInfo {
-                    va_offset,
-                    superblock_idx: handle.superblock_idx,
-                    block_index_in_sb: handle.block_index,
-                    in_use: true,
-                });
-                idx
-            }
-        };
-
-        Ok(block_idx)
+        let (va_offset, sb_idx, blk_in_sb) = self.alloc_one_block_internal()?;
+        Ok(self.install_block(va_offset, sb_idx, blk_in_sb))
     }
 
     /// Append a block to an existing sequence's block table.
@@ -295,53 +387,19 @@ impl PagedKvCache {
     /// Allocate `num_blocks` for a new sequence. Returns the block table.
     pub fn alloc_sequence(&self, num_blocks: usize) -> Result<Vec<u32>> {
         let mut table = Vec::with_capacity(num_blocks);
-
         for _ in 0..num_blocks {
-            let (handle, new_phys) = self.block_allocator.allocate(&self.vmm)?;
-
-            // Map the superblock into VA if this is the first block from it
-            if let Some(phys_handle) = new_phys {
-                self.map_superblock(phys_handle, handle.superblock_idx as usize)?;
-            }
-
-            // Compute VA offset for this block
-            let sb = &self.superblocks.lock()[handle.superblock_idx as usize];
-            let va_offset = sb.va_base + handle.block_index as usize * self.block_bytes;
-
-            // Reuse or allocate a block index
-            let block_idx = {
-                let mut free = self.free_block_indices.lock();
-                if let Some(idx) = free.pop() {
-                    let mut info = self.block_info.lock();
-                    info[idx as usize] = BlockInfo {
-                        va_offset,
-                        superblock_idx: handle.superblock_idx,
-                        block_index_in_sb: handle.block_index,
-                        in_use: true,
-                    };
-                    idx
-                } else {
-                    let mut info = self.block_info.lock();
-                    let idx = info.len() as u32;
-                    info.push(BlockInfo {
-                        va_offset,
-                        superblock_idx: handle.superblock_idx,
-                        block_index_in_sb: handle.block_index,
-                        in_use: true,
-                    });
-                    idx
-                }
-            };
-
+            let (va_offset, sb_idx, blk_in_sb) = self.alloc_one_block_internal()?;
+            let block_idx = self.install_block(va_offset, sb_idx, blk_in_sb);
             table.push(block_idx);
         }
-
         Ok(table)
     }
 
     /// Free all blocks belonging to a sequence.
     pub fn free_sequence(&self, block_table: &[u32]) {
         let mut info = self.block_info.lock();
+        let num_layers = self.cfg.num_hidden_layers;
+
         for &block_idx in block_table {
             let bi = &mut info[block_idx as usize];
             if !bi.in_use {
@@ -349,11 +407,15 @@ impl PagedKvCache {
             }
             bi.in_use = false;
 
-            // Return block to free list
-            self.block_allocator.free(BlockHandle {
+            // Return blocks to all per-layer free lists
+            let handle = BlockHandle {
                 superblock_idx: bi.superblock_idx,
                 block_index: bi.block_index_in_sb,
-            });
+            };
+            for l in 0..num_layers {
+                self.k_pools[l].allocator.free(handle);
+                self.v_pools[l].allocator.free(handle);
+            }
 
             // Recycle the block index
             self.free_block_indices.lock().push(block_idx);
@@ -363,26 +425,28 @@ impl PagedKvCache {
     /// Register a new sequence with its block table. Returns the sequence index.
     pub fn register_sequence(&self, block_table: Vec<u32>) -> usize {
         let mut meta = self.seq_metadata.lock();
-        let mut epoch = self.seq_last_epoch.lock();
         let idx = meta.len();
         meta.push(SeqMetadata {
             block_table,
             seq_len: 0,
         });
-        epoch.push(current_epoch());
         idx
     }
 
     /// Unregister a sequence and free its blocks.
     pub fn unregister_sequence(&self, seq_idx: usize) {
         let block_table = {
-            let meta = self.seq_metadata.lock();
+            let mut meta = self.seq_metadata.lock();
             if seq_idx >= meta.len() {
                 return;
             }
-            meta[seq_idx].block_table.clone()
+            let table = std::mem::take(&mut meta[seq_idx].block_table);
+            meta[seq_idx].seq_len = 0;
+            table
         };
-        self.free_sequence(&block_table);
+        if !block_table.is_empty() {
+            self.free_sequence(&block_table);
+        }
     }
 
     /// Update sequence length.
@@ -393,34 +457,36 @@ impl PagedKvCache {
         }
     }
 
-    /// Record that the sequence was accessed at the current epoch.
-    /// Used for LRU victim selection.
-    pub fn record_epoch(&self, seq_idx: usize) {
-        let mut epoch = self.seq_last_epoch.lock();
-        if seq_idx < epoch.len() {
-            epoch[seq_idx] = current_epoch();
-        }
-    }
-
-    /// Get the epoch when this sequence was last accessed.
-    /// Lower value = older = better victim candidate.
-    pub fn get_seq_epoch(&self, seq_idx: usize) -> Option<u64> {
-        let epoch = self.seq_last_epoch.lock();
-        if seq_idx < epoch.len() {
-            Some(epoch[seq_idx])
-        } else {
-            None
-        }
-    }
-
     /// Get the block table for a given sequence index.
-    pub fn get_block_table(&self, seq_idx: usize) -> Option<Vec<u32>> {
+    /// Returns the block count (0 if sequence not found).
+    pub fn seq_block_count(&self, seq_idx: usize) -> usize {
         let meta = self.seq_metadata.lock();
         if seq_idx < meta.len() {
-            Some(meta[seq_idx].block_table.clone())
+            meta[seq_idx].block_table.len()
         } else {
-            None
+            0
         }
+    }
+
+    /// Get the block table VA offsets for a sequence.
+    /// Returns None if the sequence is not found or any block is invalid.
+    pub fn get_block_va_offsets(&self, seq_idx: usize) -> Option<Vec<usize>> {
+        let meta = self.seq_metadata.lock();
+        let seq = meta.get(seq_idx)?;
+        let info = self.block_info.lock();
+        let offsets: Option<Vec<usize>> = seq
+            .block_table
+            .iter()
+            .map(|&idx| {
+                let bi = info.get(idx as usize)?;
+                if bi.in_use {
+                    Some(bi.va_offset)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        offsets
     }
 
     /// Get the VA offset for a given block index.
@@ -459,10 +525,6 @@ impl PagedKvCache {
         self.seq_metadata.lock().len()
     }
 
-    pub fn block_allocator(&self) -> &Arc<PhysicalBlockAllocator> {
-        &self.block_allocator
-    }
-
     /// Write one step of KV data for a batch of sequences.
     pub fn append_step(
         &self,
@@ -495,7 +557,9 @@ impl PagedKvCache {
             if logical_block >= seq.block_table.len() {
                 return Err(anyhow!(
                     "logical block {} >= allocated {} for seq {}",
-                    logical_block, seq.block_table.len(), seq_idx
+                    logical_block,
+                    seq.block_table.len(),
+                    seq_idx
                 ));
             }
 
@@ -528,13 +592,24 @@ impl PagedKvCache {
 
     // --- Statistics ---
 
+    /// Fraction of physical GPU memory that is wasted due to superblock
+    /// allocation granularity. Each superblock is 2 MiB; blocks carved from
+    /// a superblock but not currently in use still consume physical memory.
+    ///
+    /// Returns 0.0 when no superblocks have been allocated.
     pub fn fragmentation_ratio(&self) -> f32 {
-        let free = self.block_allocator.free_count();
-        let total = self.block_allocator.total_blocks_allocated();
-        if total == 0 {
+        let num_layers = self.cfg.num_hidden_layers;
+        let superblocks = self.k_pools[0].allocator.superblock_count();
+        if superblocks == 0 {
             return 0.0;
         }
-        free as f32 / total as f32
+        // Each logical superblock position consumes num_layers * 2 physical superblocks.
+        let total_physical = superblocks * SUPERBLOCK_SIZE * num_layers * 2;
+        let physical_used = self.blocks_in_use() * self.block_bytes * num_layers * 2;
+        if physical_used >= total_physical {
+            return 0.0;
+        }
+        (total_physical - physical_used) as f32 / total_physical as f32
     }
 
     pub fn blocks_in_use(&self) -> usize {
@@ -559,6 +634,32 @@ impl PagedKvCache {
         (total_slots - total_tokens) as f32 / total_slots as f32
     }
 
+    /// Total blocks allocated across all per-layer pools (same for all pools).
+    pub fn total_physical_blocks(&self) -> usize {
+        self.k_pools[0].allocator.total_blocks_allocated()
+    }
+
+    /// Free blocks available across all per-layer pools (same for all pools).
+    pub fn free_physical_blocks(&self) -> usize {
+        self.k_pools[0].allocator.free_count()
+    }
+
+    /// Check if there are free blocks available.
+    pub fn has_free_blocks(&self) -> bool {
+        self.k_pools[0].allocator.free_count() > 0
+    }
+
+    /// Blocks per superblock (same for all per-layer pools).
+    pub fn blocks_per_superblock(&self) -> usize {
+        self.k_pools[0].allocator.blocks_per_superblock
+    }
+
+    /// Superblock count (number of logical superblock positions, each
+    /// backed by num_layers * 2 physical superblocks).
+    pub fn superblock_count(&self) -> usize {
+        self.k_pools[0].allocator.superblock_count()
+    }
+
     pub fn stats(&self) -> CacheStats {
         let meta = self.seq_metadata.lock();
         let active_seqs = meta.len();
@@ -566,26 +667,28 @@ impl PagedKvCache {
         let total_tokens: usize = meta.iter().map(|s| s.seq_len).sum();
         let allocated = self.total_blocks();
         let in_use = self.blocks_in_use();
-        let free_pool = self.block_allocator.free_count();
+        let free_pool = self.k_pools[0].allocator.free_count();
         let total_slots = total_blocks_used * self.block_size;
         let internal_frag = if total_slots > 0 {
             (total_slots - total_tokens) as f32 / total_slots as f32
         } else {
             0.0
         };
-        let sb_count = self.block_allocator.superblock_count();
+        let sb_count = self.k_pools[0].allocator.superblock_count();
+        let num_layers = self.cfg.num_hidden_layers;
 
         CacheStats {
             active_sequences: active_seqs,
             total_blocks_allocated: allocated,
             blocks_in_use: in_use,
             free_blocks_in_pool: free_pool,
-            blocks_per_superblock: self.block_allocator.blocks_per_superblock,
+            blocks_per_superblock: self.k_pools[0].allocator.blocks_per_superblock,
             superblocks_allocated: sb_count,
             block_bytes: self.block_bytes,
             total_tokens_stored: total_tokens,
             internal_fragmentation: internal_frag,
-            physical_memory_mib: (sb_count * SUPERBLOCK_SIZE) as f32 / (1024.0 * 1024.0),
+            physical_memory_mib: (sb_count * SUPERBLOCK_SIZE * num_layers * 2) as f32
+                / (1024.0 * 1024.0),
         }
     }
 }
@@ -594,16 +697,29 @@ impl PagedKvCache {
 
 impl Drop for PagedKvCache {
     fn drop(&mut self) {
-        // Unmap all superblocks from all VA regions
-        let sbs = std::mem::take(&mut *self.superblocks.lock());
         let num_layers = self.cfg.num_hidden_layers;
-        for sb in &sbs {
-            for l in 0..num_layers {
-                let _ = self.vmm.unmap(self.va_k[l], sb.va_base, SUPERBLOCK_SIZE);
-                let _ = self.vmm.unmap(self.va_v[l], sb.va_base, SUPERBLOCK_SIZE);
+
+        // Unmap and release per-layer K superblocks
+        for l in 0..num_layers {
+            let sbs = std::mem::take(&mut *self.k_pools[l].superblocks.lock());
+            for sb in &sbs {
+                let _ = self
+                    .vmm
+                    .unmap(self.va_k[l], sb.va_base, SUPERBLOCK_SIZE);
+                let _ = self.vmm.release_physical(sb.phys_handle);
             }
-            let _ = self.vmm.release_physical(sb.phys_handle);
         }
+        // Unmap and release per-layer V superblocks
+        for l in 0..num_layers {
+            let sbs = std::mem::take(&mut *self.v_pools[l].superblocks.lock());
+            for sb in &sbs {
+                let _ = self
+                    .vmm
+                    .unmap(self.va_v[l], sb.va_base, SUPERBLOCK_SIZE);
+                let _ = self.vmm.release_physical(sb.phys_handle);
+            }
+        }
+
         // Free all VA regions
         let va_size = self.max_blocks_total * self.block_bytes;
         let va_size = align_up(va_size, SUPERBLOCK_SIZE);
@@ -661,10 +777,41 @@ mod tests {
     #[test]
     fn test_allocator_free_reuse() {
         let alloc = PhysicalBlockAllocator::new(4 * 16 * 128);
-        alloc.free(BlockHandle { superblock_idx: 0, block_index: 0 });
-        alloc.free(BlockHandle { superblock_idx: 0, block_index: 1 });
-        alloc.free(BlockHandle { superblock_idx: 1, block_index: 5 });
+        alloc.free(BlockHandle {
+            superblock_idx: 0,
+            block_index: 0,
+        });
+        alloc.free(BlockHandle {
+            superblock_idx: 0,
+            block_index: 1,
+        });
+        alloc.free(BlockHandle {
+            superblock_idx: 1,
+            block_index: 5,
+        });
         assert_eq!(alloc.free_count(), 3);
+    }
+
+    #[test]
+    fn test_allocator_add_superblock() {
+        let alloc = PhysicalBlockAllocator::new(4 * 16 * 128);
+        assert_eq!(alloc.free_count(), 0);
+
+        alloc.add_superblock();
+        assert_eq!(alloc.superblock_count(), 1);
+        // All blocks (including block 0) are now in the free list.
+        assert_eq!(alloc.free_count(), alloc.blocks_per_superblock);
+    }
+
+    #[test]
+    fn test_allocator_try_allocate() {
+        let alloc = PhysicalBlockAllocator::new(4 * 16 * 128);
+        assert!(alloc.try_allocate().is_none());
+
+        alloc.add_superblock();
+        let h = alloc.try_allocate().unwrap();
+        assert_eq!(h.superblock_idx, 0);
+        // Block 0 may be returned since all blocks are in the free list.
     }
 
     // --- Block address computation tests ---
@@ -742,324 +889,24 @@ mod tests {
     fn test_align_up() {
         assert_eq!(align_up(0, SUPERBLOCK_SIZE), 0);
         assert_eq!(align_up(1, SUPERBLOCK_SIZE), SUPERBLOCK_SIZE);
-        assert_eq!(align_up(SUPERBLOCK_SIZE, SUPERBLOCK_SIZE), SUPERBLOCK_SIZE);
-        assert_eq!(align_up(SUPERBLOCK_SIZE + 1, SUPERBLOCK_SIZE), 4 * 1024 * 1024);
+        assert_eq!(
+            align_up(SUPERBLOCK_SIZE, SUPERBLOCK_SIZE),
+            SUPERBLOCK_SIZE
+        );
+        assert_eq!(
+            align_up(SUPERBLOCK_SIZE + 1, SUPERBLOCK_SIZE),
+            4 * 1024 * 1024
+        );
     }
 
     #[test]
     fn test_superblock_block_carving() {
         let elem_count = 4 * 16 * 128;
         let block_bytes = elem_count * std::mem::size_of::<f16>();
-        assert_eq!(SUPERBLOCK_SIZE % block_bytes, 0,
-            "block_bytes must divide superblock evenly");
-    }
-
-    // --- Step 3 GPU benchmarks (require CUDA device) ---
-
-    #[test]
-    fn step3_max_concurrent_requests() {
-        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
-        let cfg = ModelConfig::tiny_llama();
-
-        let max_batch = 256;
-        let max_seq_len = 256;
-        let block_size = 16;
-        let max_blocks_per_seq = (max_seq_len + block_size - 1) / block_size;
-
-        let cache = PagedKvCache::new(
-            ctx, cfg.clone(), max_batch, max_seq_len, block_size,
-        ).expect("create PagedKvCache");
-
-        println!("\n=== Step 3: Maximum Concurrent Requests ===");
-        println!("model: tiny_llama (kv_heads={}, head_dim={}, layers={})",
-            cfg.kv_heads(), cfg.head_dim(), cfg.num_hidden_layers);
-        println!("GPU map granularity: {} bytes", cache.vmm.map_granularity);
-        println!("block_size={}, max_seq_len={}, blocks_per_seq={}",
-            block_size, max_seq_len, max_blocks_per_seq);
-        println!("block_bytes={}, blocks_per_superblock={}",
-            cache.block_bytes, cache.block_allocator.blocks_per_superblock);
-
-        // Allocate until OOM
-        let mut allocated = 0usize;
-        for _ in 0..max_batch {
-            match cache.alloc_sequence(max_blocks_per_seq) {
-                Ok(table) => {
-                    cache.register_sequence(table);
-                    allocated += 1;
-                }
-                Err(e) => {
-                    println!("alloc_sequence failed at seq {}: {:?}", allocated, e);
-                    break;
-                }
-            }
-        }
-
-        let stats = cache.stats();
-        println!("\nResults:");
-        println!("  max concurrent requests:  {}", allocated);
-        println!("  total blocks allocated:   {}", stats.total_blocks_allocated);
-        println!("  blocks in use:            {}", stats.blocks_in_use);
-        println!("  free blocks in pool:      {}", stats.free_blocks_in_pool);
-        println!("  superblocks allocated:    {}", stats.superblocks_allocated);
-        println!("  physical memory:          {:.2} MiB", stats.physical_memory_mib);
-        println!("  physical blocks / request: {}", stats.blocks_in_use as f32 / allocated.max(1) as f32);
-
-        // Check how maps are batched
-        let maps_per_superblock = cfg.num_hidden_layers * 2;
-        let total_map_calls = stats.superblocks_allocated * maps_per_superblock;
-        println!("  total cuMemMap calls:     {} ({} per superblock)",
-            total_map_calls, maps_per_superblock);
-
-        // Free all
-        for i in 0..allocated {
-            cache.unregister_sequence(i);
-        }
-        let after = cache.stats();
-        println!("\nAfter freeing all:");
-        println!("  blocks in use:            {}", after.blocks_in_use);
-        println!("  free blocks in pool:      {}", after.free_blocks_in_pool);
-        println!("  free ratio:               {:.4}", cache.fragmentation_ratio());
-
-        assert!(allocated > 0, "should allocate at least some sequences");
-        println!("=== End Max Concurrent Requests ===\n");
-    }
-
-    #[test]
-    fn step3_fragmentation_rate() {
-        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
-        let cfg = ModelConfig::tiny_llama();
-
-        let max_batch = 64;
-        let max_seq_len = 256;
-        let block_size = 16;
-        let max_blocks_per_seq = (max_seq_len + block_size - 1) / block_size;
-
-        let cache = PagedKvCache::new(
-            ctx, cfg.clone(), max_batch, max_seq_len, block_size,
-        ).expect("create PagedKvCache");
-
-        println!("\n=== Step 3: Fragmentation Rate ===");
-
-        // Phase 1: allocate all sequences
-        let mut tables: Vec<Vec<u32>> = Vec::new();
-        let mut seq_indices: Vec<usize> = Vec::new();
-        for _i in 0..max_batch {
-            if let Ok(table) = cache.alloc_sequence(max_blocks_per_seq) {
-                let si = cache.register_sequence(table.clone());
-                cache.update_seq_len(si, max_seq_len);
-                tables.push(table);
-                seq_indices.push(si);
-            }
-        }
-
-        let stats = cache.stats();
-        println!("After allocating {} sequences:", tables.len());
-        println!("  internal_fragmentation: {:.4}", stats.internal_fragmentation);
-        println!("  blocks in use: {}", stats.blocks_in_use);
-        println!("  physical memory: {:.2} MiB", stats.physical_memory_mib);
-        println!("  superblocks: {}", stats.superblocks_allocated);
-
-        // Phase 2: free 50% to create holes
-        for (idx, table) in tables.iter().enumerate() {
-            if idx % 2 != 0 {
-                cache.free_sequence(table);
-            }
-        }
-
-        let mid_stats = cache.stats();
-        println!("\nAfter freeing 50% of sequences:");
-        println!("  blocks in use:         {}", mid_stats.blocks_in_use);
-        println!("  free blocks in pool:   {}", mid_stats.free_blocks_in_pool);
-        println!("  free block ratio:      {:.4}", cache.fragmentation_ratio());
-
-        // Phase 3: re-allocate with shorter sequences
-        let half_blocks = max_blocks_per_seq / 2;
-        let half_seq_len = half_blocks * block_size / 2;
-        let mut new_count = 0usize;
-        for _ in 0..(max_batch / 2) {
-            if let Ok(table) = cache.alloc_sequence(half_blocks) {
-                let si = cache.register_sequence(table);
-                cache.update_seq_len(si, half_seq_len);
-                new_count += 1;
-            } else {
-                break;
-            }
-        }
-
-        let final_stats = cache.stats();
-        println!("\nAfter re-allocating {} shorter sequences:", new_count);
-        println!("  active sequences:     {}", final_stats.active_sequences);
-        println!("  blocks in use:        {}", final_stats.blocks_in_use);
-        println!("  free blocks in pool:  {}", final_stats.free_blocks_in_pool);
-        println!("  total blocks:         {}", final_stats.total_blocks_allocated);
-        println!("  superblocks:          {}", final_stats.superblocks_allocated);
-
-        let wasted_tokens_in_last_block = new_count * (block_size - (half_seq_len % block_size));
-        println!("\nInternal fragmentation:");
-        println!("  total tokens stored:     {}", final_stats.total_tokens_stored);
-        println!("  total slots allocated:   {}", final_stats.blocks_in_use * block_size);
-        println!("  internal_fragmentation:  {:.4} ({:.2}%)",
-            final_stats.internal_fragmentation,
-            final_stats.internal_fragmentation * 100.0);
-        println!("  wasted slots in last blocks: ~{}", wasted_tokens_in_last_block);
-        println!("=== End Fragmentation Rate ===\n");
-
-        assert!(!tables.is_empty());
-    }
-
-    #[test]
-    fn step3_cumemmap_overhead() {
-        let vmm = CudaVmm::new(0).expect("cuda device 0");
-        let cfg = ModelConfig::tiny_llama();
-        let num_layers = cfg.num_hidden_layers;
-
-        println!("\n=== Step 3: cuMemMap/cuMemUnmap Overhead ===");
-        println!("GPU map granularity: {} bytes", vmm.map_granularity);
-        println!("num_layers={}, maps per superblock = {} (K+V per layer)",
-            num_layers, num_layers * 2);
-
-        // Setup: one 2MB VA region per layer, one 2MB physical handle
-        let va_k: Vec<u64> = (0..num_layers)
-            .map(|_| vmm.reserve_address(SUPERBLOCK_SIZE).expect("reserve K"))
-            .collect();
-        let va_v: Vec<u64> = (0..num_layers)
-            .map(|_| vmm.reserve_address(SUPERBLOCK_SIZE).expect("reserve V"))
-            .collect();
-
-        let _warmup = 4;
-        let iters = 16;
-
-        // --- Per-layer mapping benchmark (mimics per-block approach) ---
-        let per_layer_sizes = [8192, 16384, 32768, 65536, 131072, 262144, 524288, SUPERBLOCK_SIZE];
-
-        println!("\nPer-call latency vs. mapping size:");
-        println!("  {:>8}  {:>12}  {:>12}", "size", "map (µs)", "unmap (µs)");
-
-        for &size in &per_layer_sizes {
-            if size > SUPERBLOCK_SIZE || size < vmm.map_granularity {
-                continue;
-            }
-            let phys = vmm.create_physical(size).expect("create phys");
-
-            // Warmup
-            for _ in 0..2 {
-                for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
-                    vmm.map(vk, 0, phys, 0, size).unwrap();
-                    vmm.unmap(vk, 0, size).unwrap();
-                    vmm.map(vv, 0, phys, 0, size).unwrap();
-                    vmm.unmap(vv, 0, size).unwrap();
-                }
-            }
-
-            let start = std::time::Instant::now();
-            for _ in 0..iters {
-                for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
-                    vmm.map(vk, 0, phys, 0, size).unwrap();
-                    vmm.map(vv, 0, phys, 0, size).unwrap();
-                    vmm.unmap(vk, 0, size).unwrap();
-                    vmm.unmap(vv, 0, size).unwrap();
-                }
-            }
-            let elapsed = start.elapsed();
-            let total_ops = iters * num_layers * 2 * 2; // map+unmap × K+V
-            let avg_us = elapsed.as_micros() as f64 / total_ops as f64;
-
-            println!("  {:>8}  {:>12.2}  {:>12.2}", size, avg_us, avg_us);
-
-            vmm.release_physical(phys).expect("release");
-        }
-
-        // --- Full superblock mapping (our new approach) ---
-        println!("\nFull-superblock (2MB) mapping per layer:");
-        let phys = vmm.create_physical(SUPERBLOCK_SIZE).expect("create phys");
-
-        // Warmup
-        for (_i, (&vk, &vv)) in va_k.iter().zip(va_v.iter()).enumerate() {
-            vmm.map(vk, 0, phys, 0, SUPERBLOCK_SIZE).unwrap();
-            vmm.map(vv, 0, phys, 0, SUPERBLOCK_SIZE).unwrap();
-            vmm.unmap(vk, 0, SUPERBLOCK_SIZE).unwrap();
-            vmm.unmap(vv, 0, SUPERBLOCK_SIZE).unwrap();
-        }
-
-        let start = std::time::Instant::now();
-        for _ in 0..iters {
-            for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
-                vmm.map(vk, 0, phys, 0, SUPERBLOCK_SIZE).unwrap();
-                vmm.map(vv, 0, phys, 0, SUPERBLOCK_SIZE).unwrap();
-                vmm.unmap(vk, 0, SUPERBLOCK_SIZE).unwrap();
-                vmm.unmap(vv, 0, SUPERBLOCK_SIZE).unwrap();
-            }
-        }
-        let elapsed = start.elapsed();
-        let total_ops = iters * num_layers * 2 * 2;
-        let avg_us = elapsed.as_micros() as f64 / total_ops as f64;
-        println!("  avg per 2MB map/unmap:  {:.2} µs", avg_us);
-        println!("  total for {} layers:    {:.2} µs", num_layers, avg_us * num_layers as f64 * 2.0);
-
-        // Cleanup
-        for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
-            vmm.unmap(vk, 0, SUPERBLOCK_SIZE).unwrap();
-            vmm.unmap(vv, 0, SUPERBLOCK_SIZE).unwrap();
-        }
-        vmm.release_physical(phys).expect("release phys");
-        for v in va_k.iter().chain(va_v.iter()) {
-            vmm.free_address(*v, SUPERBLOCK_SIZE).expect("free va");
-        }
-
-        println!("=== End cuMemMap/cuMemUnmap Overhead ===\n");
-    }
-
-    #[test]
-    fn step3_internal_fragmentation_analysis() {
-        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
-        let cfg = ModelConfig::tiny_llama();
-
-        let max_batch = 16;
-        let max_seq_len = 128;
-        let block_size = 16;
-        let cache = PagedKvCache::new(
-            ctx, cfg, max_batch, max_seq_len, block_size,
-        ).expect("create PagedKvCache");
-
-        println!("\n=== Step 3: Internal Fragmentation Analysis ===");
-        println!("block_size={} tokens", block_size);
-
-        let seq_lengths = [1, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 100, 127, 128, 7];
-        let mut total_wasted = 0usize;
-        let mut total_slots = 0usize;
-
-        for &sl in &seq_lengths {
-            let blocks_needed = (sl + block_size - 1) / block_size;
-            let table = cache.alloc_sequence(blocks_needed).expect("alloc");
-            let seq_idx = cache.register_sequence(table);
-            cache.update_seq_len(seq_idx, sl);
-
-            let slots = blocks_needed * block_size;
-            let waste = slots - sl;
-            let frag = waste as f32 / slots as f32;
-            total_wasted += waste;
-            total_slots += slots;
-            println!(
-                "  seq_len={:3}  blocks={:2}  slots={:3}  waste={:2}  frag={:.3}",
-                sl, blocks_needed, slots, waste, frag
-            );
-        }
-
-        let overall_frag = total_wasted as f32 / total_slots as f32;
-        println!("\nSummary:");
-        println!("  total sequences:         {}", seq_lengths.len());
-        println!("  total slots allocated:   {}", total_slots);
-        println!("  total tokens stored:     {}", total_slots - total_wasted);
-        println!("  total wasted slots:      {}", total_wasted);
-        println!("  overall internal frag:   {:.4} ({:.2}%)",
-            overall_frag, overall_frag * 100.0);
-        println!("  average waste per seq:   {:.1} tokens",
-            total_wasted as f32 / seq_lengths.len() as f32);
-
-        let stats = cache.stats();
-        println!("\n  cache.internal_fragmentation() = {:.4}", stats.internal_fragmentation);
-        println!("=== End Internal Fragmentation Analysis ===\n");
-
-        assert_eq!(total_slots - total_wasted, seq_lengths.iter().sum::<usize>());
+        assert_eq!(
+            SUPERBLOCK_SIZE % block_bytes,
+            0,
+            "block_bytes must divide superblock evenly"
+        );
     }
 }

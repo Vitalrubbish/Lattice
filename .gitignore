@@ -7,4 +7,6 @@ Cargo.lock
 perf.data*
 flamegraph.svg
 AGENTS.md
+CLAUDE.md
+results
 .claude

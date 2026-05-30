@@ -2,11 +2,12 @@ use anyhow::Result;
 use crossbeam_channel::Sender;
 use cudarc::driver::CudaSlice;
 use half::f16;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::cache::paged_kv::{PagedKvCache, BLOCK_SIZE};
-use crate::cache::{EvictedSeqData, SwapManager, advance_epoch};
+use crate::cache::{EvictedSeqData, SwapManager, advance_epoch, current_epoch};
 use crate::config::ModelConfig;
 use crate::cuda::CudaContext;
 use crate::decoder::greedy_sample;
@@ -62,6 +63,8 @@ pub struct ContinuousScheduler {
     swap_manager: SwapManager,
     /// Swapped-out sequences waiting for GPU memory to become available.
     swapped: Vec<SwappedRequest>,
+    /// Per-sequence last-access epoch for LRU victim selection.
+    seq_last_epoch: HashMap<usize, u64>,
 }
 
 impl ContinuousScheduler {
@@ -85,6 +88,7 @@ impl ContinuousScheduler {
             queue,
             swap_manager: SwapManager::new(),
             swapped: Vec::new(),
+            seq_last_epoch: HashMap::new(),
         }
     }
 
@@ -169,6 +173,8 @@ impl ContinuousScheduler {
             match self.cache.alloc_sequence(blocks_needed) {
                 Ok(block_table) => {
                     let seq_idx = self.cache.register_sequence(block_table);
+                    self.seq_last_epoch
+                        .insert(seq_idx, current_epoch());
                     tracing::debug!(
                         req_id = waiting[i].0.id,
                         seq_idx,
@@ -200,7 +206,7 @@ impl ContinuousScheduler {
                     }
 
                     // VRAM exhausted — try to evict a running sequence
-                    if let Some(victim_idx) = select_victim(running, self.cache.as_ref()) {
+                    if let Some(victim_idx) = self.select_victim(running) {
                         let victim = &running[victim_idx];
                         tracing::info!(
                             req_id = victim.req.id,
@@ -215,6 +221,7 @@ impl ContinuousScheduler {
                         ) {
                             Ok(kv_data) => {
                                 let v = running.remove(victim_idx);
+                                self.seq_last_epoch.remove(&v.seq_idx);
                                 self.cache.unregister_sequence(v.seq_idx);
                                 tracing::debug!(
                                     req_id = v.req.id,
@@ -289,6 +296,8 @@ impl ContinuousScheduler {
 
                     let seq_idx = self.cache.register_sequence(new_block_table);
                     self.cache.update_seq_len(seq_idx, sw.position);
+                    self.seq_last_epoch
+                        .insert(seq_idx, current_epoch());
                     tracing::debug!(
                         req_id = sw.request.id,
                         seq_idx,
@@ -339,6 +348,7 @@ impl ContinuousScheduler {
             if is_done {
                 let r = running.remove(i);
                 freed_blocks += r.num_blocks;
+                self.seq_last_epoch.remove(&r.seq_idx);
                 self.cache.unregister_sequence(r.seq_idx);
                 let _ = r.tx.send(InferenceResponse {
                     id: r.req.id,
@@ -354,11 +364,9 @@ impl ContinuousScheduler {
         freed_blocks
     }
 
-    /// Check for completed swapped sequences (e.g., exceeded max_new_tokens or max_seq_len
-    /// during swap). Send their responses with whatever was generated so far.
-    ///
-    /// Currently swapped sequences that haven't started generating keep waiting.
-    /// In the future this could be extended to timeout long-swapped requests.
+    /// Check for completed swapped sequences (e.g., exceeded max_new_tokens or
+    /// max_seq_len during swap). Send their responses with whatever was
+    /// generated so far.
     fn drain_completed_swapped(&mut self) {
         let mut done = Vec::new();
         for i in 0..self.swapped.len() {
@@ -402,15 +410,13 @@ impl ContinuousScheduler {
         let positions: Vec<usize> = running.iter().map(|r| r.position).collect();
 
         // Allocate additional blocks BEFORE forward step.
-        // The initial alloc_sequence gave ceil(prompt_len/BLOCK_SIZE) blocks.
-        // During decode, position may cross a block boundary — we need blocks
-        // for the current position's logical block.
         for r in running.iter_mut() {
             let blocks_needed = (r.position / BLOCK_SIZE) + 1;
             while blocks_needed > r.num_blocks {
                 match self.cache.alloc_block() {
                     Ok(block_idx) => {
-                        self.cache.append_block_to_sequence(r.seq_idx, block_idx);
+                        self.cache
+                            .append_block_to_sequence(r.seq_idx, block_idx);
                         r.num_blocks += 1;
                     }
                     Err(_e) => {
@@ -427,8 +433,9 @@ impl ContinuousScheduler {
         }
 
         // Mark all running sequences as accessed at current epoch
+        let epoch = current_epoch();
         for r in running.iter() {
-            self.cache.record_epoch(r.seq_idx);
+            self.seq_last_epoch.insert(r.seq_idx, epoch);
         }
 
         // Run the transformer forward step (per-layer GEMM + KV cache write)
@@ -451,7 +458,10 @@ impl ContinuousScheduler {
                     if new_pos >= r.req.prompt_tokens.len() {
                         r.state = RequestState::Decode;
                         r.position = r.req.prompt_tokens.len();
-                        tracing::debug!(req_id = r.req.id, "prefill complete, entering decode");
+                        tracing::debug!(
+                            req_id = r.req.id,
+                            "prefill complete, entering decode"
+                        );
                     } else {
                         r.state = RequestState::Prefill {
                             prompt_pos: new_pos,
@@ -469,68 +479,70 @@ impl ContinuousScheduler {
 
         Ok(())
     }
-}
 
-/// Check if there are free blocks available in the allocator pool.
-fn free_blocks_available(cache: &PagedKvCache) -> bool {
-    cache.block_allocator().free_count() > 0
-}
-
-/// Select a victim sequence from the running set for eviction.
-/// Returns the index in the running Vec, or None if no sequence can be evicted.
-///
-/// Policy: LRU — the sequence with the smallest (oldest) epoch.
-/// Among sequences with the same epoch, prefer those with more blocks
-/// (fewer evictions needed to free a given amount of memory).
-fn select_victim(running: &[RunningRequest], cache: &PagedKvCache) -> Option<usize> {
-    if running.is_empty() {
-        return None;
-    }
-
-    // Don't preempt sequences still in Prefill — they haven't generated tokens yet
-    // and evicting them wastes prompt processing work.
-    let mut best: Option<(usize, u64, isize)> = None; // (idx, epoch, -blocks)
-
-    for (i, r) in running.iter().enumerate() {
-        // Only preempt decode-stage sequences (prefill is cheap to replay but we skip for simplicity)
-        if matches!(r.state, RequestState::Prefill { .. }) {
-            continue;
+    /// Select a victim sequence from the running set for eviction.
+    /// Returns the index in the running Vec, or None if no sequence can be evicted.
+    ///
+    /// Policy: LRU — the sequence with the smallest (oldest) epoch.
+    /// Among sequences with the same epoch, prefer those with more blocks
+    /// (fewer evictions needed to free a given amount of memory).
+    fn select_victim(&self, running: &[RunningRequest]) -> Option<usize> {
+        if running.is_empty() {
+            return None;
         }
 
-        let epoch = cache.get_seq_epoch(r.seq_idx).unwrap_or(0);
-        let blocks = -(r.num_blocks as isize); // negate so more blocks = smaller = better
+        // Don't preempt sequences still in Prefill.
+        let mut best: Option<(usize, u64, isize)> = None; // (idx, epoch, -blocks)
 
-        match best {
-            None => {
-                best = Some((i, epoch, blocks));
-            }
-            Some((_, best_epoch, best_blocks)) => {
-                if epoch < best_epoch || (epoch == best_epoch && blocks < best_blocks) {
-                    best = Some((i, epoch, blocks));
-                }
-            }
-        }
-    }
-
-    // Fall back to any running sequence if no decode-stage ones exist
-    if best.is_none() {
         for (i, r) in running.iter().enumerate() {
-            let epoch = cache.get_seq_epoch(r.seq_idx).unwrap_or(0);
+            if matches!(r.state, RequestState::Prefill { .. }) {
+                continue;
+            }
+
+            let epoch = self.seq_last_epoch.get(&r.seq_idx).copied().unwrap_or(0);
             let blocks = -(r.num_blocks as isize);
+
             match best {
                 None => {
                     best = Some((i, epoch, blocks));
                 }
                 Some((_, best_epoch, best_blocks)) => {
-                    if epoch < best_epoch || (epoch == best_epoch && blocks < best_blocks) {
+                    if epoch < best_epoch
+                        || (epoch == best_epoch && blocks < best_blocks)
+                    {
                         best = Some((i, epoch, blocks));
                     }
                 }
             }
         }
-    }
 
-    best.map(|(i, _, _)| i)
+        // Fall back to any running sequence if no decode-stage ones exist
+        if best.is_none() {
+            for (i, r) in running.iter().enumerate() {
+                let epoch = self.seq_last_epoch.get(&r.seq_idx).copied().unwrap_or(0);
+                let blocks = -(r.num_blocks as isize);
+                match best {
+                    None => {
+                        best = Some((i, epoch, blocks));
+                    }
+                    Some((_, best_epoch, best_blocks)) => {
+                        if epoch < best_epoch
+                            || (epoch == best_epoch && blocks < best_blocks)
+                        {
+                            best = Some((i, epoch, blocks));
+                        }
+                    }
+                }
+            }
+        }
+
+        best.map(|(i, _, _)| i)
+    }
+}
+
+/// Check if there are free blocks available in the allocator pool.
+fn free_blocks_available(cache: &PagedKvCache) -> bool {
+    cache.has_free_blocks()
 }
 
 #[cfg(test)]
@@ -602,7 +614,11 @@ mod integration_tests {
         let resp = queue.submit_blocking(req).expect("response");
 
         assert_eq!(resp.id, 100);
-        assert_eq!(resp.generated_tokens.len(), 3, "should generate max_new_tokens");
+        assert_eq!(
+            resp.generated_tokens.len(),
+            3,
+            "should generate max_new_tokens"
+        );
         assert!(
             resp.generated_tokens.iter().all(|&t| t == 0),
             "zero weights produce token 0, got {:?}",
@@ -657,7 +673,11 @@ mod integration_tests {
 
         let resp = queue.submit_blocking(req).expect("response");
         assert_eq!(resp.id, 200);
-        assert_eq!(resp.generated_tokens.len(), 1, "should stop at EOS token 0");
+        assert_eq!(
+            resp.generated_tokens.len(),
+            1,
+            "should stop at EOS token 0"
+        );
         assert_eq!(resp.generated_tokens[0], 0);
     }
 }

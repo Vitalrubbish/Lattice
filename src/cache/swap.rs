@@ -45,21 +45,17 @@ impl SwapManager {
     ///
     /// Copies K and V data for all layers from GPU VA to host buffers,
     /// then returns the host-side data. The caller must call
-    /// `cache.free_sequence()` to release the GPU blocks afterward.
-    ///
-    /// # Safety
-    ///
-    /// This function does NOT free GPU blocks — the caller owns that step.
+    /// `cache.unregister_sequence()` to release the GPU blocks afterward.
     pub fn evict_sequence(
         &self,
         cache: &PagedKvCache,
         seq_idx: usize,
     ) -> Result<EvictedSeqData> {
-        let block_table = cache
-            .get_block_table(seq_idx)
-            .ok_or_else(|| anyhow!("seq {} not found", seq_idx))?;
+        let va_offsets = cache
+            .get_block_va_offsets(seq_idx)
+            .ok_or_else(|| anyhow!("seq {} not found or has invalid blocks", seq_idx))?;
 
-        let num_blocks = block_table.len();
+        let num_blocks = va_offsets.len();
         if num_blocks == 0 {
             return Ok(EvictedSeqData {
                 k_layers: Vec::new(),
@@ -72,16 +68,6 @@ impl SwapManager {
         let block_bytes = cache.block_bytes;
         let num_layers = cache.cfg.num_hidden_layers;
         let total_bytes = num_blocks * block_bytes;
-
-        // Collect VA offsets for each block
-        let va_offsets: Vec<usize> = block_table
-            .iter()
-            .map(|&idx| {
-                cache
-                    .get_block_va_offset(idx)
-                    .ok_or_else(|| anyhow!("block {} not found", idx))
-            })
-            .collect::<Result<Vec<_>>>()?;
 
         let mut k_layers: Vec<Vec<u8>> = Vec::with_capacity(num_layers);
         let mut v_layers: Vec<Vec<u8>> = Vec::with_capacity(num_layers);
@@ -241,7 +227,12 @@ impl SwapManager {
     /// Free host buffers associated with evicted data.
     /// Called when a swapped sequence is dropped (e.g., when it finally completes).
     pub fn drop_swapped(&self, data: &EvictedSeqData) -> usize {
-        let freed = data.k_layers.iter().chain(data.v_layers.iter()).map(|v| v.len()).sum::<usize>();
+        let freed = data
+            .k_layers
+            .iter()
+            .chain(data.v_layers.iter())
+            .map(|v| v.len())
+            .sum::<usize>();
         {
             let mut swapped = self.total_swapped_bytes.lock();
             *swapped = swapped.saturating_sub(freed);
@@ -280,8 +271,9 @@ mod tests {
         let max_seq_len = 64;
         let block_size = 16;
 
-        let cache = PagedKvCache::new(ctx.clone(), cfg, max_batch, max_seq_len, block_size)
-            .expect("create PagedKvCache");
+        let cache =
+            PagedKvCache::new(ctx.clone(), cfg, max_batch, max_seq_len, block_size)
+                .expect("create PagedKvCache");
 
         let swap = SwapManager::new();
 
@@ -302,7 +294,9 @@ mod tests {
         cache.free_sequence(&block_table);
 
         // Restore
-        let new_table = swap.restore_sequence(&cache, &evicted).expect("restore");
+        let new_table = swap
+            .restore_sequence(&cache, &evicted)
+            .expect("restore");
 
         assert_eq!(new_table.len(), blocks_needed);
 
@@ -319,8 +313,8 @@ mod tests {
         let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
         let cfg = ModelConfig::tiny_llama();
 
-        let cache = PagedKvCache::new(ctx.clone(), cfg, 4, 64, 16)
-            .expect("create PagedKvCache");
+        let cache =
+            PagedKvCache::new(ctx.clone(), cfg, 4, 64, 16).expect("create PagedKvCache");
 
         let swap = SwapManager::new();
 
@@ -329,7 +323,9 @@ mod tests {
         let evicted = swap.evict_sequence(&cache, seq_idx).expect("evict empty");
         assert_eq!(evicted.num_blocks, 0);
 
-        let new_table = swap.restore_sequence(&cache, &evicted).expect("restore empty");
+        let new_table = swap
+            .restore_sequence(&cache, &evicted)
+            .expect("restore empty");
         assert!(new_table.is_empty());
 
         swap.drop_swapped(&evicted);
@@ -353,8 +349,8 @@ mod tests {
         use std::sync::Arc;
         let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
         let cfg = ModelConfig::tiny_llama();
-        let cache = PagedKvCache::new(ctx.clone(), cfg, 4, 64, 16)
-            .expect("create PagedKvCache");
+        let cache =
+            PagedKvCache::new(ctx.clone(), cfg, 4, 64, 16).expect("create PagedKvCache");
 
         let swap = SwapManager::new();
         assert_eq!(swap.total_swapped_bytes(), 0);
@@ -365,11 +361,14 @@ mod tests {
         cache.update_seq_len(seq_idx, 32);
 
         let evicted = swap.evict_sequence(&cache, seq_idx).expect("evict");
-        let expected_bytes = blocks_needed * cache.block_bytes * cache.cfg.num_hidden_layers * 2;
+        let expected_bytes =
+            blocks_needed * cache.block_bytes * cache.cfg.num_hidden_layers * 2;
         assert_eq!(swap.total_swapped_bytes(), expected_bytes);
 
         // Restore should free swap
-        let new_table = swap.restore_sequence(&cache, &evicted).expect("restore");
+        let new_table = swap
+            .restore_sequence(&cache, &evicted)
+            .expect("restore");
         assert_eq!(swap.total_swapped_bytes(), 0);
 
         cache.free_sequence(&new_table);
