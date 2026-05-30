@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# scripts/run_step3_bench.sh — Step 3 throughput benchmark
+# scripts/step3_test_wsl2.sh — Step 3 benchmark for WSL2
+#
+# NOTE: vLLM DOES NOT WORK on Blackwell GPUs (RTX 5070, sm_120) due to
+# FlashInfer not supporting compute capability 12.x yet.
+# This script supports baseline-only mode on WSL2.
+# For full vLLM comparison, use step3_test_baremetal.sh on an A30 server.
 #
 # Modes:
-#   ./scripts/run_step3_bench.sh baseline     # Baseline server only
-#   ./scripts/run_step3_bench.sh vllm          # vLLM only
-#   ./scripts/run_step3_bench.sh compare       # Both, side by side
+#   ./scripts/step3_test_wsl2.sh baseline     # Baseline server + GPU tests
 #
-# Config (env vars or edit defaults below):
-#   MODEL_PATH      Path to TinyLlama safetensors (default: /home/vitalrubbish/models/tinyllama)
-#   NUM_REQUESTS    Requests per run (default: 50)
-#   CONCURRENCY     Concurrent connections (default: 4)
-#   MAX_NEW_TOKENS  Max tokens to generate (default: 64)
+# Config (env vars):
+#   NUM_REQUESTS            Requests per run (default: 50)
+#   CONCURRENCY             Concurrent connections (default: 4)
+#   MAX_NEW_TOKENS          Max tokens to generate (default: 64)
+#   MAX_BATCH               Max concurrent seqs (default: 32)
+#   MAX_SEQ_LEN             Max sequence length (default: 512)
 # ==============================================================================
 set -euo pipefail
 
@@ -20,7 +24,6 @@ PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 
 # ── Defaults ──
 MODE="${1:-baseline}"
-MODEL_PATH="${MODEL_PATH:-/home/vitalrubbish/models/tinyllama}"
 NUM_REQUESTS="${NUM_REQUESTS:-50}"
 CONCURRENCY="${CONCURRENCY:-4}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
@@ -32,10 +35,30 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RESULTS_DIR="$PROJ_DIR/results/wsl2/step3_${MODE}_${TIMESTAMP}"
 
 # ── Sanity ──
-if [ "$MODE" != "baseline" ] && [ "$MODE" != "vllm" ] && [ "$MODE" != "compare" ]; then
-    echo "Usage: $0 {baseline|vllm|compare}"
+if [ "$MODE" = "vllm" ] || [ "$MODE" = "compare" ]; then
+    echo "=============================================================="
+    echo " WARNING: vLLM does not work on Blackwell GPUs (sm_120)."
+    echo " FlashInfer lacks pre-compiled kernels for compute capability 12.x."
+    echo ""
+    echo " To run vLLM benchmarks, use an A30 (sm_80) bare-metal server with"
+    echo " step3_test_baremetal.sh instead."
+    echo "=============================================================="
+    echo ""
+    if [ "$MODE" = "vllm" ]; then
+        echo "ERROR: vllm mode not supported on this GPU. Exiting."
+        exit 1
+    fi
+    echo "Falling back to baseline-only mode."
+    MODE="baseline"
+fi
+
+if ! command -v nvidia-smi &>/dev/null; then
+    echo "ERROR: nvidia-smi not found. Is the NVIDIA driver installed?"
     exit 1
 fi
+
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown')"
+echo "VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null || echo 'unknown') MiB"
 
 # ── Proxy killers (curl/nc/ss get hijacked by http_proxy on this host) ──
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
@@ -69,36 +92,42 @@ cleanup() {
     echo ">>> Cleaning up..."
     [ -n "${BASELINE_PID:-}" ] && graceful_kill "$BASELINE_PID"
     [ -n "${VLLM_PID:-}" ] && graceful_kill "$VLLM_PID"
-    # Also kill any stray engine core
-    pkill -9 -f "VLLM::EngineCore" 2>/dev/null || true
+    pkill -9 -f "EngineCore" 2>/dev/null || true
     echo "Done."
 }
 trap cleanup EXIT
 
-# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 echo "=============================================="
-echo " Step 3 Benchmark — mode: $MODE"
+echo " Step 3 Benchmark (WSL2) — mode: $MODE"
 echo "=============================================="
-echo " Model:       $MODEL_PATH"
 echo " Requests:    $NUM_REQUESTS"
 echo " Concurrency: $CONCURRENCY"
 echo " Gen tokens:  $MAX_NEW_TOKENS"
-echo " Baseline:    port $BASELINE_PORT"
-echo " vLLM:        port $VLLM_PORT"
+echo " Max batch:   $MAX_BATCH"
+echo " Max seq len: $MAX_SEQ_LEN"
 echo " Results:     $RESULTS_DIR"
 echo "=============================================="
 
 mkdir -p "$RESULTS_DIR"
 
 # ── Build ──
-if [ "$MODE" = "baseline" ] || [ "$MODE" = "compare" ]; then
-    echo ""
-    echo ">>> Building baseline server + bench tool..."
-    cd "$PROJ_DIR"
-    cargo build --release --bin baseline-server --example bench_throughput 2>&1 | tail -2
-fi
+echo ""
+echo ">>> Building baseline server + bench tool..."
+cd "$PROJ_DIR"
+cargo build --release --bin baseline-server --example bench_throughput 2>&1 | tail -4
 
-# ═══════════════════════════════════════════════════════════
+# ── Run Rust GPU tests ──
+echo ""
+echo ">>> Running Rust GPU tests (fragmentation, max concurrency, cuMemMap overhead)..."
+cargo test --release --package baseline-llm-os -- \
+    step3_max_concurrent_requests \
+    step3_fragmentation_rate \
+    step3_cumemmap_overhead \
+    step3_internal_fragmentation_analysis \
+    --nocapture 2>&1 | tee "$RESULTS_DIR/baseline_gpu_tests.txt"
+
+# ═══════════════════════════════════════════════════════════════
 run_baseline() {
     echo ""
     echo "──────────────────────────────────────────────"
@@ -123,7 +152,7 @@ run_baseline() {
     echo "   -> Ready"
 
     echo ""
-    echo ">>> Running benchmark..."
+    echo ">>> Running throughput benchmark..."
     timeout 600 "$PROJ_DIR/target/release/examples/bench_throughput" \
         --addr "127.0.0.1:$BASELINE_PORT" \
         --num-requests "$NUM_REQUESTS" \
@@ -138,94 +167,40 @@ run_baseline() {
     unset BASELINE_PID
 }
 
-# ═══════════════════════════════════════════════════════════
-run_vllm() {
-    echo ""
-    echo "──────────────────────────────────────────────"
-    echo " vLLM Server  (port $VLLM_PORT)"
-    echo "──────────────────────────────────────────────"
-
-    # Activate the conda env with vLLM + FlashInfer patch applied
-    eval "$(conda shell.bash hook)" 2>/dev/null || true
-    conda activate vllm-bench 2>/dev/null || {
-        echo "ERROR: conda env 'vllm-bench' not found. Install with:"
-        echo "  conda create -n vllm-bench python=3.12 -y"
-        echo "  conda activate vllm-bench"
-        echo "  pip install vllm"
-        exit 1
-    }
-
-    # Re-clear proxy after conda activation (conda may re-set them)
-    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
-    export NO_PROXY="*" no_proxy="*"
-
-    local SITE_PACKAGES
-    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
-
-    # Ensure FlashInfer CCCL patch is applied
-    local CCCL_FILE="$SITE_PACKAGES/flashinfer/compilation_context.py"
-    if ! grep -q "CCCL_DISABLE_CTK_COMPATIBILITY_CHECK" "$CCCL_FILE" 2>/dev/null; then
-        echo ">>> Applying FlashInfer CCCL patch..."
-        sed -i 's/COMMON_NVCC_FLAGS = \[/COMMON_NVCC_FLAGS = ["-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",/' "$CCCL_FILE"
+# ═══════════════════════════════════════════════════════════════
+collect_gpu_test_metrics() {
+    local file="$RESULTS_DIR/baseline_gpu_tests.txt"
+    if [ ! -f "$file" ]; then
+        echo "  (no GPU test output)"
+        return
     fi
 
-    export CUDA_HOME="$SITE_PACKAGES/nvidia/cu13"
-    export FLASHINFER_CUDA_ARCH_LIST="12.0"
-
-    vllm serve "$MODEL_PATH" \
-        --host 127.0.0.1 --port "$VLLM_PORT" \
-        --block-size 16 \
-        --gpu-memory-utilization 0.85 \
-        --max-num-seqs "$MAX_BATCH" \
-        --max-model-len "$MAX_SEQ_LEN" \
-        --enforce-eager \
-        &> "$RESULTS_DIR/vllm_server.log" &
-    VLLM_PID=$!
-    echo "   PID: $VLLM_PID"
-
-    echo ">>> Waiting for vLLM to load model (may take 2-5 min on first run)..."
-    if ! wait_port "$VLLM_PORT" 300; then
-        echo "ERROR: vLLM did not start in 5 min"
-        tail -30 "$RESULTS_DIR/vllm_server.log"
-        exit 1
-    fi
-    echo "   -> Ready"
-
-    # Wait a beat for the server to fully accept connections
-    sleep 2
-
-    # Warmup request (first request triggers Triton JIT)
-    echo ">>> Warmup..."
-    http_proxy="" https_proxy="" python3 -c "
-import http.client, json, os
-os.environ.pop('http_proxy', None)
-os.environ.pop('https_proxy', None)
-conn = http.client.HTTPConnection('127.0.0.1', $VLLM_PORT, timeout=60)
-conn.request('POST', '/v1/completions',
-    body=json.dumps({'model': '$MODEL_PATH', 'prompt': 'Hello', 'max_tokens': 3}),
-    headers={'Content-Type': 'application/json'})
-r = conn.getresponse(); r.read()
-print('   warmup status:', r.status)
-" 2>&1
-
-    # Run benchmark via Python (same prompt-length distribution as baseline)
     echo ""
-    echo ">>> Running vLLM benchmark..."
-    http_proxy="" https_proxy="" python3 "$SCRIPT_DIR/bench_vllm.py" \
-        --port "$VLLM_PORT" \
-        --model "$MODEL_PATH" \
-        --num-requests "$NUM_REQUESTS" \
-        --max-new-tokens "$MAX_NEW_TOKENS" \
-        --output-csv "$RESULTS_DIR/vllm_results.csv" \
-        2>&1 | tee "$RESULTS_DIR/vllm_output.txt"
-
+    echo ">>> Baseline GPU Test Metrics:"
     echo ""
-    echo ">>> Stopping vLLM..."
-    graceful_kill "$VLLM_PID"
-    unset VLLM_PID
+
+    local max_conc
+    max_conc=$(grep -Po 'max concurrent requests:\s+\K\d+' "$file" 2>/dev/null || echo "N/A")
+    echo "  max_concurrent_requests:  $max_conc"
+
+    local int_frag
+    int_frag=$(grep -Po 'internal_fragmentation:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  internal_fragmentation:   $int_frag"
+
+    local map_overhead
+    map_overhead=$(grep -Po 'avg per 2MB map/unmap:\s+\K[\d.]+' "$file" 2>/dev/null || echo "N/A")
+    echo "  avg_2MB_map_unmap_us:     $map_overhead"
+
+    local phys_mem
+    phys_mem=$(grep -Po 'physical memory:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  physical_memory_mib:      $phys_mem"
+
+    local map_calls
+    map_calls=$(grep -Po 'total cuMemMap calls:\s+\K\d+' "$file" 2>/dev/null || echo "N/A")
+    echo "  total_cuMemMap_calls:     $map_calls"
 }
 
-# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 summarize() {
     local label="$1" file="$2"
     if [ ! -f "$file" ]; then echo "  [$label] (no data)"; return; fi
@@ -234,34 +209,18 @@ summarize() {
         "$file" 2>/dev/null | sed 's/^/    /' || true
 }
 
-# ═══════════════════════════════════════════════════════════
-case "$MODE" in
-    baseline)
-        run_baseline
-        echo ""
-        summarize "baseline" "$RESULTS_DIR/baseline_output.txt"
-        ;;
-    vllm)
-        run_vllm
-        echo ""
-        summarize "vllm" "$RESULTS_DIR/vllm_output.txt"
-        ;;
-    compare)
-        run_baseline
-        run_vllm
-        echo ""
-        echo "=============================================="
-        echo " Comparison Summary"
-        echo "=============================================="
-        summarize "baseline" "$RESULTS_DIR/baseline_output.txt"
-        echo ""
-        summarize "vllm"     "$RESULTS_DIR/vllm_output.txt"
-        ;;
-esac
+# ═══════════════════════════════════════════════════════════════
+run_baseline
+collect_gpu_test_metrics
+echo ""
+summarize "baseline" "$RESULTS_DIR/baseline_output.txt"
 
 echo ""
 echo "=============================================="
 echo " Done."
 echo " Results: $RESULTS_DIR/"
 ls -la "$RESULTS_DIR/"
+echo ""
+echo " NOTE: vLLM comparison requires bare-metal A30 server."
+echo "       Run step3_test_baremetal.sh for full comparison."
 echo "=============================================="
