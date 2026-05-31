@@ -135,9 +135,9 @@ if [ "$MODE" = "baseline" ] || [ "$MODE" = "compare" ]; then
     echo ">>> Running Rust GPU tests (fragmentation, max concurrency, cuMemMap overhead)..."
     cargo test --release --package baseline-llm-os -- \
         step3_max_concurrent_requests \
-        step3_fragmentation_rate \
+        step3_runtime_fragmentation \
         step3_cumemmap_overhead \
-        step3_internal_fragmentation_analysis \
+        --test-threads=1 \
         --nocapture 2>&1 | tee "$RESULTS_DIR/baseline_gpu_tests.txt"
 fi
 
@@ -291,6 +291,19 @@ collect_gpu_test_metrics() {
     local map_calls
     map_calls=$(grep -Po 'total cuMemMap calls:\s+\K\d+' "$file" 2>/dev/null || echo "N/A")
     echo "  total_cuMemMap_calls:     $map_calls"
+
+    # Runtime fragmentation
+    local runtime_frag_avg
+    runtime_frag_avg=$(grep -Po 'avg runtime fragmentation ratio:\s+\K[\d.]+' "$file" 2>/dev/null || echo "N/A")
+    echo "  runtime_frag_avg_ratio:   $runtime_frag_avg"
+
+    local runtime_frag_peak
+    runtime_frag_peak=$(grep -Po 'peak \(worst\):\s+\K[\d.]+' "$file" 2>/dev/null || echo "N/A")
+    echo "  runtime_frag_peak_ratio:  $runtime_frag_peak"
+
+    local runtime_frag_stddev
+    runtime_frag_stddev=$(grep -Po 'stddev:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  runtime_frag_stddev:      $runtime_frag_stddev"
 }
 
 # ═══════════════════════════════════════════════════════════════

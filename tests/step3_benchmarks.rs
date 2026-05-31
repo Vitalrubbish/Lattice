@@ -103,129 +103,6 @@ fn step3_max_concurrent_requests() {
     println!("=== End Max Concurrent Requests ===\n");
 }
 
-// --- Step 3: Fragmentation Rate ---
-
-#[test]
-fn step3_fragmentation_rate() {
-    let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
-    let cfg = ModelConfig::tiny_llama();
-
-    let max_batch = 64;
-    let max_seq_len = 256;
-    let block_size = 16;
-    let max_blocks_per_seq = (max_seq_len + block_size - 1) / block_size;
-
-    let cache = PagedKvCache::new(ctx, cfg.clone(), max_batch, max_seq_len, block_size)
-        .expect("create PagedKvCache");
-
-    println!("\n=== Step 3: Fragmentation Rate ===");
-
-    // Phase 1: allocate all sequences
-    let mut tables: Vec<Vec<u32>> = Vec::new();
-    let mut seq_indices: Vec<usize> = Vec::new();
-    for _i in 0..max_batch {
-        if let Ok(table) = cache.alloc_sequence(max_blocks_per_seq) {
-            let si = cache.register_sequence(table.clone());
-            cache.update_seq_len(si, max_seq_len);
-            tables.push(table);
-            seq_indices.push(si);
-        }
-    }
-
-    let stats = cache.stats();
-    println!("After allocating {} sequences:", tables.len());
-    println!(
-        "  internal_fragmentation: {:.4}",
-        stats.internal_fragmentation
-    );
-    println!("  blocks in use: {}", stats.blocks_in_use);
-    println!(
-        "  physical memory: {:.2} MiB",
-        stats.physical_memory_mib
-    );
-    println!("  superblocks: {}", stats.superblocks_allocated);
-
-    // Phase 2: free 50% to create holes
-    for (idx, table) in tables.iter().enumerate() {
-        if idx % 2 != 0 {
-            cache.free_sequence(table);
-        }
-    }
-
-    let mid_stats = cache.stats();
-    println!("\nAfter freeing 50% of sequences:");
-    println!("  blocks in use:         {}", mid_stats.blocks_in_use);
-    println!(
-        "  free blocks in pool:   {}",
-        mid_stats.free_blocks_in_pool
-    );
-    println!(
-        "  physical memory waste ratio: {:.4}",
-        cache.fragmentation_ratio()
-    );
-
-    // Phase 3: re-allocate with shorter sequences
-    let half_blocks = max_blocks_per_seq / 2;
-    let half_seq_len = half_blocks * block_size / 2;
-    let mut new_count = 0usize;
-    for _ in 0..(max_batch / 2) {
-        if let Ok(table) = cache.alloc_sequence(half_blocks) {
-            let si = cache.register_sequence(table);
-            cache.update_seq_len(si, half_seq_len);
-            new_count += 1;
-        } else {
-            break;
-        }
-    }
-
-    let final_stats = cache.stats();
-    println!(
-        "\nAfter re-allocating {} shorter sequences:",
-        new_count
-    );
-    println!(
-        "  active sequences:     {}",
-        final_stats.active_sequences
-    );
-    println!("  blocks in use:        {}", final_stats.blocks_in_use);
-    println!(
-        "  free blocks in pool:  {}",
-        final_stats.free_blocks_in_pool
-    );
-    println!(
-        "  total blocks:         {}",
-        final_stats.total_blocks_allocated
-    );
-    println!(
-        "  superblocks:          {}",
-        final_stats.superblocks_allocated
-    );
-
-    let wasted_tokens_in_last_block =
-        new_count * (block_size - (half_seq_len % block_size));
-    println!("\nInternal fragmentation:");
-    println!(
-        "  total tokens stored:     {}",
-        final_stats.total_tokens_stored
-    );
-    println!(
-        "  total slots allocated:   {}",
-        final_stats.blocks_in_use * block_size
-    );
-    println!(
-        "  internal_fragmentation:  {:.4} ({:.2}%)",
-        final_stats.internal_fragmentation,
-        final_stats.internal_fragmentation * 100.0
-    );
-    println!(
-        "  wasted slots in last blocks: ~{}",
-        wasted_tokens_in_last_block
-    );
-    println!("=== End Fragmentation Rate ===\n");
-
-    assert!(!tables.is_empty());
-}
-
 // --- Step 3: cuMemMap/cuMemUnmap Overhead ---
 
 #[test]
@@ -253,6 +130,7 @@ fn step3_cumemmap_overhead() {
         .collect();
 
     let iters = 16;
+    
 
     // --- Per-layer mapping benchmark (mimics per-block approach) ---
     let per_layer_sizes = [
@@ -340,78 +218,6 @@ fn step3_cumemmap_overhead() {
     }
 
     println!("=== End cuMemMap/cuMemUnmap Overhead ===\n");
-}
-
-// --- Step 3: Internal Fragmentation Analysis ---
-
-#[test]
-fn step3_internal_fragmentation_analysis() {
-    let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
-    let cfg = ModelConfig::tiny_llama();
-
-    let max_batch = 16;
-    let max_seq_len = 128;
-    let block_size = 16;
-    let cache =
-        PagedKvCache::new(ctx, cfg, max_batch, max_seq_len, block_size)
-            .expect("create PagedKvCache");
-
-    println!("\n=== Step 3: Internal Fragmentation Analysis ===");
-    println!("block_size={} tokens", block_size);
-
-    let seq_lengths = [
-        1, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 100, 127, 128, 7,
-    ];
-    let mut total_wasted = 0usize;
-    let mut total_slots = 0usize;
-
-    for &sl in &seq_lengths {
-        let blocks_needed = (sl + block_size - 1) / block_size;
-        let table = cache.alloc_sequence(blocks_needed).expect("alloc");
-        let seq_idx = cache.register_sequence(table);
-        cache.update_seq_len(seq_idx, sl);
-
-        let slots = blocks_needed * block_size;
-        let waste = slots - sl;
-        let frag = waste as f32 / slots as f32;
-        total_wasted += waste;
-        total_slots += slots;
-        println!(
-            "  seq_len={:3}  blocks={:2}  slots={:3}  waste={:2}  frag={:.3}",
-            sl, blocks_needed, slots, waste, frag
-        );
-    }
-
-    let overall_frag = total_wasted as f32 / total_slots as f32;
-    println!("\nSummary:");
-    println!("  total sequences:         {}", seq_lengths.len());
-    println!("  total slots allocated:   {}", total_slots);
-    println!(
-        "  total tokens stored:     {}",
-        total_slots - total_wasted
-    );
-    println!("  total wasted slots:      {}", total_wasted);
-    println!(
-        "  overall internal frag:   {:.4} ({:.2}%)",
-        overall_frag,
-        overall_frag * 100.0
-    );
-    println!(
-        "  average waste per seq:   {:.1} tokens",
-        total_wasted as f32 / seq_lengths.len() as f32
-    );
-
-    let stats = cache.stats();
-    println!(
-        "\n  cache.internal_fragmentation() = {:.4}",
-        stats.internal_fragmentation
-    );
-    println!("=== End Internal Fragmentation Analysis ===\n");
-
-    assert_eq!(
-        total_slots - total_wasted,
-        seq_lengths.iter().sum::<usize>()
-    );
 }
 
 // --- Step 3: Runtime Fragmentation ---

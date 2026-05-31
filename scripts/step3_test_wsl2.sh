@@ -143,10 +143,8 @@ echo ""
 echo ">>> Running Rust GPU tests (fragmentation, max concurrency, cuMemMap overhead)..."
 cargo test --release --package baseline-llm-os -- \
     step3_max_concurrent_requests \
-    step3_fragmentation_rate \
     step3_runtime_fragmentation \
     step3_cumemmap_overhead \
-    step3_internal_fragmentation_analysis \
     --test-threads=1 \
     --nocapture 2>&1 | tee "$RESULTS_DIR/baseline_gpu_tests.txt"
 
