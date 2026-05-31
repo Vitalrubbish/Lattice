@@ -11,6 +11,60 @@ use crate::cuda::{runtime::Blas, CudaContext};
 
 use super::weights::ModelWeights;
 
+pub trait Transformer: Send + Sync {
+    fn forward_step(
+        &self,
+        hidden: &mut CudaSlice<f16>,
+        cache: &mut KvCache,
+        slot_ids: &[usize],
+        token_ids: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<f32>>;
+
+    fn prefill(
+        &self,
+        hidden: &mut CudaSlice<f16>,
+        cache: &mut KvCache,
+        slot_ids: &[usize],
+        token_ids: &[u32],
+        seq_len: usize,
+    ) -> Result<Duration> {
+        let t = std::time::Instant::now();
+        let batch = slot_ids.len();
+        for pos in 0..seq_len {
+            let positions = vec![pos; batch];
+            self.forward_step(hidden, cache, slot_ids, token_ids, &positions)?;
+        }
+        Ok(t.elapsed())
+    }
+
+    fn forward_step_paged(
+        &self,
+        hidden: &mut CudaSlice<f16>,
+        cache: &PagedKvCache,
+        seq_indices: &[usize],
+        token_ids: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<f32>>;
+
+    fn prefill_paged(
+        &self,
+        hidden: &mut CudaSlice<f16>,
+        cache: &PagedKvCache,
+        seq_indices: &[usize],
+        token_ids: &[u32],
+        seq_len: usize,
+    ) -> Result<Duration> {
+        let t = std::time::Instant::now();
+        let batch = seq_indices.len();
+        for pos in 0..seq_len {
+            let positions = vec![pos; batch];
+            self.forward_step_paged(hidden, cache, seq_indices, token_ids, &positions)?;
+        }
+        Ok(t.elapsed())
+    }
+}
+
 pub struct NaiveTransformer {
     pub cfg: ModelConfig,
     pub ctx: Arc<CudaContext>,
@@ -121,5 +175,51 @@ impl NaiveTransformer {
             self.forward_step_paged(hidden, cache, seq_indices, &positions)?;
         }
         Ok(t.elapsed())
+    }
+}
+
+impl Transformer for NaiveTransformer {
+    fn forward_step(
+        &self,
+        hidden: &mut CudaSlice<f16>,
+        cache: &mut KvCache,
+        slot_ids: &[usize],
+        _token_ids: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<f32>> {
+        self.forward_step(hidden, cache, slot_ids, positions)
+    }
+
+    fn prefill(
+        &self,
+        hidden: &mut CudaSlice<f16>,
+        cache: &mut KvCache,
+        slot_ids: &[usize],
+        _token_ids: &[u32],
+        seq_len: usize,
+    ) -> Result<Duration> {
+        self.prefill(hidden, cache, slot_ids, seq_len)
+    }
+
+    fn forward_step_paged(
+        &self,
+        hidden: &mut CudaSlice<f16>,
+        cache: &PagedKvCache,
+        seq_indices: &[usize],
+        _token_ids: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<f32>> {
+        self.forward_step_paged(hidden, cache, seq_indices, positions)
+    }
+
+    fn prefill_paged(
+        &self,
+        hidden: &mut CudaSlice<f16>,
+        cache: &PagedKvCache,
+        seq_indices: &[usize],
+        _token_ids: &[u32],
+        seq_len: usize,
+    ) -> Result<Duration> {
+        self.prefill_paged(hidden, cache, seq_indices, seq_len)
     }
 }

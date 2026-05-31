@@ -500,6 +500,20 @@ impl PagedKvCache {
         }
     }
 
+    /// Get VA offsets for all blocks (in element offset, not byte offset).
+    pub fn get_all_block_offsets_f16(&self) -> Vec<u64> {
+        let info = self.block_info.lock();
+        info.iter().map(|bi| {
+            if bi.in_use { (bi.va_offset / std::mem::size_of::<f16>()) as u64 } else { 0u64 }
+        }).collect()
+    }
+
+    /// Get the block table for a given sequence index.
+    pub fn get_block_table(&self, seq_idx: usize) -> Option<Vec<u32>> {
+        let meta = self.seq_metadata.lock();
+        meta.get(seq_idx).map(|s| s.block_table.clone())
+    }
+
     /// Get the K-cache virtual address base for a given layer.
     pub fn va_k(&self, layer: usize) -> u64 {
         self.va_k[layer]

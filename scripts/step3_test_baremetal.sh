@@ -3,10 +3,9 @@
 # scripts/step3_test_baremetal.sh — Step 3 benchmark for bare-metal A30
 #
 # Runs the full comparison suite:
-#   baseline  — Rust GPU tests (frag, max-concurrency, cuMemMap overhead) +
-#               Rust HTTP server throughput benchmark
+#   baseline  — Rust GPU tests + llama_transformer throughput benchmark
 #   vllm      — vLLM server + comprehensive benchmark (frag, concurrency, throughput)
-#   compare   — Both, produce side-by-side report
+#   compare   — Both baseline + vLLM tests
 #
 # Modes:
 #   ./scripts/step3_test_baremetal.sh baseline
@@ -15,6 +14,7 @@
 #
 # Config (env vars):
 #   MODEL_PATH              Path to TinyLlama safetensors (default: /root/models/tinyllama)
+#   MODEL_TYPE              Model config preset: tinyllama | llama7b (default: tinyllama)
 #   NUM_REQUESTS            Requests per run (default: 100)
 #   CONCURRENCY             Concurrent connections (default: 4)
 #   MAX_NEW_TOKENS          Max tokens to generate (default: 64)
@@ -32,6 +32,7 @@ PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 # ── Defaults ──
 MODE="${1:-compare}"
 MODEL_PATH="${MODEL_PATH:-/root/models/tinyllama}"
+MODEL_TYPE="${MODEL_TYPE:-tinyllama}"
 NUM_REQUESTS="${NUM_REQUESTS:-100}"
 CONCURRENCY="${CONCURRENCY:-4}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
@@ -92,6 +93,24 @@ graceful_kill() {
     wait "$pid" 2>/dev/null || true
 }
 
+# ── Helper: kill process listening on a given port ──
+kill_port() {
+    local port="$1"
+    local pids
+    pids=$(ss -tlnp 2>/dev/null | grep -Po ":$port\s+.*pid=\K\d+" | sort -u || true)
+    if [ -n "$pids" ]; then
+        echo "   (killing existing process on port $port: $pids)"
+        for pid in $pids; do
+            kill "$pid" 2>/dev/null || true
+        done
+        sleep 1
+        for pid in $pids; do
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        done
+    fi
+}
+
 # ── Cleanup trap ──
 cleanup() {
     echo ""
@@ -110,6 +129,7 @@ echo "=============================================="
 echo " Step 3 Benchmark (bare-metal A30) — mode: $MODE"
 echo "=============================================="
 echo " Model:       $MODEL_PATH"
+echo " Model type:  $MODEL_TYPE"
 echo " Requests:    $NUM_REQUESTS"
 echo " Concurrency: $CONCURRENCY"
 echo " Gen tokens:  $MAX_NEW_TOKENS"
@@ -142,41 +162,56 @@ if [ "$MODE" = "baseline" ] || [ "$MODE" = "compare" ]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════
-run_baseline() {
+run_baseline_llama() {
     echo ""
     echo "──────────────────────────────────────────────"
-    echo " Baseline Server  (port $BASELINE_PORT)"
+    echo " Baseline LlamaTransformer + Continuous (port $BASELINE_PORT)"
     echo "──────────────────────────────────────────────"
+
+    if [ ! -f "$MODEL_PATH/model.safetensors" ]; then
+        echo "  WARNING: model not found at $MODEL_PATH, skipping llama_transformer test"
+        return
+    fi
+
+    kill_port "$BASELINE_PORT"
 
     RUST_LOG=error "$PROJ_DIR/target/release/baseline-server" \
         --listen "127.0.0.1:$BASELINE_PORT" \
-        --model-path dummy \
+        --model-path "$MODEL_PATH" \
+        --model-type "$MODEL_TYPE" \
         --max-batch "$MAX_BATCH" \
         --max-seq-len "$MAX_SEQ_LEN" \
         --continuous \
-        &> "$RESULTS_DIR/baseline_server.log" &
+        --llama \
+        &> "$RESULTS_DIR/baseline_llama_server.log" &
     BASELINE_PID=$!
     echo "   PID: $BASELINE_PID"
 
-    if ! wait_port "$BASELINE_PORT" 30; then
-        echo "ERROR: baseline server did not start"
-        cat "$RESULTS_DIR/baseline_server.log"
+    if ! wait_port "$BASELINE_PORT" 60; then
+        echo "ERROR: baseline llama server did not start (port not listening)"
+        cat "$RESULTS_DIR/baseline_llama_server.log"
+        exit 1
+    fi
+
+    if ! kill -0 "$BASELINE_PID" 2>/dev/null; then
+        echo "ERROR: baseline llama server PID $BASELINE_PID died after start"
+        cat "$RESULTS_DIR/baseline_llama_server.log"
         exit 1
     fi
     echo "   -> Ready"
 
     echo ""
-    echo ">>> Running throughput benchmark (concurrent)..."
+    echo ">>> Running throughput benchmark (llama_transformer + continuous)..."
     timeout 600 "$PROJ_DIR/target/release/examples/bench_throughput" \
         --addr "127.0.0.1:$BASELINE_PORT" \
         --num-requests "$NUM_REQUESTS" \
         --concurrency "$CONCURRENCY" \
         --max-new-tokens "$MAX_NEW_TOKENS" \
-        --output-csv "$RESULTS_DIR/baseline_results.csv" \
-        2>&1 | tee "$RESULTS_DIR/baseline_output.txt"
+        --output-csv "$RESULTS_DIR/baseline_llama_results.csv" \
+        2>&1 | tee "$RESULTS_DIR/baseline_llama_output.txt"
 
     echo ""
-    echo ">>> Stopping baseline..."
+    echo ">>> Stopping baseline llama..."
     graceful_kill "$BASELINE_PID"
     unset BASELINE_PID
 }
@@ -255,6 +290,15 @@ run_vllm() {
 }
 
 # ═══════════════════════════════════════════════════════════════
+summarize() {
+    local label="$1" file="$2"
+    if [ ! -f "$file" ]; then echo "  [$label] (no data)"; return; fi
+    echo "  [$label]"
+    grep -E 'requests_completed|requests_failed|output_throughput_tok_s|total_throughput_tok_s|total_mean_ms|total_p50_ms|total_p95_ms|total_p99_ms' \
+        "$file" 2>/dev/null | sed 's/^/    /' || true
+}
+
+# ═══════════════════════════════════════════════════════════════
 collect_gpu_test_metrics() {
     # Extract key metrics from the Rust GPU test output
     local file="$RESULTS_DIR/baseline_gpu_tests.txt"
@@ -274,8 +318,12 @@ collect_gpu_test_metrics() {
 
     # Internal fragmentation
     local int_frag
-    int_frag=$(grep -Po 'internal_fragmentation:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    int_frag=$(grep -Po 'internal fragmentation:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
     echo "  internal_fragmentation:   $int_frag"
+
+    local phys_waste
+    phys_waste=$(grep -Po 'physical memory waste ratio:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  physical_memory_waste:    $phys_waste"
 
     # cuMemMap overhead
     local map_overhead
@@ -307,137 +355,12 @@ collect_gpu_test_metrics() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-summarize() {
-    local label="$1" file="$2"
-    if [ ! -f "$file" ]; then echo "  [$label] (no data)"; return; fi
-    echo "  [$label]"
-    grep -E 'requests_completed|requests_failed|request_throughput_req_s|output_throughput_tok_s|total_throughput_tok_s|total_mean_ms|total_p50_ms|total_p95_ms|total_p99_ms|max_concurrent|internal_fragmentation|external_frag' \
-        "$file" 2>/dev/null | sed 's/^/    /' || true
-}
-
-# ═══════════════════════════════════════════════════════════════
-write_comparison_report() {
-    local report="$RESULTS_DIR/comparison_report.md"
-
-    cat > "$report" << 'REPORT_HEADER'
-# Step 3 Benchmark Comparison Report
-
-**Date:** REPORT_HEADER
-    date >> "$report"
-    cat >> "$report" << REPORT_HEADER2
-**Server:** Bare-metal A30
-**Model:** TinyLlama-1.1B
-
----
-
-## 1. Maximum Concurrent Requests
-
-| Metric | Baseline (Rust + CUDA VMM) | vLLM |
-|--------|---------------------------|------|
-REPORT_HEADER2
-
-    # Extract values
-    local base_max_conc="N/A"
-    local vllm_max_conc="N/A"
-    base_max_conc=$(grep -Po 'max concurrent requests:\s+\K\d+' "$RESULTS_DIR/baseline_gpu_tests.txt" 2>/dev/null || echo "N/A")
-    vllm_max_conc=$(grep -Po '"max_concurrent_requests":\s+\K\d+' "$RESULTS_DIR/max_concurrency.json" 2>/dev/null || echo "N/A")
-
-    echo "| max_concurrent_requests | $base_max_conc | $vllm_max_conc |" >> "$report"
-
-    cat >> "$report" << 'REPORT_MID'
-
----
-
-## 2. Memory Fragmentation Rate
-
-| Metric | Baseline (Rust + CUDA VMM) | vLLM |
-|--------|---------------------------|------|
-REPORT_MID
-
-    local base_int_frag="N/A"
-    local vllm_int_frag="N/A"
-    local vllm_ext_frag="N/A"
-    base_int_frag=$(grep -Po 'internal_fragmentation:\s+\K[\d.]+' "$RESULTS_DIR/baseline_gpu_tests.txt" 2>/dev/null | tail -1 || echo "N/A")
-    vllm_int_frag=$(grep -Po '"internal_frag_ratio":\s+\K[\d.]+' "$RESULTS_DIR/fragmentation.json" 2>/dev/null || echo "N/A")
-    vllm_ext_frag=$(grep -Po '"external_frag_ratio":\s+\K[\d.]+' "$RESULTS_DIR/fragmentation.json" 2>/dev/null || echo "N/A")
-
-    echo "| internal_fragmentation | $base_int_frag | $vllm_int_frag |" >> "$report"
-    echo "| external_frag_proxy | N/A (block-level allocator) | $vllm_ext_frag |" >> "$report"
-
-    cat >> "$report" << 'REPORT_MID2'
-
----
-
-## 3. Throughput
-
-| Metric | Baseline (Rust + CUDA VMM) | vLLM |
-|--------|---------------------------|------|
-REPORT_MID2
-
-    local base_tp="N/A" base_lat="N/A" base_p95="N/A"
-    local vllm_tp="N/A" vllm_lat="N/A" vllm_p95="N/A"
-
-    base_tp=$(grep -Po 'total_throughput_tok_s:\s+\K[\d.]+' "$RESULTS_DIR/baseline_output.txt" 2>/dev/null || echo "N/A")
-    base_lat=$(grep -Po 'total_mean_ms:\s+\K[\d.]+' "$RESULTS_DIR/baseline_output.txt" 2>/dev/null || echo "N/A")
-    base_p95=$(grep -Po 'total_p95_ms:\s+\K[\d.]+' "$RESULTS_DIR/baseline_output.txt" 2>/dev/null || echo "N/A")
-    vllm_tp=$(grep -Po '"total_throughput_tok_s":\s+\K[\d.]+' "$RESULTS_DIR/throughput.json" 2>/dev/null || echo "N/A")
-    vllm_lat=$(grep -Po '"total_mean_ms":\s+\K[\d.]+' "$RESULTS_DIR/throughput.json" 2>/dev/null || echo "N/A")
-    vllm_p95=$(grep -Po '"total_p95_ms":\s+\K[\d.]+' "$RESULTS_DIR/throughput.json" 2>/dev/null || echo "N/A")
-
-    echo "| total_throughput_tok_s | $base_tp | $vllm_tp |" >> "$report"
-    echo "| total_mean_ms | $base_lat | $vllm_lat |" >> "$report"
-    echo "| total_p95_ms | $base_p95 | $vllm_p95 |" >> "$report"
-
-    cat >> "$report" << 'REPORT_MID3'
-
----
-
-## 4. cuMemMap/cuMemUnmap Overhead (Baseline only)
-
-vLLM uses PyTorch's CUDA caching allocator and does not use the CUDA VMM API directly, so
-cuMemMap/cuMemUnmap overhead is measured only for the baseline implementation.
-
-REPORT_MID3
-
-    local map_overhead="N/A"
-    local map_gran="N/A"
-    local map_calls="N/A"
-    map_overhead=$(grep -Po 'avg per 2MB map/unmap:\s+\K[\d.]+' "$RESULTS_DIR/baseline_gpu_tests.txt" 2>/dev/null || echo "N/A")
-    map_gran=$(grep -Po 'GPU map granularity:\s+\K\d+' "$RESULTS_DIR/baseline_gpu_tests.txt" 2>/dev/null || echo "N/A")
-    map_calls=$(grep -Po 'total cuMemMap calls:\s+\K\d+' "$RESULTS_DIR/baseline_gpu_tests.txt" 2>/dev/null || echo "N/A")
-
-    echo "| map_granularity_bytes | $map_gran | N/A |" >> "$report"
-    echo "| avg_2MB_map_unmap_us | $map_overhead | N/A |" >> "$report"
-    echo "| total_cuMemMap_calls | $map_calls | N/A |" >> "$report"
-    echo "| strategy | batch mapping via superblocks | PyTorch caching allocator |" >> "$report"
-
-    cat >> "$report" << 'REPORT_FOOTER'
-
----
-
-## 5. Notes
-
-- **Baseline** uses CUDA VMM API (`cuMemCreate`/`cuMemMap`/`cuMemUnmap`) with 2MB superblock batch mapping
-- **vLLM** uses PyTorch's CUDA caching allocator with block-based KV cache management
-- Both use `block_size=16` tokens
-- The baseline's `cuMemMap`/`cuMemUnmap` calls are batched at superblock granularity (2MB) rather than per-block
-- For detailed cuMemMap overhead analysis, see the `step3_cumemmap_overhead` GPU test output
-
----
-*Report generated by step3_test_baremetal.sh*
-REPORT_FOOTER
-
-    echo ""
-    echo ">>> Comparison report written to: $report"
-}
-
-# ═══════════════════════════════════════════════════════════════
 case "$MODE" in
     baseline)
-        run_baseline
+        run_baseline_llama
         collect_gpu_test_metrics
         echo ""
-        summarize "baseline" "$RESULTS_DIR/baseline_output.txt"
+        summarize "baseline (llama+continuous)" "$RESULTS_DIR/baseline_llama_output.txt"
         ;;
     vllm)
         run_vllm
@@ -446,18 +369,11 @@ case "$MODE" in
         ls -la "$RESULTS_DIR/"*.json 2>/dev/null || true
         ;;
     compare)
-        run_baseline
+        run_baseline_llama
         run_vllm
         collect_gpu_test_metrics
         echo ""
-        echo "=============================================="
-        echo " Comparison Summary"
-        echo "=============================================="
-        summarize "baseline" "$RESULTS_DIR/baseline_output.txt"
-        echo ""
-        summarize "vllm"     "$RESULTS_DIR/vllm_output.txt"
-        echo ""
-        write_comparison_report
+        summarize "baseline (llama+continuous)" "$RESULTS_DIR/baseline_llama_output.txt"
         ;;
 esac
 

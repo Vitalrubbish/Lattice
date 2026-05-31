@@ -24,6 +24,8 @@ PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 
 # ── Defaults ──
 MODE="${1:-baseline}"
+MODEL_PATH="${MODEL_PATH:-/home/vitalrubbish/models/tinyllama}"
+MODEL_TYPE="${MODEL_TYPE:-tinyllama}"
 NUM_REQUESTS="${NUM_REQUESTS:-50}"
 CONCURRENCY="${CONCURRENCY:-4}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
@@ -122,6 +124,8 @@ trap cleanup EXIT
 echo "=============================================="
 echo " Step 3 Benchmark (WSL2) — mode: $MODE"
 echo "=============================================="
+echo " Model:       $MODEL_PATH"
+echo " Model type:  $MODEL_TYPE"
 echo " Requests:    $NUM_REQUESTS"
 echo " Concurrency: $CONCURRENCY"
 echo " Gen tokens:  $MAX_NEW_TOKENS"
@@ -149,51 +153,56 @@ cargo test --release --package baseline-llm-os -- \
     --nocapture 2>&1 | tee "$RESULTS_DIR/baseline_gpu_tests.txt"
 
 # ═══════════════════════════════════════════════════════════════
-run_baseline() {
+run_baseline_llama() {
     echo ""
     echo "──────────────────────────────────────────────"
-    echo " Baseline Server  (port $BASELINE_PORT)"
+    echo " Baseline LlamaTransformer + Continuous (port $BASELINE_PORT)"
     echo "──────────────────────────────────────────────"
 
-    # Kill any stale process on the port from a previous run.
+    if [ ! -f "$MODEL_PATH/model.safetensors" ]; then
+        echo "  WARNING: model not found at $MODEL_PATH, skipping llama_transformer test"
+        return
+    fi
+
     kill_port "$BASELINE_PORT"
 
     RUST_LOG=error "$PROJ_DIR/target/release/baseline-server" \
         --listen "127.0.0.1:$BASELINE_PORT" \
-        --model-path dummy \
+        --model-path "$MODEL_PATH" \
+        --model-type "$MODEL_TYPE" \
         --max-batch "$MAX_BATCH" \
         --max-seq-len "$MAX_SEQ_LEN" \
         --continuous \
-        &> "$RESULTS_DIR/baseline_server.log" &
+        --llama \
+        &> "$RESULTS_DIR/baseline_llama_server.log" &
     BASELINE_PID=$!
     echo "   PID: $BASELINE_PID"
 
-    if ! wait_port "$BASELINE_PORT" 30; then
-        echo "ERROR: baseline server did not start (port not listening)"
-        cat "$RESULTS_DIR/baseline_server.log"
+    if ! wait_port "$BASELINE_PORT" 60; then
+        echo "ERROR: baseline llama server did not start (port not listening)"
+        cat "$RESULTS_DIR/baseline_llama_server.log"
         exit 1
     fi
 
-    # Verify the PID we started is still alive (not a stale listener).
     if ! kill -0 "$BASELINE_PID" 2>/dev/null; then
-        echo "ERROR: baseline server PID $BASELINE_PID died after start"
-        cat "$RESULTS_DIR/baseline_server.log"
+        echo "ERROR: baseline llama server PID $BASELINE_PID died after start"
+        cat "$RESULTS_DIR/baseline_llama_server.log"
         exit 1
     fi
     echo "   -> Ready"
 
     echo ""
-    echo ">>> Running throughput benchmark..."
+    echo ">>> Running throughput benchmark (llama_transformer + continuous)..."
     timeout 600 "$PROJ_DIR/target/release/examples/bench_throughput" \
         --addr "127.0.0.1:$BASELINE_PORT" \
         --num-requests "$NUM_REQUESTS" \
         --concurrency "$CONCURRENCY" \
         --max-new-tokens "$MAX_NEW_TOKENS" \
-        --output-csv "$RESULTS_DIR/baseline_results.csv" \
-        2>&1 | tee "$RESULTS_DIR/baseline_output.txt"
+        --output-csv "$RESULTS_DIR/baseline_llama_results.csv" \
+        2>&1 | tee "$RESULTS_DIR/baseline_llama_output.txt"
 
     echo ""
-    echo ">>> Stopping baseline..."
+    echo ">>> Stopping baseline llama..."
     graceful_kill "$BASELINE_PID"
     unset BASELINE_PID
 }
@@ -215,7 +224,7 @@ collect_gpu_test_metrics() {
     echo "  max_concurrent_requests:  $max_conc"
 
     local int_frag
-    int_frag=$(grep -Po 'internal_fragmentation:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    int_frag=$(grep -Po 'internal fragmentation:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
     echo "  internal_fragmentation:   $int_frag"
 
     local phys_waste
@@ -257,17 +266,14 @@ summarize() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-run_baseline
+run_baseline_llama
 collect_gpu_test_metrics
 echo ""
-summarize "baseline" "$RESULTS_DIR/baseline_output.txt"
+summarize "baseline (llama+continuous)" "$RESULTS_DIR/baseline_llama_output.txt"
 
 echo ""
 echo "=============================================="
 echo " Done."
 echo " Results: $RESULTS_DIR/"
 ls -la "$RESULTS_DIR/"
-echo ""
-echo " NOTE: vLLM comparison requires bare-metal A30 server."
-echo "       Run step3_test_baremetal.sh for full comparison."
 echo "=============================================="

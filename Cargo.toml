@@ -40,6 +40,10 @@ path = "examples/bench_loaders.rs"
 name = "bench_throughput"
 path = "examples/bench_throughput.rs"
 
+[[example]]
+name = "check_logits"
+path = "examples/check_logits.rs"
+
 [profile.release]
 debug = true
 lto = "thin"

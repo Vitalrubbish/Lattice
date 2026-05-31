@@ -33,13 +33,27 @@ echo " Model:  $MODEL_PATH"
 echo " Output: $RESULTS_DIR"
 echo "=============================================="
 
-# ---- require sudo password ----
-if [ -z "$SUDO_PASS" ]; then
-    echo ""
-    echo "Set SUDO_PASS env var to your sudo password, e.g.:"
-    echo "  SUDO_PASS='mypassword' ./scripts/step1_test_baremetal.sh"
-    exit 1
+# ---- privileged execution helper ----
+IS_ROOT=false
+if [ "$(id -u)" -eq 0 ]; then
+    IS_ROOT=true
+    echo "Running as root — skipping sudo."
+else
+    if [ -z "$SUDO_PASS" ]; then
+        echo ""
+        echo "Not running as root. Set SUDO_PASS env var to your sudo password, e.g.:"
+        echo "  SUDO_PASS='mypassword' ./scripts/step1_test_baremetal.sh"
+        exit 1
+    fi
 fi
+
+run_priv() {
+    if $IS_ROOT; then
+        "$@"
+    else
+        echo "$SUDO_PASS" | sudo -S "$@" 2>/dev/null
+    fi
+}
 
 mkdir -p "$RESULTS_DIR"
 
@@ -62,10 +76,10 @@ cargo build --release --bin baseline-server --example bench_loaders 2>&1 | tail 
 echo ""
 echo ">>> Cold-cache trace test..."
 sync
-echo "$SUDO_PASS" | sudo -S sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null
+run_priv sh -c 'echo 3 > /proc/sys/vm/drop_caches'
 sleep 1
 
-echo "$SUDO_PASS" | sudo -S bpftrace "$TMP_DIR/trace_all.bt" \
+run_priv bpftrace "$TMP_DIR/trace_all.bt" \
     -c "timeout 20 bash scripts/load_and_exit.sh read tinyllama $MODEL_PATH" \
     > "$RESULTS_DIR/trace_cold.log" 2>&1
 
@@ -75,7 +89,7 @@ echo "  -> $RESULTS_DIR/trace_cold.log"
 echo ""
 echo ">>> Warm-cache trace test..."
 
-echo "$SUDO_PASS" | sudo -S bpftrace "$TMP_DIR/trace_all.bt" \
+run_priv bpftrace "$TMP_DIR/trace_all.bt" \
     -c "timeout 20 bash scripts/load_and_exit.sh read tinyllama $MODEL_PATH" \
     > "$RESULTS_DIR/trace_warm.log" 2>&1
 
@@ -85,9 +99,9 @@ echo "  -> $RESULTS_DIR/trace_warm.log"
 echo ""
 echo ">>> Loader comparison test..."
 
-echo "$SUDO_PASS" | sudo -S env \
+run_priv env \
     MODEL_PATH="$MODEL_PATH" \
-    SUDO_PASS="$SUDO_PASS" \
+    SUDO_PASS="${SUDO_PASS:-}" \
     ./target/release/examples/bench_loaders \
     > "$RESULTS_DIR/loader_comparison.log" 2>&1
 

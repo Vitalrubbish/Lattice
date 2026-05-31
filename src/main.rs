@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,7 +8,9 @@ use baseline_llm_os::cache::paged_kv::PagedKvCache;
 use baseline_llm_os::cache::KvCache;
 use baseline_llm_os::config::ModelConfig;
 use baseline_llm_os::cuda::CudaContext;
-use baseline_llm_os::model::{LoaderKind, ModelLoader, ModelWeights, NaiveTransformer};
+use baseline_llm_os::model::{
+    LlamaTransformer, LoaderKind, ModelLoader, ModelWeights, NaiveTransformer, Transformer,
+};
 use baseline_llm_os::server::serve_http;
 
 #[derive(Parser, Debug)]
@@ -37,6 +39,10 @@ struct Cli {
     /// Use continuous batching with paged KV cache (CUDA VMM).
     #[arg(long)]
     continuous: bool,
+
+    /// Use LlamaTransformer with real attention weights instead of NaiveTransformer.
+    #[arg(long)]
+    llama: bool,
 }
 
 #[tokio::main]
@@ -56,7 +62,13 @@ async fn main() -> Result<()> {
     };
 
     let kind = LoaderKind::parse(&cli.loader)?;
-    let weights = if cli.model_path.to_string_lossy() == "dummy" {
+    let is_dummy = cli.model_path.to_string_lossy() == "dummy";
+
+    if cli.llama && is_dummy {
+        bail!("--llama requires real model weights (--model-path), not 'dummy'");
+    }
+
+    let weights = if is_dummy {
         ModelWeights::empty(&cfg)
     } else {
         let (w, metrics) = ModelLoader::new(&ctx, &cfg, kind).load(&cli.model_path)?;
@@ -65,7 +77,14 @@ async fn main() -> Result<()> {
     };
     tracing::info!(bytes = weights.total_bytes(), "weights ready");
 
-    let model = Arc::new(NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights)?);
+    let model: Arc<dyn Transformer> = if cli.llama {
+        if cli.continuous {
+            tracing::info!("using LlamaTransformer with continuous batching (paged KV cache)");
+        }
+        Arc::new(LlamaTransformer::new(ctx.clone(), cfg.clone(), weights)?)
+    } else {
+        Arc::new(NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights)?)
+    };
     let queue = Arc::new(InferenceQueue::new());
 
     if cli.continuous {
@@ -74,7 +93,7 @@ async fn main() -> Result<()> {
             cfg.clone(),
             cli.max_batch,
             cli.max_seq_len,
-            16, // BLOCK_SIZE
+            16,
         )?;
         let sched = ContinuousScheduler::new(
             cfg.clone(),

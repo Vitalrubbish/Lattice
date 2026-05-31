@@ -11,7 +11,7 @@ use crate::cache::{EvictedSeqData, SwapManager, advance_epoch, current_epoch};
 use crate::config::ModelConfig;
 use crate::cuda::CudaContext;
 use crate::decoder::greedy_sample;
-use crate::model::NaiveTransformer;
+use crate::model::Transformer;
 
 use super::static_batch::{InferenceQueue, InferenceRequest, InferenceResponse};
 
@@ -54,7 +54,7 @@ struct SwappedRequest {
 pub struct ContinuousScheduler {
     pub cfg: ModelConfig,
     pub ctx: Arc<CudaContext>,
-    pub model: Arc<NaiveTransformer>,
+    pub model: Arc<dyn Transformer>,
     pub cache: Arc<PagedKvCache>,
     pub max_batch: usize,
     pub max_seq_len: usize,
@@ -71,7 +71,7 @@ impl ContinuousScheduler {
     pub fn new(
         cfg: ModelConfig,
         ctx: Arc<CudaContext>,
-        model: Arc<NaiveTransformer>,
+        model: Arc<dyn Transformer>,
         cache: PagedKvCache,
         max_batch: usize,
         max_seq_len: usize,
@@ -439,10 +439,17 @@ impl ContinuousScheduler {
         }
 
         // Run the transformer forward step (per-layer GEMM + KV cache write)
+        let token_ids: Vec<u32> = running.iter().map(|r| {
+            match r.state {
+                RequestState::Prefill { prompt_pos } => r.req.prompt_tokens[prompt_pos],
+                RequestState::Decode => r.generated.last().copied().unwrap_or(0),
+            }
+        }).collect();
         let logits = self.model.forward_step_paged(
             &mut hidden,
             &self.cache,
             &seq_indices,
+            &token_ids,
             &positions,
         )?;
 

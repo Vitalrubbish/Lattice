@@ -10,7 +10,7 @@ use crate::cache::KvCache;
 use crate::config::ModelConfig;
 use crate::cuda::CudaContext;
 use crate::decoder::greedy_sample;
-use crate::model::NaiveTransformer;
+use crate::model::Transformer;
 
 #[derive(Debug, Clone)]
 pub struct InferenceRequest {
@@ -62,7 +62,7 @@ impl Default for InferenceQueue {
 pub struct StaticScheduler {
     pub cfg: ModelConfig,
     pub ctx: Arc<CudaContext>,
-    pub model: Arc<NaiveTransformer>,
+    pub model: Arc<dyn Transformer>,
     pub cache: KvCache,
     pub max_batch_size: usize,
     pub max_seq_len: usize,
@@ -73,7 +73,7 @@ impl StaticScheduler {
     pub fn new(
         cfg: ModelConfig,
         ctx: Arc<CudaContext>,
-        model: Arc<NaiveTransformer>,
+        model: Arc<dyn Transformer>,
         cache: KvCache,
         max_batch_size: usize,
         max_seq_len: usize,
@@ -130,7 +130,14 @@ impl StaticScheduler {
         let mut hidden: CudaSlice<f16> = self.ctx.device.alloc_zeros::<f16>(batch * h)?;
 
         let t = Instant::now();
-        self.model.prefill(&mut hidden, &mut self.cache, &slot_ids, max_prompt)?;
+        for pos in 0..max_prompt {
+            let positions: Vec<usize> = vec![pos; batch];
+            let token_ids: Vec<u32> = (0..batch).map(|b| {
+                let plen = reqs[b].0.prompt_tokens.len();
+                if pos < plen { reqs[b].0.prompt_tokens[pos] } else { 0 }
+            }).collect();
+            self.model.forward_step(&mut hidden, &mut self.cache, &slot_ids, &token_ids, &positions)?;
+        }
         let prefill_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let max_new = reqs.iter().map(|(r, _)| r.max_new_tokens).max().unwrap_or(0);
@@ -143,9 +150,18 @@ impl StaticScheduler {
             if done.iter().all(|x| *x) {
                 break;
             }
+            let token_ids: Vec<u32> = (0..batch).map(|b| {
+                if done[b] { return 0; }
+                let plen = reqs[b].0.prompt_tokens.len();
+                if outputs[b].is_empty() {
+                    reqs[b].0.prompt_tokens[plen - 1]
+                } else {
+                    *outputs[b].last().unwrap()
+                }
+            }).collect();
             let logits = self
                 .model
-                .forward_step(&mut hidden, &mut self.cache, &slot_ids, &positions)?;
+                .forward_step(&mut hidden, &mut self.cache, &slot_ids, &token_ids, &positions)?;
             let next = greedy_sample(&logits, batch, self.cfg.vocab_size);
             for b in 0..batch {
                 if done[b] {

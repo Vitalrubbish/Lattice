@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DeviceRepr};
 use std::sync::Arc;
 
+pub mod kernels;
 pub mod runtime;
 
 pub struct CudaContext {
