@@ -11,10 +11,10 @@
  *   - cuMemcpyDtoH_v2: device → host (result retrieval)
  *   - cuMemAlloc_v2: GPU memory allocation timing
  *
- * CUDA uprobe path: /usr/lib/wsl/lib/libcuda.so.1.1 (WSL2 default)
+ * CUDA uprobe path: /usr/lib/x86_64-linux-gnu/libcuda.so.1 (WSL2 default)
  * Bare metal:        /usr/lib/x86_64-linux-gnu/libcuda.so.1
  * Override for bare metal:
- *   sed -i 's|/usr/lib/wsl/lib/libcuda.so.1.1|/usr/lib/x86_64-linux-gnu/libcuda.so.1|g' scripts/trace_cuda_memcpy.bt
+ *   sed -i 's|/usr/lib/x86_64-linux-gnu/libcuda.so.1|/usr/lib/x86_64-linux-gnu/libcuda.so.1|g' scripts/trace_cuda_memcpy.bt
  */
 
 BEGIN
@@ -24,13 +24,13 @@ BEGIN
 }
 
 /* ── cuMemcpyHtoD: host → device ────────────────────────────────── */
-uprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyHtoD_v2
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so.1:cuMemcpyHtoD_v2
 {
     @h2d_start[tid] = nsecs;
     @h2d_bytes[tid] = arg2;          // ByteCount parameter
 }
 
-uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyHtoD_v2 /@h2d_start[tid] != 0/
+uretprobe:/usr/lib/x86_64-linux-gnu/libcuda.so.1:cuMemcpyHtoD_v2 /@h2d_start[tid] != 0/
 {
     $dur_us = (nsecs - @h2d_start[tid]) / 1000;
     @h2d_lat = hist($dur_us);
@@ -45,13 +45,13 @@ uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyHtoD_v2 /@h2d_start[tid] != 0/
 }
 
 /* ── cuMemcpyDtoH: device → host ────────────────────────────────── */
-uprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyDtoH_v2
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so.1:cuMemcpyDtoH_v2
 {
     @d2h_start[tid] = nsecs;
     @d2h_bytes[tid] = arg2;
 }
 
-uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyDtoH_v2 /@d2h_start[tid] != 0/
+uretprobe:/usr/lib/x86_64-linux-gnu/libcuda.so.1:cuMemcpyDtoH_v2 /@d2h_start[tid] != 0/
 {
     $dur_us = (nsecs - @d2h_start[tid]) / 1000;
     @d2h_lat = hist($dur_us);
@@ -66,13 +66,13 @@ uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemcpyDtoH_v2 /@d2h_start[tid] != 0/
 }
 
 /* ── cuMemAlloc: GPU memory allocation ──────────────────────────── */
-uprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemAlloc_v2
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so.1:cuMemAlloc_v2
 {
     @alloc_start[tid] = nsecs;
     @alloc_bytes[tid] = arg1;         // bytesize parameter
 }
 
-uretprobe:/usr/lib/wsl/lib/libcuda.so.1.1:cuMemAlloc_v2 /@alloc_start[tid] != 0/
+uretprobe:/usr/lib/x86_64-linux-gnu/libcuda.so.1:cuMemAlloc_v2 /@alloc_start[tid] != 0/
 {
     $dur_us = (nsecs - @alloc_start[tid]) / 1000;
     @alloc_lat = hist($dur_us);

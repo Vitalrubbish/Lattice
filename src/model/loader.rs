@@ -474,22 +474,22 @@ impl<'a> ModelLoader<'a> {
             // into a GPU scratch buffer and then D→H copy for parsing.
             let header_io = CpuTimer::start();
 
-            let header_gpu_max = 256 * 1024; // 256 KB — generous for large vocab models
+            let header_gpu_max = 256 * 1024usize; // 256 KB — generous for large vocab models
             let header_dev = self.ctx.alloc_bytes(header_gpu_max)?;
-            let mut nread: usize = 0;
-            let ret = unsafe {
+            let nread = unsafe {
                 cuFileRead(
                     fh,
                     header_dev.as_device_ptr(),
-                    &mut nread,
-                    0,  // file offset
-                    0,  // devPtr offset
+                    header_gpu_max, // size to read
+                    0,              // file offset
+                    0,              // devPtr offset
                 )
             };
-            if ret != 0 {
-                bail!("cuFileRead header failed for {shard:?}: err={ret}");
+            if nread < 0 {
+                let errno = unsafe { *libc::__errno_location() };
+                bail!("cuFileRead header failed for {shard:?}: errno={errno}");
             }
-            let actual_header_bytes = nread.min(header_gpu_max);
+            let actual_header_bytes = (nread as usize).min(header_gpu_max);
 
             // D→H copy header back for JSON parsing.
             let mut header_cpu = vec![0u8; actual_header_bytes];
@@ -515,23 +515,23 @@ impl<'a> ModelLoader<'a> {
                 metrics.alloc_ms += alloc_wall;
 
                 let h2d = CpuTimer::start();
-                let mut nread: usize = 0;
-                let ret = unsafe {
+                let nread = unsafe {
                     cuFileRead(
                         fh,
                         dev.as_device_ptr(),
-                        &mut nread,
+                        meta.data_len,       // size to read
                         meta.data_offset as i64,
                         0,
                     )
                 };
-                if ret != 0 {
+                if nread < 0 {
+                    let errno = unsafe { *libc::__errno_location() };
                     bail!(
-                        "cuFileRead tensor '{}' failed for {shard:?}: err={ret}",
+                        "cuFileRead tensor '{}' failed for {shard:?}: errno={errno}",
                         meta.name
                     );
                 }
-                if nread != meta.data_len {
+                if nread as usize != meta.data_len {
                     tracing::warn!(
                         tensor = %meta.name,
                         expected = meta.data_len,
@@ -755,9 +755,12 @@ mod gds_helpers {
 
     #[derive(serde::Deserialize)]
     struct RawTensorMeta {
-        dtype: String,
-        shape: Vec<usize>,
-        data_offsets: [usize; 2],
+        #[serde(default)]
+        dtype: Option<String>,
+        #[serde(default)]
+        shape: Option<Vec<usize>>,
+        #[serde(default)]
+        data_offsets: Option<[usize; 2]>,
     }
 
     let map: std::collections::HashMap<String, RawTensorMeta> =
@@ -766,12 +769,18 @@ mod gds_helpers {
 
     let mut metas = Vec::with_capacity(map.len());
     for (name, raw) in map {
+        // Skip metadata entries (e.g. __metadata__) that lack tensor fields.
+        let (Some(dtype), Some(shape), Some(data_offsets)) =
+            (raw.dtype, raw.shape, raw.data_offsets)
+        else {
+            continue;
+        };
         metas.push(GdsTensorMeta {
             name,
-            dtype: raw.dtype,
-            shape: raw.shape,
-            data_offset: raw.data_offsets[0],
-            data_len: raw.data_offsets[1] - raw.data_offsets[0],
+            dtype,
+            shape,
+            data_offset: data_offsets[0],
+            data_len: data_offsets[1] - data_offsets[0],
         });
     }
 
@@ -815,13 +824,15 @@ mod gds_ffi {
 
     #[link(name = "cufile")]
     extern "C" {
+        /// cuFileRead returns ssize_t (bytes read, or -1 on error).
+        /// size is an INPUT parameter — how many bytes to read.
         pub fn cuFileRead(
             fh: CUfileHandle,
             devPtr: u64,
-            size: *mut usize,
+            size: usize,
             file_offset: i64,
             devPtr_offset: i64,
-        ) -> CUfileError;
+        ) -> isize;
 
         pub fn cuFileHandleRegister(
             fh: *mut CUfileHandle,

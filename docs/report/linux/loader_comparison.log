@@ -1,0 +1,66 @@
+
+=== read(2) ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=4460ms read=3963ms parse=1ms alloc=24ms h2d=263ms cpu_user=204ms cpu_sys=2328ms bytes=2200119864 throughput=493 MB/s
+  run 2/3:
+  [cold] total=1845ms read=1378ms parse=0ms alloc=14ms h2d=240ms cpu_user=176ms cpu_sys=1668ms bytes=2200119864 throughput=1193 MB/s
+  run 3/3:
+  [cold] total=1713ms read=1244ms parse=0ms alloc=13ms h2d=244ms cpu_user=200ms cpu_sys=1510ms bytes=2200119864 throughput=1285 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=1685ms read=1220ms parse=0ms alloc=13ms h2d=242ms cpu_user=184ms cpu_sys=1498ms bytes=2200119864 throughput=1306 MB/s
+  run 2/3:
+  [warm] total=1689ms read=1223ms parse=0ms alloc=13ms h2d=243ms cpu_user=184ms cpu_sys=1503ms bytes=2200119864 throughput=1303 MB/s
+  run 3/3:
+  [warm] total=1691ms read=1227ms parse=0ms alloc=13ms h2d=242ms cpu_user=172ms cpu_sys=1517ms bytes=2200119864 throughput=1301 MB/s
+
+=== mmap(2) ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=4273ms read=0ms parse=1ms alloc=16ms h2d=4130ms cpu_user=201ms cpu_sys=1248ms bytes=2200119864 throughput=515 MB/s
+  run 2/3:
+  [cold] total=640ms read=0ms parse=0ms alloc=15ms h2d=341ms cpu_user=205ms cpu_sys=433ms bytes=2200119864 throughput=3438 MB/s
+  run 3/3:
+  [cold] total=482ms read=0ms parse=0ms alloc=15ms h2d=342ms cpu_user=177ms cpu_sys=302ms bytes=2200119864 throughput=4560 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=478ms read=0ms parse=0ms alloc=15ms h2d=341ms cpu_user=188ms cpu_sys=286ms bytes=2200119864 throughput=4601 MB/s
+  run 2/3:
+  [warm] total=480ms read=0ms parse=0ms alloc=15ms h2d=342ms cpu_user=188ms cpu_sys=291ms bytes=2200119864 throughput=4585 MB/s
+  run 3/3:
+  [warm] total=479ms read=0ms parse=0ms alloc=14ms h2d=341ms cpu_user=172ms cpu_sys=306ms bytes=2200119864 throughput=4592 MB/s
+
+=== O_DIRECT ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=5253ms read=4845ms parse=0ms alloc=16ms h2d=176ms cpu_user=171ms cpu_sys=1285ms bytes=2200119864 throughput=419 MB/s
+  run 2/3:
+  [cold] total=5234ms read=4838ms parse=0ms alloc=15ms h2d=166ms cpu_user=165ms cpu_sys=1278ms bytes=2200119864 throughput=420 MB/s
+  run 3/3:
+  [cold] total=5316ms read=4846ms parse=0ms alloc=16ms h2d=240ms cpu_user=179ms cpu_sys=1353ms bytes=2200119864 throughput=414 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=5321ms read=4845ms parse=0ms alloc=16ms h2d=245ms cpu_user=188ms cpu_sys=1347ms bytes=2200119864 throughput=413 MB/s
+  run 2/3:
+  [warm] total=5237ms read=4842ms parse=0ms alloc=15ms h2d=167ms cpu_user=167ms cpu_sys=1291ms bytes=2200119864 throughput=420 MB/s
+  run 3/3:
+  [warm] total=5237ms read=4838ms parse=0ms alloc=16ms h2d=166ms cpu_user=173ms cpu_sys=1274ms bytes=2200119864 throughput=420 MB/s
+
+=== GDS (cuFileRead) ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=4625ms read=540ms parse=0ms alloc=16ms h2d=4048ms cpu_user=186ms cpu_sys=1545ms bytes=2200119864 throughput=476 MB/s
+  run 2/3:
+  [cold] total=1145ms read=567ms parse=0ms alloc=20ms h2d=540ms cpu_user=188ms cpu_sys=853ms bytes=2200119864 throughput=1921 MB/s
+  run 3/3:
+  [cold] total=977ms read=530ms parse=0ms alloc=21ms h2d=410ms cpu_user=176ms cpu_sys=697ms bytes=2200119864 throughput=2252 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=956ms read=521ms parse=0ms alloc=21ms h2d=397ms cpu_user=159ms cpu_sys=691ms bytes=2200119864 throughput=2301 MB/s
+  run 2/3:
+  [warm] total=960ms read=526ms parse=0ms alloc=21ms h2d=395ms cpu_user=176ms cpu_sys=679ms bytes=2200119864 throughput=2292 MB/s
+  run 3/3:
+  [warm] total=977ms read=539ms parse=0ms alloc=21ms h2d=400ms cpu_user=115ms cpu_sys=758ms bytes=2200119864 throughput=2251 MB/s
+
+Done.

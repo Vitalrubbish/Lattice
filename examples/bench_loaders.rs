@@ -78,27 +78,41 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let methods: &[(LoaderKind, &str)] = &[
+    let mut methods: Vec<(LoaderKind, &str)> = vec![
         (LoaderKind::Read, "read(2)"),
         (LoaderKind::Mmap, "mmap(2)"),
         (LoaderKind::Direct, "O_DIRECT"),
     ];
+    #[cfg(feature = "gds")]
+    methods.push((LoaderKind::Gds, "GDS (cuFileRead)"));
 
-    for &(kind, name) in methods {
+    for &(kind, name) in &methods {
         println!("\n=== {name} ===");
 
         // Cold: drop caches, then load
+        let mut cold_failed = false;
         drop_caches();
         for i in 0..RUNS_PER_METHOD {
             println!("  run {}/{}:", i + 1, RUNS_PER_METHOD);
-            run_one(kind, "cold")?;
+            if let Err(e) = run_one(kind, "cold") {
+                println!("  [skip] cold run failed: {e:?}");
+                cold_failed = true;
+                break;
+            }
         }
 
         // Warm: load again without dropping caches
-        println!("  --- warm ---");
-        for i in 0..RUNS_PER_METHOD {
-            println!("  run {}/{}:", i + 1, RUNS_PER_METHOD);
-            run_one(kind, "warm")?;
+        if cold_failed {
+            println!("  --- warm --- (skipped: cold run failed)");
+        } else {
+            println!("  --- warm ---");
+            for i in 0..RUNS_PER_METHOD {
+                println!("  run {}/{}:", i + 1, RUNS_PER_METHOD);
+                if let Err(e) = run_one(kind, "warm") {
+                    println!("  [skip] warm run failed: {e:?}");
+                    break;
+                }
+            }
         }
     }
 
