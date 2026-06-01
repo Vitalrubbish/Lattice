@@ -478,9 +478,11 @@ impl ContinuousScheduler {
                 RequestState::Prefill { prompt_pos } => {
                     let new_pos = prompt_pos + 1;
                     r.position = new_pos;
+                    self.cache.update_seq_len(r.seq_idx, r.position);
                     if new_pos >= r.req.prompt_tokens.len() {
                         r.state = RequestState::Decode;
                         r.position = r.req.prompt_tokens.len();
+                        self.cache.update_seq_len(r.seq_idx, r.position);
                         tracing::debug!(
                             req_id = r.req.id,
                             "prefill complete, entering decode"
