@@ -1,0 +1,18 @@
+
+=== GDS (cuFileRead) ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=11192ms read=594ms parse=1ms alloc=67ms h2d=10508ms cpu_user=973ms cpu_sys=8515ms bytes=15231271888 throughput=1361 MB/s
+  run 2/3:
+  [cold] total=4374ms read=602ms parse=0ms alloc=110ms h2d=3642ms cpu_user=949ms cpu_sys=3320ms bytes=15231271888 throughput=3483 MB/s
+  run 3/3:
+  [cold] total=3448ms read=600ms parse=0ms alloc=112ms h2d=2717ms cpu_user=804ms cpu_sys=2538ms bytes=15231271888 throughput=4417 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=3377ms read=597ms parse=0ms alloc=117ms h2d=2643ms cpu_user=820ms cpu_sys=2452ms bytes=15231271888 throughput=4511 MB/s
+  run 2/3:
+  [warm] total=3378ms read=599ms parse=0ms alloc=114ms h2d=2646ms cpu_user=908ms cpu_sys=2364ms bytes=15231271888 throughput=4509 MB/s
+  run 3/3:
+  [warm] total=3366ms read=599ms parse=0ms alloc=116ms h2d=2631ms cpu_user=775ms cpu_sys=2487ms bytes=15231271888 throughput=4525 MB/s
+
+Done.

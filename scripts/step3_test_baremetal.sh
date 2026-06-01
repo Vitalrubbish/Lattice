@@ -111,15 +111,38 @@ kill_port() {
     fi
 }
 
+# ── Helper: wait for GPU memory to be mostly free ──
+wait_gpu_free() {
+    local max_wait="${1:-30}" min_free_mib="${2:-20480}"  # 20 GiB free
+    local i
+    for i in $(seq 1 "$max_wait"); do
+        local free_mib
+        free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader 2>/dev/null | head -1 | grep -oP '\d+')
+        if [ -n "$free_mib" ] && [ "$free_mib" -ge "$min_free_mib" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "   (warning: GPU memory may not be fully freed)"
+    return 1
+}
+
+# ── Helper: aggressively kill all vLLM-related processes ──
+kill_vllm_procs() {
+    pkill -9 -f "EngineCore" 2>/dev/null || true
+    pkill -9 -f "multiprocessing.spawn" 2>/dev/null || true
+    pkill -9 -f "vllm" 2>/dev/null || true
+    pkill -9 -f "VLLM" 2>/dev/null || true
+    sleep 2
+}
+
 # ── Cleanup trap ──
 cleanup() {
     echo ""
     echo ">>> Cleaning up..."
     [ -n "${BASELINE_PID:-}" ] && graceful_kill "$BASELINE_PID"
     [ -n "${VLLM_PID:-}" ] && graceful_kill "$VLLM_PID"
-    # vLLM V1 engine uses multiprocessing; kill remaining engine processes
-    pkill -9 -f "EngineCore" 2>/dev/null || true
-    pkill -9 -f "multiprocessing.spawn" 2>/dev/null || true
+    kill_vllm_procs
     echo "Done."
 }
 trap cleanup EXIT
@@ -214,6 +237,8 @@ run_baseline_llama() {
     echo ">>> Stopping baseline llama..."
     graceful_kill "$BASELINE_PID"
     unset BASELINE_PID
+    # Wait for GPU memory to be released before next step
+    wait_gpu_free 30 || true
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -287,6 +312,8 @@ run_vllm() {
     echo ">>> Stopping vLLM..."
     graceful_kill "$VLLM_PID"
     unset VLLM_PID
+    kill_vllm_procs
+    wait_gpu_free 30 || true
 }
 
 # ═══════════════════════════════════════════════════════════════

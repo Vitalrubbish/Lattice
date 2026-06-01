@@ -1,0 +1,18 @@
+
+=== O_DIRECT ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=20539ms read=17032ms parse=1ms alloc=75ms h2d=1988ms cpu_user=1293ms cpu_sys=9776ms bytes=15231271888 throughput=742 MB/s
+  run 2/3:
+  [cold] total=19606ms read=16624ms parse=1ms alloc=68ms h2d=1472ms cpu_user=1239ms cpu_sys=9266ms bytes=15231271888 throughput=777 MB/s
+  run 3/3:
+  [cold] total=19436ms read=16620ms parse=1ms alloc=68ms h2d=1307ms cpu_user=1210ms cpu_sys=9131ms bytes=15231271888 throughput=784 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=19112ms read=16374ms parse=0ms alloc=67ms h2d=1228ms cpu_user=1193ms cpu_sys=9054ms bytes=15231271888 throughput=797 MB/s
+  run 2/3:
+  [warm] total=19300ms read=16581ms parse=0ms alloc=66ms h2d=1190ms cpu_user=1188ms cpu_sys=9055ms bytes=15231271888 throughput=789 MB/s
+  run 3/3:
+  [warm] total=19402ms read=16584ms parse=0ms alloc=67ms h2d=1304ms cpu_user=1206ms cpu_sys=9094ms bytes=15231271888 throughput=785 MB/s
+
+Done.

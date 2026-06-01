@@ -1,0 +1,18 @@
+
+=== read(2) ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=18158ms read=14957ms parse=1ms alloc=74ms h2d=1758ms cpu_user=1270ms cpu_sys=16480ms bytes=15231271888 throughput=839 MB/s
+  run 2/3:
+  [cold] total=12038ms read=9305ms parse=0ms alloc=66ms h2d=1306ms cpu_user=1216ms cpu_sys=10818ms bytes=15231271888 throughput=1265 MB/s
+  run 3/3:
+  [cold] total=11098ms read=8372ms parse=1ms alloc=65ms h2d=1294ms cpu_user=1156ms cpu_sys=9937ms bytes=15231271888 throughput=1372 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=11071ms read=8268ms parse=0ms alloc=65ms h2d=1377ms cpu_user=1240ms cpu_sys=9826ms bytes=15231271888 throughput=1376 MB/s
+  run 2/3:
+  [warm] total=11154ms read=8275ms parse=0ms alloc=63ms h2d=1454ms cpu_user=1192ms cpu_sys=9958ms bytes=15231271888 throughput=1366 MB/s
+  run 3/3:
+  [warm] total=11042ms read=8273ms parse=1ms alloc=66ms h2d=1331ms cpu_user=1239ms cpu_sys=9797ms bytes=15231271888 throughput=1379 MB/s
+
+Done.

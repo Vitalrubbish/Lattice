@@ -1,0 +1,351 @@
+Attaching 16 probes...
+=========================================================
+===  LLM Model Weight Loading — Full I/O Path Trace  ===
+=========================================================
+Start: 03:31:25
+Attaching: VFS + page-cache + block + CUDA driver
+---------------------------------------------------------
+[2s] vfs=@vfs_count: 78
+ bio=@bio_count: 1070
+ blk-iss=@rq_issue_count: 6965
+ blk-done=@rq_complete_count: 6620
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 220572
+
+[4s] vfs=@vfs_count: 79
+ bio=@bio_count: 2836
+ blk-iss=@rq_issue_count: 21094
+ blk-done=@rq_complete_count: 20389
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 672668
+
+[6s] vfs=@vfs_count: 81
+ bio=@bio_count: 3993
+ blk-iss=@rq_issue_count: 30316
+ blk-done=@rq_complete_count: 29249
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 966857
+
+[8s] vfs=@vfs_count: 81
+ bio=@bio_count: 4665
+ blk-iss=@rq_issue_count: 35685
+ blk-done=@rq_complete_count: 34471
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 1138634
+
+[10s] vfs=@vfs_count: 82
+ bio=@bio_count: 6465
+ blk-iss=@rq_issue_count: 50098
+ blk-done=@rq_complete_count: 47902
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 1598154
+
+[12s] vfs=@vfs_count: 84
+ bio=@bio_count: 7688
+ blk-iss=@rq_issue_count: 59875
+ blk-done=@rq_complete_count: 56989
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 1910396
+
+[14s] vfs=@vfs_count: 84
+ bio=@bio_count: 9321
+ blk-iss=@rq_issue_count: 72932
+ blk-done=@rq_complete_count: 69324
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 2327858
+
+[16s] vfs=@vfs_count: 85
+ bio=@bio_count: 11119
+ blk-iss=@rq_issue_count: 87323
+ blk-done=@rq_complete_count: 77593
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 2786913
+
+[18s] vfs=@vfs_count: 87
+ bio=@bio_count: 12126
+ blk-iss=@rq_issue_count: 95372
+ blk-done=@rq_complete_count: 77593
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 3043888
+
+[20s] vfs=@vfs_count: 88
+ bio=@bio_count: 13916
+ blk-iss=@rq_issue_count: 109695
+ blk-done=@rq_complete_count: 77593
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 3502066
+
+Model loaded — keeping alive for bpftrace data collection...
+[22s] vfs=@vfs_count: 92
+ bio=@bio_count: 15621
+ blk-iss=@rq_issue_count: 117402
+ blk-done=@rq_complete_count: 77594
+ h2d=@h2d_count: 0
+ d2h=@d2h_count: 0
+ alloc=@alloc_count: 0
+ pg-new=@page_cache_alloc: 3739936
+
+
+=========================================================
+===                 FINAL REPORT                       ===
+=========================================================
+
+-- Linux I/O Stack (counts) --
+vfs_read calls:    @vfs_count: 92
+vfs_read bytes:    @vfs_total_bytes: 21872733650
+filemap_get_pages: @fgp_count: 261170
+page_cache_alloc:  @page_cache_alloc: 3758444
+readahead calls:   N/A (probe unavailable on kernel 5.15)
+submit_bio calls:  @bio_count: 16399
+block_rq_issue:    @rq_issue_count: 118180
+block_rq_complete: @rq_complete_count: 77594
+
+-- CUDA Driver (counts) --
+cuMemAlloc_v2:     @alloc_count: 3
+cuMemAlloc bytes:  @alloc_total_bytes: 8520704
+cuMemcpyHtoD_v2:   @h2d_count: 0
+cuMemcpyHtoD bytes:
+cuMemcpyDtoH_v2:   @d2h_count: 0
+cuMemcpyDtoH bytes:
+
+-- Latency Histograms (us) --
+
+vfs_read:
+@vfs_read_lat: 
+[1]                   11 |@@@@@@@@@@@@@@@                                     |
+[2, 4)                13 |@@@@@@@@@@@@@@@@@@                                  |
+[4, 8)                14 |@@@@@@@@@@@@@@@@@@@@                                |
+[8, 16)               36 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[16, 32)               5 |@@@@@@@                                             |
+[32, 64)               1 |@                                                   |
+[64, 128)              2 |@@                                                  |
+[128, 256)             1 |@                                                   |
+[256, 512)             1 |@                                                   |
+[512, 1K)              0 |                                                    |
+[1K, 2K)               0 |                                                    |
+[2K, 4K)               0 |                                                    |
+[4K, 8K)               0 |                                                    |
+[8K, 16K)              0 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             0 |                                                    |
+[64K, 128K)            0 |                                                    |
+[128K, 256K)           0 |                                                    |
+[256K, 512K)           0 |                                                    |
+[512K, 1M)             0 |                                                    |
+[1M, 2M)               4 |@@@@@                                               |
+[2M, 4M)               4 |@@@@@                                               |
+
+
+filemap_get_pages:
+@filemap_get_pages_lat: 
+[0]               235476 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[1]                 9834 |@@                                                  |
+[2, 4)                20 |                                                    |
+[4, 8)               870 |                                                    |
+[8, 16)              316 |                                                    |
+[16, 32)             107 |                                                    |
+[32, 64)               8 |                                                    |
+[64, 128)             10 |                                                    |
+[128, 256)             2 |                                                    |
+[256, 512)         11486 |@@                                                  |
+[512, 1K)           2889 |                                                    |
+[1K, 2K)             108 |                                                    |
+[2K, 4K)              39 |                                                    |
+[4K, 8K)               2 |                                                    |
+[8K, 16K)              1 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             0 |                                                    |
+[64K, 128K)            2 |                                                    |
+
+
+submit_bio:
+@submit_bio_lat: 
+[1]                  791 |@@@@                                                |
+[2, 4)              1038 |@@@@@                                               |
+[4, 8)                14 |                                                    |
+[8, 16)                4 |                                                    |
+[16, 32)            4789 |@@@@@@@@@@@@@@@@@@@@@@@@@                           |
+[32, 64)            9734 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[64, 128)             27 |                                                    |
+[128, 256)             2 |                                                    |
+
+
+block I/O (issue->complete):
+@block_io_lat: 
+[16, 32)               4 |                                                    |
+[32, 64)              13 |                                                    |
+[64, 128)           9487 |@@@@@@@@@@@@@                                       |
+[128, 256)         36389 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[256, 512)          6257 |@@@@@@@@                                            |
+[512, 1K)          23758 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                   |
+[1K, 2K)            1537 |@@                                                  |
+[2K, 4K)             139 |                                                    |
+[4K, 8K)               5 |                                                    |
+[8K, 16K)              2 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             0 |                                                    |
+[64K, 128K)            2 |                                                    |
+[128K, 256K)           1 |                                                    |
+
+
+cuMemAlloc_v2:
+@alloc_lat: 
+[8, 16)                1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[16, 32)               0 |                                                    |
+[32, 64)               0 |                                                    |
+[64, 128)              1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[128, 256)             1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+
+cuMemcpyHtoD_v2:
+
+
+cuMemcpyDtoH_v2:
+
+
+-- bytes per block device --
+@bytes_per_dev[8388688]: 1903820800
+@bytes_per_dev[8388640]: 1903820800
+@bytes_per_dev[8388720]: 1903820800
+@bytes_per_dev[8388672]: 1903820800
+@bytes_per_dev[8388752]: 1903828992
+@bytes_per_dev[271581184]: 1904029696
+@bytes_per_dev[8388736]: 1904091136
+@bytes_per_dev[8388608]: 2067783680
+
+========== END ==========
+
+
+
+@alloc_count: 3
+@alloc_lat: 
+[8, 16)                1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[16, 32)               0 |                                                    |
+[32, 64)               0 |                                                    |
+[64, 128)              1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[128, 256)             1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+
+@alloc_total_bytes: 8520704
+@bio_count: 16399
+@block_io_lat: 
+[16, 32)               4 |                                                    |
+[32, 64)              13 |                                                    |
+[64, 128)           9487 |@@@@@@@@@@@@@                                       |
+[128, 256)         36389 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[256, 512)          6257 |@@@@@@@@                                            |
+[512, 1K)          23758 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                   |
+[1K, 2K)            1537 |@@                                                  |
+[2K, 4K)             139 |                                                    |
+[4K, 8K)               5 |                                                    |
+[8K, 16K)              2 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             0 |                                                    |
+[64K, 128K)            2 |                                                    |
+[128K, 256K)           1 |                                                    |
+
+@bytes_per_dev[8388688]: 1903820800
+@bytes_per_dev[8388640]: 1903820800
+@bytes_per_dev[8388720]: 1903820800
+@bytes_per_dev[8388672]: 1903820800
+@bytes_per_dev[8388752]: 1903828992
+@bytes_per_dev[271581184]: 1904029696
+@bytes_per_dev[8388736]: 1904091136
+@bytes_per_dev[8388608]: 2067783680
+
+@d2h_count: 0
+
+
+
+@fgp_count: 261170
+
+@filemap_get_pages_lat: 
+[0]               235476 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[1]                 9834 |@@                                                  |
+[2, 4)                20 |                                                    |
+[4, 8)               870 |                                                    |
+[8, 16)              316 |                                                    |
+[16, 32)             107 |                                                    |
+[32, 64)               8 |                                                    |
+[64, 128)             10 |                                                    |
+[128, 256)             2 |                                                    |
+[256, 512)         11486 |@@                                                  |
+[512, 1K)           2889 |                                                    |
+[1K, 2K)             108 |                                                    |
+[2K, 4K)              39 |                                                    |
+[4K, 8K)               2 |                                                    |
+[8K, 16K)              1 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             0 |                                                    |
+[64K, 128K)            2 |                                                    |
+
+
+@h2d_count: 0
+
+
+
+@header_printed: 1
+
+@page_cache_alloc: 3758444
+@report_printed: 1
+@rq_complete_count: 77594
+@rq_issue_count: 118180
+
+@submit_bio_lat: 
+[1]                  791 |@@@@                                                |
+[2, 4)              1038 |@@@@@                                               |
+[4, 8)                14 |                                                    |
+[8, 16)                4 |                                                    |
+[16, 32)            4789 |@@@@@@@@@@@@@@@@@@@@@@@@@                           |
+[32, 64)            9734 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[64, 128)             27 |                                                    |
+[128, 256)             2 |                                                    |
+
+@vfs_count: 92
+@vfs_read_lat: 
+[1]                   11 |@@@@@@@@@@@@@@@                                     |
+[2, 4)                13 |@@@@@@@@@@@@@@@@@@                                  |
+[4, 8)                14 |@@@@@@@@@@@@@@@@@@@@                                |
+[8, 16)               36 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[16, 32)               5 |@@@@@@@                                             |
+[32, 64)               1 |@                                                   |
+[64, 128)              2 |@@                                                  |
+[128, 256)             1 |@                                                   |
+[256, 512)             1 |@                                                   |
+[512, 1K)              0 |                                                    |
+[1K, 2K)               0 |                                                    |
+[2K, 4K)               0 |                                                    |
+[4K, 8K)               0 |                                                    |
+[8K, 16K)              0 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             0 |                                                    |
+[64K, 128K)            0 |                                                    |
+[128K, 256K)           0 |                                                    |
+[256K, 512K)           0 |                                                    |
+[512K, 1M)             0 |                                                    |
+[1M, 2M)               4 |@@@@@                                               |
+[2M, 4M)               4 |@@@@@                                               |
+
+@vfs_total_bytes: 21872733650
+
+

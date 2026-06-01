@@ -16,10 +16,17 @@ pub struct GpuKernels {
 
 impl GpuKernels {
     pub fn compile(device: &Arc<CudaDevice>) -> Result<Self> {
+        // Build include paths: always include /usr/include plus CUDA toolkit include
+        // from CUDA_HOME or common locations (needed for cuda_fp16.h etc.)
+        let mut include_paths = vec!["/usr/include".into()];
+        let cuda_home = std::env::var("CUDA_HOME")
+            .or_else(|_| std::env::var("CUDA_PATH"))
+            .unwrap_or_else(|_| "/usr/local/cuda".into());
+        include_paths.push(format!("{cuda_home}/include"));
         let opts = cudarc::nvrtc::CompileOptions {
             ftz: Some(true),
             use_fast_math: Some(true),
-            include_paths: vec!["/usr/include".into()],
+            include_paths,
             ..Default::default()
         };
 

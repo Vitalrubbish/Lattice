@@ -1,0 +1,18 @@
+
+=== mmap(2) ===
+  [ok] page cache, dentries, inodes dropped
+  run 1/3:
+  [cold] total=11294ms read=0ms parse=11ms alloc=79ms h2d=10432ms cpu_user=1288ms cpu_sys=7990ms bytes=15231271888 throughput=1349 MB/s
+  run 2/3:
+  [cold] total=4284ms read=0ms parse=1ms alloc=77ms h2d=2345ms cpu_user=1300ms cpu_sys=2980ms bytes=15231271888 throughput=3556 MB/s
+  run 3/3:
+  [cold] total=3194ms read=0ms parse=1ms alloc=76ms h2d=2349ms cpu_user=1279ms cpu_sys=1913ms bytes=15231271888 throughput=4769 MB/s
+  --- warm ---
+  run 1/3:
+  [warm] total=3168ms read=0ms parse=1ms alloc=74ms h2d=2334ms cpu_user=1326ms cpu_sys=1839ms bytes=15231271888 throughput=4808 MB/s
+  run 2/3:
+  [warm] total=3191ms read=0ms parse=1ms alloc=77ms h2d=2350ms cpu_user=1305ms cpu_sys=1885ms bytes=15231271888 throughput=4773 MB/s
+  run 3/3:
+  [warm] total=3170ms read=0ms parse=0ms alloc=74ms h2d=2336ms cpu_user=1252ms cpu_sys=1916ms bytes=15231271888 throughput=4804 MB/s
+
+Done.

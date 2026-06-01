@@ -641,6 +641,6 @@ sudo env MODEL_PATH="$HOME/models/tinyllama" target/release/examples/bench_loade
 
 ## Raw Logs
 
-- [trace_cold.log](trace_cold.log) — Full bpftrace output (cold cache)
-- [trace_warm.log](trace_warm.log) — Full bpftrace output (warm cache)
-- [loader_comparison.log](loader_comparison.log) — Full bench_loaders output (all 4 loaders)
+- [trace_cold.log](artifacts/trace_cold.log) — Full bpftrace output (cold cache)
+- [trace_warm.log](artifacts/trace_warm.log) — Full bpftrace output (warm cache)
+- [loader_comparison.log](artifacts/loader_comparison.log) — Full bench_loaders output (all 4 loaders)

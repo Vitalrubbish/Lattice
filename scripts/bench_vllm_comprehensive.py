@@ -208,9 +208,27 @@ def bench_max_concurrency(port: int, model: str, max_tokens: int = 64,
     max_ok = 0
     final_failures = 0
     concurrent_levels_tested = []
+    test_budget_s = 120  # time budget for this benchmark
 
-    # Binary search approach: ramp up concurrency levels
-    for concurrency in range(step, 1024, step):
+    # Adaptive stepping: small steps at low concurrency, larger steps higher up
+    # Use a fixed list of concurrency levels to test
+    concurrency_levels = (
+        list(range(step, min(64, 1024), step)) +
+        list(range(64, 128, 16)) +
+        list(range(128, 256, 32)) +
+        list(range(256, 512, 64)) +
+        list(range(512, 1024, 128))
+    )
+    # Deduplicate and sort
+    concurrency_levels = sorted(set(concurrency_levels))
+
+    bench_start = time.time()
+    for concurrency in concurrency_levels:
+        # Check time budget
+        if time.time() - bench_start > test_budget_s:
+            print(f"    Stopping: time budget ({test_budget_s}s) exceeded", file=sys.stderr)
+            break
+
         print(f"\n  Testing concurrency={concurrency}...", file=sys.stderr)
 
         # Use small prompts and small max_tokens to maximize concurrency
@@ -219,7 +237,7 @@ def bench_max_concurrency(port: int, model: str, max_tokens: int = 64,
         results = []
         t_start = time.time()
 
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        with ThreadPoolExecutor(max_workers=min(concurrency, 64)) as executor:
             futures = {
                 executor.submit(
                     send_completion_concurrent, port, model, pl, max_tokens, timeout_per_req
@@ -260,7 +278,7 @@ def bench_max_concurrency(port: int, model: str, max_tokens: int = 64,
             break
 
         # Small delay between levels to let server recover
-        time.sleep(1)
+        time.sleep(0.5)
 
     # Also report GPU memory info
     gpu_mem = _get_gpu_memory()
