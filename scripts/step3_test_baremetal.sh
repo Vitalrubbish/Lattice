@@ -343,15 +343,6 @@ collect_gpu_test_metrics() {
     max_conc=$(grep -Po 'max concurrent requests:\s+\K\d+' "$file" 2>/dev/null || echo "N/A")
     echo "  max_concurrent_requests:  $max_conc"
 
-    # Internal fragmentation
-    local int_frag
-    int_frag=$(grep -Po 'internal fragmentation:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
-    echo "  internal_fragmentation:   $int_frag"
-
-    local phys_waste
-    phys_waste=$(grep -Po 'physical memory waste ratio:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
-    echo "  physical_memory_waste:    $phys_waste"
-
     # cuMemMap overhead
     local map_overhead
     map_overhead=$(grep -Po 'avg per 2MB map/unmap:\s+\K[\d.]+' "$file" 2>/dev/null || echo "N/A")
@@ -367,7 +358,24 @@ collect_gpu_test_metrics() {
     map_calls=$(grep -Po 'total cuMemMap calls:\s+\K\d+' "$file" 2>/dev/null || echo "N/A")
     echo "  total_cuMemMap_calls:     $map_calls"
 
-    # Runtime fragmentation
+    # UFS metrics from runtime fragmentation test
+    local ufs_ifr
+    ufs_ifr=$(grep -Po 'IFR avg:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  [UFS] ifr_avg:            $ufs_ifr"
+
+    local ufs_bu
+    ufs_bu=$(grep -Po 'BU avg:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  [UFS] bu_avg:             $ufs_bu"
+
+    local ufs_pme
+    ufs_pme=$(grep -Po 'PME avg:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  [UFS] pme_avg:            $ufs_pme"
+
+    local ufs_rfi
+    ufs_rfi=$(grep -Po 'RFI avg:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "  [UFS] rfi_avg:            $ufs_rfi"
+
+    # Legacy (backward compat)
     local runtime_frag_avg
     runtime_frag_avg=$(grep -Po 'avg runtime fragmentation ratio:\s+\K[\d.]+' "$file" 2>/dev/null || echo "N/A")
     echo "  runtime_frag_avg_ratio:   $runtime_frag_avg"
@@ -379,6 +387,74 @@ collect_gpu_test_metrics() {
     local runtime_frag_stddev
     runtime_frag_stddev=$(grep -Po 'stddev:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
     echo "  runtime_frag_stddev:      $runtime_frag_stddev"
+}
+
+# ── Helper: extract UFS metrics from baseline throughput output ──
+extract_ufs_from_baseline() {
+    local file="$1"
+    if [ ! -f "$file" ]; then echo "N/A"; return; fi
+
+    local ifr_avg bu_avg pme_avg rfi_avg ifr_peak rfi_peak
+    ifr_avg=$(grep -Po 'ifr_avg:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    bu_avg=$(grep -Po 'bu_avg:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    pme_avg=$(grep -Po 'pme_avg:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    rfi_avg=$(grep -Po 'rfi_avg:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    ifr_peak=$(grep -Po 'ifr_peak:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    rfi_peak=$(grep -Po 'rfi_peak:\s+\K[\d.]+' "$file" 2>/dev/null | tail -1 || echo "N/A")
+    echo "$ifr_avg $bu_avg $pme_avg $rfi_avg $ifr_peak $rfi_peak"
+}
+
+# ── Helper: extract UFS metrics from vLLM JSON output ──
+extract_ufs_from_vllm() {
+    local json_file="$1"
+    if [ ! -f "$json_file" ]; then echo "N/A"; return; fi
+
+    python3 -c "
+import json, sys
+try:
+    with open('$json_file') as f:
+        data = json.load(f)
+    ufs = data.get('ufs_summary', {})
+    vals = [
+        ufs.get('ifr_avg', 0), ufs.get('bu_avg', 0), ufs.get('pme_avg', 0),
+        ufs.get('rfi_avg', 0), ufs.get('ifr_peak', 0), ufs.get('rfi_peak', 0),
+    ]
+    print(' '.join(f'{v:.4f}' if isinstance(v, (int, float)) else str(v) for v in vals))
+except Exception as e:
+    print('N/A', file=sys.stderr)
+" 2>/dev/null || echo "N/A"
+}
+
+# ── Helper: print UFS comparison table ──
+print_ufs_comparison() {
+    local baseline_label="$1" baseline_file="$2"
+    local vllm_label="$3" vllm_file="$4"
+
+    local b_ufs v_ufs
+    b_ufs=$(extract_ufs_from_baseline "$baseline_file")
+    v_ufs=$(extract_ufs_from_vllm "$vllm_file")
+
+    local b_ifr_avg b_bu_avg b_pme_avg b_rfi_avg b_ifr_peak b_rfi_peak
+    read -r b_ifr_avg b_bu_avg b_pme_avg b_rfi_avg b_ifr_peak b_rfi_peak <<< "$b_ufs"
+    local v_ifr_avg v_bu_avg v_pme_avg v_rfi_avg v_ifr_peak v_rfi_peak
+    read -r v_ifr_avg v_bu_avg v_pme_avg v_rfi_avg v_ifr_peak v_rfi_peak <<< "$v_ufs"
+
+    echo ""
+    echo "=============================================="
+    echo " Unified Fragmentation Comparison (UFS)"
+    echo "=============================================="
+    printf " %-22s | %-10s | %-10s\n" "Metric" "$baseline_label" "$vllm_label"
+    printf " %-22s-+-%-10s-+-%-10s\n" "----------------------" "----------" "----------"
+    printf " %-22s | %-10s | %-10s\n" "IFR avg" "$b_ifr_avg" "$v_ifr_avg"
+    printf " %-22s | %-10s | %-10s\n" "IFR peak" "$b_ifr_peak" "$v_ifr_peak"
+    printf " %-22s | %-10s | %-10s\n" "BU avg" "$b_bu_avg" "$v_bu_avg"
+    printf " %-22s | %-10s | %-10s\n" "PME avg" "$b_pme_avg" "$v_pme_avg"
+    printf " %-22s | %-10s | %-10s\n" "RFI avg" "$b_rfi_avg" "$v_rfi_avg"
+    printf " %-22s | %-10s | %-10s\n" "RFI peak" "$b_rfi_peak" "$v_rfi_peak"
+    echo "=============================================="
+    echo " (IFR/BU are directly comparable across systems)"
+    echo " (PME/RFI use system-specific actual_physical_bytes)"
+    echo "=============================================="
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -401,6 +477,11 @@ case "$MODE" in
         collect_gpu_test_metrics
         echo ""
         summarize "baseline (llama+continuous)" "$RESULTS_DIR/baseline_llama_output.txt"
+        echo ""
+        # Print UFS comparison table
+        print_ufs_comparison \
+            "Baseline" "$RESULTS_DIR/baseline_llama_output.txt" \
+            "vLLM" "$RESULTS_DIR/throughput.json"
         ;;
 esac
 

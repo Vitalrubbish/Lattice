@@ -9,3 +9,7 @@ AGENTS.md
 CLAUDE.md
 results
 .claude
+
+__pycache__/
+cufile.log
+scripts/load_trace_qwen.sh

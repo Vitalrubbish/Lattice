@@ -78,13 +78,34 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let mut methods: Vec<(LoaderKind, &str)> = vec![
+    let requested_loader = std::env::var("BENCH_LOADER").ok();
+
+    let all_methods: Vec<(LoaderKind, &str)> = vec![
         (LoaderKind::Read, "read(2)"),
         (LoaderKind::Mmap, "mmap(2)"),
         (LoaderKind::Direct, "O_DIRECT"),
     ];
     #[cfg(feature = "gds")]
-    methods.push((LoaderKind::Gds, "GDS (cuFileRead)"));
+    let all_methods = {
+        let mut m = all_methods;
+        m.push((LoaderKind::Gds, "GDS (cuFileRead)"));
+        m
+    };
+
+    let methods: Vec<(LoaderKind, &str)> = if let Some(ref loader_name) = requested_loader {
+        let kind = LoaderKind::parse(loader_name)
+            .unwrap_or_else(|_| panic!("unknown loader: {loader_name}"));
+        all_methods
+            .into_iter()
+            .filter(|(k, _)| std::mem::discriminant(k) == std::mem::discriminant(&kind))
+            .collect()
+    } else {
+        all_methods
+    };
+
+    if methods.is_empty() {
+        anyhow::bail!("no matching loader found");
+    }
 
     for &(kind, name) in &methods {
         println!("\n=== {name} ===");

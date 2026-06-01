@@ -401,7 +401,7 @@ fn step3_runtime_fragmentation() {
         }
 
         // 2. Snapshot fragmentation after admission
-        tracker.record(&cache);
+        tracker.record_unified(&cache);
 
         // 3. Simulate decode steps
         for req in running.iter_mut() {
@@ -433,7 +433,7 @@ fn step3_runtime_fragmentation() {
         }
 
         // 4. Snapshot after decode step
-        tracker.record(&cache);
+        tracker.record_unified(&cache);
 
         // 5. Remove completed requests
         let mut i = 0;
@@ -671,6 +671,23 @@ fn step3_runtime_fragmentation() {
         "  bytes per token (K+V all layers): {}",
         bytes_per_token
     );
+
+    // ── UFS Metrics ──
+    let ufs_summary = tracker.unified_summary();
+    println!();
+    println!("  --- Unified Fragmentation Standard (UFS) ---");
+    println!("  IFR avg:                    {:.4}", ufs_summary.ifr_avg);
+    println!("  IFR peak:                   {:.4}", ufs_summary.ifr_peak);
+    println!("  IFR stddev:                 {:.4}", ufs_summary.ifr_stddev);
+    println!("  BU avg:                     {:.4}", ufs_summary.bu_avg);
+    println!("  BU min:                     {:.4}", ufs_summary.bu_min);
+    println!("  BU stddev:                  {:.4}", ufs_summary.bu_stddev);
+    println!("  PME avg:                    {:.4}", ufs_summary.pme_avg);
+    println!("  PME min:                    {:.4}", ufs_summary.pme_min);
+    println!("  PME stddev:                 {:.4}", ufs_summary.pme_stddev);
+    println!("  RFI avg:                    {:.4}", ufs_summary.rfi_avg);
+    println!("  RFI peak:                   {:.4}", ufs_summary.rfi_peak);
+    println!("  RFI stddev:                 {:.4}", ufs_summary.rfi_stddev);
     println!();
 
     println!("=== End Runtime Fragmentation Rate ===\n");
@@ -685,4 +702,25 @@ fn step3_runtime_fragmentation() {
         avg_ratio
     );
     assert!(total_completed > 0, "should have completed some requests");
+
+    // UFS assertions
+    assert!(
+        ufs_summary.sample_count > 0,
+        "should have recorded unified fragmentation samples"
+    );
+    assert!(
+        ufs_summary.ifr_avg >= 0.0 && ufs_summary.ifr_avg <= 1.0,
+        "IFR should be in [0.0, 1.0], got {:.4}",
+        ufs_summary.ifr_avg
+    );
+    assert!(
+        ufs_summary.bu_avg >= 0.0 && ufs_summary.bu_avg <= 1.0,
+        "BU should be in [0.0, 1.0], got {:.4}",
+        ufs_summary.bu_avg
+    );
+    assert!(
+        ufs_summary.rfi_avg >= 0.0 && ufs_summary.rfi_avg <= 1.0,
+        "RFI should be in [0.0, 1.0], got {:.4}",
+        ufs_summary.rfi_avg
+    );
 }

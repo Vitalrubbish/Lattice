@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use crate::cache::fragmentation_tracker::RuntimeFragmentationTracker;
 use crate::cache::paged_kv::{PagedKvCache, BLOCK_SIZE};
 use crate::cache::{EvictedSeqData, SwapManager, advance_epoch, current_epoch};
 use crate::config::ModelConfig;
@@ -14,6 +15,7 @@ use crate::decoder::greedy_sample;
 use crate::model::Transformer;
 
 use super::static_batch::{InferenceQueue, InferenceRequest, InferenceResponse};
+use super::stats::StatsHandle;
 
 /// Maximum number of sequences allowed in the swapped queue.
 const MAX_SWAPPED_SEQS: usize = 256;
@@ -65,6 +67,10 @@ pub struct ContinuousScheduler {
     swapped: Vec<SwappedRequest>,
     /// Per-sequence last-access epoch for LRU victim selection.
     seq_last_epoch: HashMap<usize, u64>,
+    /// Runtime fragmentation tracker — records snapshots at each scheduler step.
+    tracker: RuntimeFragmentationTracker,
+    /// Shared stats handle for the server to query fragmentation metrics.
+    stats_handle: StatsHandle,
 }
 
 impl ContinuousScheduler {
@@ -76,7 +82,12 @@ impl ContinuousScheduler {
         max_batch: usize,
         max_seq_len: usize,
         queue: Arc<InferenceQueue>,
+        stats_handle: StatsHandle,
     ) -> Self {
+        // bytes_per_token_elem = kv_heads × head_dim × 2 (one layer of K, f16)
+        let bytes_per_token_elem = cfg.kv_heads() * cfg.head_dim() * 2;
+        let tracker = RuntimeFragmentationTracker::new(bytes_per_token_elem);
+
         Self {
             cfg,
             ctx: ctx.clone(),
@@ -89,6 +100,8 @@ impl ContinuousScheduler {
             swap_manager: SwapManager::new(),
             swapped: Vec::new(),
             seq_last_epoch: HashMap::new(),
+            tracker,
+            stats_handle,
         }
     }
 
@@ -149,6 +162,9 @@ impl ContinuousScheduler {
 
             // 5. Run one forward step for all running requests
             self.run_step(&mut running)?;
+
+            // 5b. Record unified fragmentation snapshot after each step
+            self.record_fragmentation_snapshot();
 
             // 6. Remove completed requests, attempt restoration
             self.drain_completed_swapped();
@@ -487,6 +503,30 @@ impl ContinuousScheduler {
         Ok(())
     }
 
+    /// Record a unified fragmentation snapshot from the current cache state
+    /// and publish it to the shared stats handle for the server to query.
+    fn record_fragmentation_snapshot(&mut self) {
+        self.tracker.record_unified(&self.cache);
+
+        let snapshot = self.tracker.unified_summary();
+        let latest_unified = self
+            .tracker
+            .unified_samples()
+            .last()
+            .copied();
+
+        self.stats_handle.update_from_tracker(
+            latest_unified,
+            snapshot.sample_count,
+            snapshot.rfi_avg,
+            snapshot.rfi_peak,
+            snapshot.rfi_stddev,
+            self.tracker.average_ratio(),
+            self.tracker.peak_ratio(),
+            self.tracker.ratio_stddev(),
+        );
+    }
+
     /// Select a victim sequence from the running set for eviction.
     /// Returns the index in the running Vec, or None if no sequence can be evicted.
     ///
@@ -599,6 +639,7 @@ mod integration_tests {
 
         let queue = Arc::new(InferenceQueue::new());
 
+        let stats = StatsHandle::new();
         let sched = ContinuousScheduler::new(
             cfg.clone(),
             ctx.clone(),
@@ -607,6 +648,7 @@ mod integration_tests {
             max_batch,
             max_seq_len,
             queue.clone(),
+            stats,
         );
         let _h = sched.spawn();
 
@@ -659,6 +701,7 @@ mod integration_tests {
 
         let queue = Arc::new(InferenceQueue::new());
 
+        let stats = StatsHandle::new();
         let sched = ContinuousScheduler::new(
             cfg.clone(),
             ctx.clone(),
@@ -667,6 +710,7 @@ mod integration_tests {
             max_batch,
             max_seq_len,
             queue.clone(),
+            stats,
         );
         let _h = sched.spawn();
 

@@ -3,7 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use baseline_llm_os::batch::{ContinuousScheduler, InferenceQueue, StaticScheduler};
+use baseline_llm_os::batch::{ContinuousScheduler, InferenceQueue, StaticScheduler, StatsHandle};
 use baseline_llm_os::cache::paged_kv::PagedKvCache;
 use baseline_llm_os::cache::KvCache;
 use baseline_llm_os::config::ModelConfig;
@@ -87,6 +87,9 @@ async fn main() -> Result<()> {
     };
     let queue = Arc::new(InferenceQueue::new());
 
+    // Create shared stats handle for server ↔ scheduler communication
+    let stats_handle = StatsHandle::new();
+
     if cli.continuous {
         let cache = PagedKvCache::new(
             ctx.clone(),
@@ -103,6 +106,7 @@ async fn main() -> Result<()> {
             cli.max_batch,
             cli.max_seq_len,
             queue.clone(),
+            stats_handle.clone(),
         );
         let _h = sched.spawn();
     } else {
@@ -119,6 +123,6 @@ async fn main() -> Result<()> {
         let _h = sched.spawn();
     }
 
-    serve_http(&cli.listen, queue).await?;
+    serve_http(&cli.listen, queue, stats_handle).await?;
     Ok(())
 }
