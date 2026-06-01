@@ -623,12 +623,13 @@ impl PagedKvCache {
 
     // --- Statistics ---
 
-    /// Fraction of physical GPU memory that is wasted due to superblock
-    /// allocation granularity. Each superblock is 2 MiB; blocks carved from
-    /// a superblock but not currently in use still consume physical memory.
+    /// Fraction of allocated superblock capacity sitting idle in the free list.
+    /// This is NOT fragmentation — in a fixed-size block allocator, every free
+    /// block can satisfy any allocation request. It measures physical memory
+    /// idle rate due to CUDA VMM's 2 MiB allocation granularity.
     ///
     /// Returns 0.0 when no superblocks have been allocated.
-    pub fn fragmentation_ratio(&self) -> f32 {
+    pub fn physical_idle_ratio(&self) -> f32 {
         let num_layers = self.cfg.num_hidden_layers;
         let superblocks = self.k_pools[0].allocator.superblock_count();
         if superblocks == 0 {
@@ -696,7 +697,7 @@ impl PagedKvCache {
         let active_seqs = meta.len();
         let total_blocks_used: usize = meta.iter().map(|s| s.block_table.len()).sum();
         let total_tokens: usize = meta.iter().map(|s| s.seq_len).sum();
-        let allocated = self.total_blocks();
+        let allocated = self.total_physical_blocks();
         let in_use = self.blocks_in_use();
         let free_pool = self.k_pools[0].allocator.free_count();
         let total_slots = total_blocks_used * self.block_size;

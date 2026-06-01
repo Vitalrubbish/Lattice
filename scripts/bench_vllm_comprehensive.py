@@ -186,17 +186,18 @@ class UFSStatsCollector:
     """
     Background stats collector for vLLM benchmarks.
 
-    During a benchmark run, this collects GPU memory snapshots via
-    nvidia-smi and estimates KV cache fragmentation metrics using
-    the Unified Fragmentation Standard.
+    Queries vLLM's true block-pool capacity from the server log or /metrics,
+    then computes UFS metrics with the real total_blocks_allocated — not an
+    nvidia-smi diff that hides the pre-allocated pool.
 
-    Since vLLM does not expose a simple `/stats` endpoint for KV cache
-    block counts, we estimate from:
-      - GPU memory used (nvidia-smi): for actual_physical_bytes
-      - Per-request token counts (API responses): for total_tokens, blocks
+    total_blocks_allocated for vLLM = num_gpu_blocks (the entire pre-allocated
+    pool, fixed at startup).  This matches baseline semantics: "all physical
+    memory provisioned for KV cache blocks."
     """
 
-    def __init__(self, poll_interval_s: float = 0.5):
+    def __init__(self, poll_interval_s: float = 0.5,
+                 server_log_path: Optional[str] = None,
+                 vllm_port: Optional[int] = None):
         self.poll_interval_s = poll_interval_s
         self.samples: List[UnifiedFragMetrics] = []
         self._running = threading.Event()
@@ -216,8 +217,10 @@ class UFSStatsCollector:
         self.block_size = DEFAULT_BLOCK_SIZE
         self.block_bytes = DEFAULT_BLOCK_BYTES
 
-        # Baseline GPU memory (before KV cache allocations)
-        self._baseline_gpu_mem_mib: Optional[float] = None
+        # vLLM pool capacity — queried once at calibration time
+        self.num_gpu_blocks: int = 0
+        self._server_log_path = server_log_path
+        self._vllm_port = vllm_port
 
     def set_model_params(self, kv_heads: int, head_dim: int,
                          num_layers: int, block_size: int = 16):
@@ -227,10 +230,73 @@ class UFSStatsCollector:
         self.block_size = block_size
         self.block_bytes = kv_heads * head_dim * block_size * 2  # f16
 
-    def calibrate_baseline(self):
-        """Record baseline GPU memory before KV cache allocations."""
-        mem = _get_gpu_memory()
-        self._baseline_gpu_mem_mib = mem.get("used_mib", 0.0)
+    def calibrate(self):
+        """
+        Query vLLM's true block-pool capacity.
+
+        Tries in order:
+          1. Parse server log for 'GPU KV cache size: N tokens'
+          2. Query /metrics for vllm:kv_cache_usage_ratio + estimate
+          3. Fallback: estimate from gpu_memory_utilization
+        """
+        # Method 1: parse server log
+        num_blocks = self._parse_num_blocks_from_log()
+
+        # Method 2: /metrics endpoint
+        if num_blocks == 0 and self._vllm_port:
+            num_blocks = self._query_num_blocks_from_metrics()
+
+        if num_blocks > 0:
+            self.num_gpu_blocks = num_blocks
+            print(f"   vLLM block pool: {num_blocks} blocks "
+                  f"({num_blocks * self.block_bytes * self.num_layers * 2 / (1024**3):.2f} GiB "
+                  f"for all layers K+V)", file=sys.stderr)
+        else:
+            # Fallback: rough estimate
+            mem = _get_gpu_memory()
+            total_mib = mem.get("total_mib", 24576.0)
+            # Assume ~85% gpu_memory_utilization, minus ~1.5 GiB for weights
+            kv_cache_mib = total_mib * 0.85 - 1536
+            self.num_gpu_blocks = int(kv_cache_mib * 1024 * 1024
+                                      / (self.block_bytes * self.num_layers * 2))
+            print(f"   WARNING: could not query vLLM block pool, "
+                  f"estimated {self.num_gpu_blocks} blocks", file=sys.stderr)
+
+    def _parse_num_blocks_from_log(self) -> int:
+        """Parse 'GPU KV cache size: N tokens' from vLLM server log."""
+        if not self._server_log_path:
+            return 0
+        try:
+            with open(self._server_log_path, 'r') as f:
+                for line in f:
+                    m = re.search(r'GPU KV cache size:\s*([0-9,]+)\s+tokens', line)
+                    if m:
+                        tokens_str = m.group(1).replace(',', '')
+                        tokens = int(tokens_str)
+                        return tokens // self.block_size
+        except Exception:
+            pass
+        return 0
+
+    def _query_num_blocks_from_metrics(self) -> int:
+        """Query /metrics endpoint for KV cache capacity."""
+        try:
+            import urllib.request
+            url = f"http://127.0.0.1:{self._vllm_port}/metrics"
+            resp = urllib.request.urlopen(url, timeout=5)
+            body = resp.read().decode()
+            # Try vLLM v0 format
+            m = re.search(r'vllm:num_gpu_blocks\S*\s+(\d+)', body)
+            if m:
+                return int(m.group(1))
+            # Try kv_cache_usage_ratio (v1 may have this)
+            m = re.search(r'vllm:kv_cache_usage_ratio\S*\s+([\d.]+)', body)
+            if m and self.num_gpu_blocks == 0:
+                # Can't derive total from ratio alone, skip
+                pass
+        except Exception:
+            pass
+        return 0
 
     def update_request_stats(self, prompt_tokens: int = 0,
                               completion_tokens: int = 0,
@@ -269,39 +335,26 @@ class UFSStatsCollector:
             time.sleep(self.poll_interval_s)
 
     def _take_snapshot(self) -> Optional[UnifiedFragMetrics]:
-        """Take a single UFS snapshot using nvidia-smi and accumulated stats."""
-        mem = _get_gpu_memory()
-        if not mem:
-            return None
+        """
+        Take a single UFS snapshot.
 
-        used_mib = mem.get("used_mib", 0.0)
-        if self._baseline_gpu_mem_mib is not None:
-            kv_cache_mib = max(0.0, used_mib - self._baseline_gpu_mem_mib)
-        else:
-            kv_cache_mib = used_mib * 0.3  # rough estimate
-
-        kv_cache_bytes = int(kv_cache_mib * 1024 * 1024)
+        total_blocks_allocated = num_gpu_blocks (the entire pre-allocated pool).
+        This matches baseline semantics: physical memory provisioned for KV cache.
+        blocks_in_use is estimated from accumulated token counts.
+        """
+        if self.num_gpu_blocks == 0:
+            return None  # not calibrated yet
 
         with self._lock:
             total_tokens = self._total_prompt_tokens + self._total_completion_tokens
-            # Estimate blocks from tokens (this is approximate for vLLM)
             estimated_blocks = (total_tokens + self.block_size - 1) // self.block_size
 
-        # For vLLM: estimate blocks_allocated from GPU memory
-        if kv_cache_bytes > 0:
-            total_blocks_allocated = max(
-                estimated_blocks,
-                kv_cache_bytes // (self.block_bytes * self.num_layers * 2)
-            )
-        else:
-            total_blocks_allocated = estimated_blocks
-
-        blocks_in_use = min(estimated_blocks, total_blocks_allocated)
+        blocks_in_use = min(estimated_blocks, self.num_gpu_blocks)
 
         return compute_metrics_vllm(
             block_size=self.block_size,
             blocks_in_use=blocks_in_use,
-            total_blocks_allocated=total_blocks_allocated,
+            total_blocks_allocated=self.num_gpu_blocks,
             total_blocks_used_by_seqs=estimated_blocks,
             total_tokens=total_tokens,
             block_bytes=self.block_bytes,
@@ -413,7 +466,8 @@ def _get_gpu_memory() -> dict:
 #  Benchmark: Fragmentation Rate (UFS Standard)
 # ═══════════════════════════════════════════════════════════════
 
-def bench_fragmentation(port: int, model: str, max_tokens: int = 64) -> dict:
+def bench_fragmentation(port: int, model: str, max_tokens: int = 64,
+                       vllm_log_path: str = "") -> dict:
     """
     Measure fragmentation using the UFS standard.
 
@@ -426,8 +480,10 @@ def bench_fragmentation(port: int, model: str, max_tokens: int = 64) -> dict:
     print(" Benchmark: Fragmentation Rate (UFS Standard)", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
 
-    collector = UFSStatsCollector(poll_interval_s=0.3)
-    collector.calibrate_baseline()
+    collector = UFSStatsCollector(poll_interval_s=0.3,
+                                   server_log_path=vllm_log_path,
+                                   vllm_port=port)
+    collector.calibrate()
 
     # Phase 1: Fill cache
     print("\n  Phase 1: Filling KV cache with concurrent requests...", file=sys.stderr)
@@ -589,7 +645,8 @@ def bench_fragmentation(port: int, model: str, max_tokens: int = 64) -> dict:
 
 def bench_throughput(port: int, model: str, num_requests: int = 100,
                      concurrency: int = 4, max_new_tokens: int = 64,
-                     collect_frag: bool = True) -> dict:
+                     collect_frag: bool = True,
+                     vllm_log_path: str = "") -> dict:
     """Throughput benchmark with concurrent requests + UFS stats collection."""
     print("=" * 60, file=sys.stderr)
     print(" Benchmark: Throughput (concurrent)", file=sys.stderr)
@@ -603,9 +660,11 @@ def bench_throughput(port: int, model: str, num_requests: int = 100,
     prompts = [random.choice(SONNET_PROMPT_LENS) for _ in range(num_requests)]
 
     # UFS stats collection
-    collector = UFSStatsCollector(poll_interval_s=0.3)
+    collector = UFSStatsCollector(poll_interval_s=0.3,
+                                   server_log_path=vllm_log_path,
+                                   vllm_port=port)
     if collect_frag:
-        collector.calibrate_baseline()
+        collector.calibrate()
         collector.start()
 
     results = []
@@ -762,6 +821,7 @@ def bench_stress(port: int, model: str, num_requests: int = 100,
             concurrency=concurrency,
             max_new_tokens=max_new_tokens,
             collect_frag=True,
+            vllm_log_path=os.path.join(output_dir, "vllm_server.log"),
         )
 
         ufs = tp.get("ufs_summary", {})
@@ -908,6 +968,7 @@ def main():
         warmup_server(args.port, args.model)
 
     all_results = {}
+    vllm_server_log = os.path.join(args.output_dir, "vllm_server.log")
 
     # ── Max Concurrency ──
     if args.mode in ("max_concurrency", "all"):
@@ -926,7 +987,8 @@ def main():
     # ── Fragmentation ──
     if args.mode in ("fragmentation", "all"):
         frag = bench_fragmentation(args.port, args.model,
-                                   max_tokens=args.max_new_tokens)
+                                   max_tokens=args.max_new_tokens,
+                                   vllm_log_path=vllm_server_log)
         all_results["fragmentation"] = frag
 
         with open(os.path.join(args.output_dir, "fragmentation.json"), "w") as f:
@@ -950,6 +1012,7 @@ def main():
             concurrency=args.concurrency,
             max_new_tokens=args.max_new_tokens,
             collect_frag=True,
+            vllm_log_path=vllm_server_log,
         )
         all_results["throughput"] = tp
 

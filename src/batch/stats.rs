@@ -22,12 +22,6 @@ pub struct StatsSnapshot {
     pub rfi_peak: f32,
     /// Standard deviation of runtime fragmentation index.
     pub rfi_stddev: f32,
-    /// Legacy ratio average (for backward-compatible reporting).
-    pub legacy_ratio_avg: f32,
-    /// Legacy ratio peak.
-    pub legacy_ratio_peak: f32,
-    /// Legacy ratio stddev.
-    pub legacy_ratio_stddev: f32,
 }
 
 impl Default for StatsSnapshot {
@@ -38,9 +32,6 @@ impl Default for StatsSnapshot {
             rfi_avg: 0.0,
             rfi_peak: 0.0,
             rfi_stddev: 0.0,
-            legacy_ratio_avg: 0.0,
-            legacy_ratio_peak: 0.0,
-            legacy_ratio_stddev: 0.0,
         }
     }
 }
@@ -69,9 +60,6 @@ impl StatsHandle {
         rfi_avg: f32,
         rfi_peak: f32,
         rfi_stddev: f32,
-        legacy_avg: f32,
-        legacy_peak: f32,
-        legacy_stddev: f32,
     ) {
         let mut snap = self.inner.lock();
         snap.unified = unified;
@@ -79,9 +67,6 @@ impl StatsHandle {
         snap.rfi_avg = rfi_avg;
         snap.rfi_peak = rfi_peak;
         snap.rfi_stddev = rfi_stddev;
-        snap.legacy_ratio_avg = legacy_avg;
-        snap.legacy_ratio_peak = legacy_peak;
-        snap.legacy_ratio_stddev = legacy_stddev;
     }
 
     /// Get the current stats snapshot.

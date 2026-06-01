@@ -22,15 +22,24 @@ fn step3_max_concurrent_requests() {
     let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
     let cfg = ModelConfig::tiny_llama();
 
-    let max_batch = 256;
-    let max_seq_len = 256;
+    // Use a wider range than the vLLM bench to exercise the allocator.
+    // Every sequence starts with a small prompt, then grows via alloc_block
+    // during simulated decode.  This measures *capacity at workload*, not
+    // worst-case pre-allocation.
+    let max_batch = 1024;
+    let max_seq_len = 512;
     let block_size = 16;
-    let max_blocks_per_seq = (max_seq_len + block_size - 1) / block_size;
+    let max_new_tokens = 64;
+
+    // Prompt-length distribution matching vLLM's max-concurrency benchmark:
+    // short prompts (8, 16, 32 tokens) to maximise the number of admitted
+    // sequences.  Cycle through deterministically so the test is reproducible.
+    let prompt_lens: &[usize] = &[8, 16, 32];
 
     let cache = PagedKvCache::new(ctx, cfg.clone(), max_batch, max_seq_len, block_size)
         .expect("create PagedKvCache");
 
-    println!("\n=== Step 3: Maximum Concurrent Requests ===");
+    println!("\n=== Step 3: Capacity at Workload ===");
     println!(
         "model: tiny_llama (kv_heads={}, head_dim={}, layers={})",
         cfg.kv_heads(),
@@ -38,32 +47,75 @@ fn step3_max_concurrent_requests() {
         cfg.num_hidden_layers
     );
     println!(
-        "block_size={}, max_seq_len={}, blocks_per_seq={}",
-        block_size, max_seq_len, max_blocks_per_seq
+        "block_size={}, max_seq_len={}, max_new_tokens={}",
+        block_size, max_seq_len, max_new_tokens
     );
     println!(
         "block_bytes={}, blocks_per_superblock={}",
         cache.block_bytes, cache.blocks_per_superblock()
     );
+    println!(
+        "prompt lens (cycle): {:?}",
+        prompt_lens
+    );
 
-    // Allocate until OOM
-    let mut allocated = 0usize;
-    for _ in 0..max_batch {
-        match cache.alloc_sequence(max_blocks_per_seq) {
+    // ── Phase 1: admit sequences with initial prompt blocks ──
+    let mut admitted = 0usize;
+    for i in 0..max_batch {
+        let pl = prompt_lens[i % prompt_lens.len()];
+        let initial_blocks = (pl + block_size - 1) / block_size;
+
+        match cache.alloc_sequence(initial_blocks) {
             Ok(table) => {
                 cache.register_sequence(table);
-                allocated += 1;
+                cache.update_seq_len(admitted, pl);
+                admitted += 1;
             }
             Err(e) => {
-                println!("alloc_sequence failed at seq {}: {:?}", allocated, e);
+                println!(
+                    "admission stopped at seq {} (prompt_len={}): {:?}",
+                    admitted, pl, e
+                );
                 break;
             }
         }
     }
+    println!("\nPhase 1 (admission): {} sequences admitted", admitted);
+
+    // ── Phase 2: simulate decode growth ──
+    let mut capped_seqs = 0usize;
+    for seq_idx in 0..admitted {
+        let mut current_len = cache.get_seq_len(seq_idx);
+        let target_len = (current_len + max_new_tokens).min(max_seq_len);
+
+        while current_len < target_len {
+            current_len += 1;
+            let blocks_needed = (current_len + block_size - 1) / block_size;
+            if blocks_needed > cache.seq_block_count(seq_idx) {
+                match cache.alloc_block() {
+                    Ok(block_idx) => {
+                        cache.append_block_to_sequence(seq_idx, block_idx);
+                    }
+                    Err(_) => {
+                        // OOM during decode — cap here
+                        current_len -= 1;
+                        capped_seqs += 1;
+                        break;
+                    }
+                }
+            }
+            cache.update_seq_len(seq_idx, current_len);
+        }
+    }
+    println!(
+        "Phase 2 (decode): {} sequences grew to max_new_tokens, {} capped (OOM)",
+        admitted.saturating_sub(capped_seqs),
+        capped_seqs,
+    );
 
     let stats = cache.stats();
     println!("\nResults:");
-    println!("  max concurrent requests:  {}", allocated);
+    println!("  capacity at workload:     {}", admitted);
     println!("  total blocks allocated:   {}", stats.total_blocks_allocated);
     println!("  blocks in use:            {}", stats.blocks_in_use);
     println!("  free blocks in pool:      {}", stats.free_blocks_in_pool);
@@ -73,8 +125,8 @@ fn step3_max_concurrent_requests() {
         stats.physical_memory_mib
     );
     println!(
-        "  physical blocks / request: {}",
-        stats.blocks_in_use as f32 / allocated.max(1) as f32
+        "  avg blocks / request:     {:.2}",
+        stats.blocks_in_use as f32 / admitted.max(1) as f32
     );
 
     // Check how maps are batched
@@ -87,7 +139,7 @@ fn step3_max_concurrent_requests() {
     );
 
     // Free all
-    for i in 0..allocated {
+    for i in 0..admitted {
         cache.unregister_sequence(i);
     }
     let after = cache.stats();
@@ -95,12 +147,12 @@ fn step3_max_concurrent_requests() {
     println!("  blocks in use:            {}", after.blocks_in_use);
     println!("  free blocks in pool:      {}", after.free_blocks_in_pool);
     println!(
-        "  physical memory waste ratio: {:.4}",
-        cache.fragmentation_ratio()
+        "  physical idle ratio:      {:.4}",
+        cache.physical_idle_ratio()
     );
 
-    assert!(allocated > 0, "should allocate at least some sequences");
-    println!("=== End Max Concurrent Requests ===\n");
+    assert!(admitted > 0, "should admit at least some sequences");
+    println!("=== End Capacity at Workload ===\n");
 }
 
 // --- Step 3: cuMemMap/cuMemUnmap Overhead ---

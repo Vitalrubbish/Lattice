@@ -521,9 +521,6 @@ impl ContinuousScheduler {
             snapshot.rfi_avg,
             snapshot.rfi_peak,
             snapshot.rfi_stddev,
-            self.tracker.average_ratio(),
-            self.tracker.peak_ratio(),
-            self.tracker.ratio_stddev(),
         );
     }
 

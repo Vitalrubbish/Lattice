@@ -338,10 +338,10 @@ collect_gpu_test_metrics() {
     echo ">>> Baseline GPU Test Metrics:"
     echo ""
 
-    # Max concurrent requests
-    local max_conc
-    max_conc=$(grep -Po 'max concurrent requests:\s+\K\d+' "$file" 2>/dev/null || echo "N/A")
-    echo "  max_concurrent_requests:  $max_conc"
+    # Capacity at workload (measured under prompt-length distribution)
+    local cap
+    cap=$(grep -Po 'capacity at workload:\s+\K\d+' "$file" 2>/dev/null || echo "N/A")
+    echo "  capacity_at_workload:     $cap"
 
     # cuMemMap overhead
     local map_overhead

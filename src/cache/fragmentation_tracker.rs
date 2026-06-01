@@ -73,7 +73,7 @@ impl RuntimeFragmentationTracker {
     ///
     /// A ratio of 0.0 means no fragmentation (all allocated memory is used by
     /// active tokens); approaching 1.0 means most allocated memory is wasted.
-    pub fn record(&mut self, cache: &PagedKvCache) {
+    fn record(&mut self, cache: &PagedKvCache) {
         let sb_count = cache.superblock_count();
         if sb_count == 0 {
             return;
