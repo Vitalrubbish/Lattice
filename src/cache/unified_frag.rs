@@ -30,7 +30,7 @@
 //
 // All byte values account for ALL layers (K+V).
 //   BPT (bytes per token, all layers) = kv_heads × head_dim × 2 × num_layers × 2
-//   ideal_bytes = blocks_in_use × block_bytes × num_layers × 2
+//   ideal_bytes = total_tokens × BPT
 //
 // ## System-specific actual bytes
 //
@@ -120,7 +120,6 @@ impl UnifiedFragMetrics {
 
         let blocks_in_use = cache.blocks_in_use();
         let total_blocks_allocated = cache.total_physical_blocks();
-        let block_bytes = cache.block_bytes;
         let num_layers = cache.cfg.num_hidden_layers;
         let bpt_all = bytes_per_token_all_layers(cache);
 
@@ -137,8 +136,10 @@ impl UnifiedFragMetrics {
         let actual_physical_bytes =
             (superblock_count * superblock_size * num_layers * 2) as u64;
 
-        let ideal_physical_bytes =
-            (blocks_in_use * block_bytes * num_layers * 2) as u64;
+        // PME: ideal_physical_bytes uses actual token count (not block count),
+        // so PME captures internal fragmentation + block-pool underutilization,
+        // making it orthogonal to BU (which only captures block-pool utilization).
+        let ideal_physical_bytes = (total_tokens * bpt_all) as u64;
 
         let physical_memory_efficiency = if actual_physical_bytes > 0 {
             ideal_physical_bytes as f32 / actual_physical_bytes as f32
@@ -188,7 +189,7 @@ impl UnifiedFragMetrics {
         total_blocks_allocated: usize,
         total_blocks_used_by_seqs: usize,
         total_tokens: usize,
-        block_bytes: usize,
+        _block_bytes: usize,  // retained for API compat; PME now uses total_tokens × BPT
         num_layers: usize,
         kv_heads: usize,
         head_dim: usize,
@@ -209,8 +210,12 @@ impl UnifiedFragMetrics {
             0.0
         };
 
-        let ideal_physical_bytes =
-            (blocks_in_use * block_bytes * num_layers * 2) as u64;
+        // Bytes per token for all layers (K+V)
+        let bpt_all = kv_heads * head_dim * 2 * num_layers * 2;
+
+        // PME: ideal_physical_bytes uses actual token count, making PME
+        // orthogonal to BU (which uses block count).
+        let ideal_physical_bytes = (total_tokens * bpt_all) as u64;
 
         let physical_memory_efficiency = if actual_physical_bytes > 0 {
             ideal_physical_bytes as f32 / actual_physical_bytes as f32
@@ -218,8 +223,6 @@ impl UnifiedFragMetrics {
             1.0
         };
 
-        // Bytes per token for all layers (K+V)
-        let bpt_all = kv_heads * head_dim * 2 * num_layers * 2;
         let ideal_active_bytes = (total_tokens * bpt_all) as u64;
 
         let runtime_frag_index = if actual_active_bytes > 0 {
@@ -393,9 +396,11 @@ mod tests {
         assert!((m.block_utilization - 0.625).abs() < 0.001,
             "BU should be 0.625, got {}", m.block_utilization);
 
-        // PME: (10 * 8192 * 22 * 2) / (16 * 8192 * 22 * 2) = 10/16 = 0.625
-        assert!((m.physical_memory_efficiency - 0.625).abs() < 0.001,
-            "PME should be 0.625, got {}", m.physical_memory_efficiency);
+        // PME: ideal = total_tokens * BPT = 100 * 22528 = 2252800
+        // actual_physical = 16 * 8192 * 22 * 2 = 5767168
+        // PME = 2252800 / 5767168 = 0.390625
+        assert!((m.physical_memory_efficiency - 0.390625).abs() < 0.001,
+            "PME should be 0.390625, got {}", m.physical_memory_efficiency);
 
         // RFI > 0 (waste present)
         assert!(m.runtime_frag_index > 0.0,

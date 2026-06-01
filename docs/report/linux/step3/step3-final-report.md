@@ -15,9 +15,11 @@ fixed-size 16-token blocks) and a continuous batching scheduler, then benchmarke
 against vLLM using the Unified Fragmentation Standard (UFS) — four metrics (IFR,
 BU, PME, RFI) computable on both systems.
 
-**Key finding: CUDA VMM's grow-on-demand achieves a 17× improvement in block
-utilization as load increases (BU: 0.04 → 0.65), while vLLM's pre-allocation
-stays flat at BU=0.005 regardless of load.** The throughput gap (10×) is from
+**Key finding: CUDA VMM's grow-on-demand demonstrates adaptive block utilization —
+BU rises 17× from 0.04 at low load to 0.65 at high load as the pool expands to
+meet demand, while vLLM's pre-allocation maintains a constant BU≈0.005: its pool
+is sized for peak load, so utilization is structurally low at any demand below
+that peak.** The throughput gap (10×) is from
 attention kernel quality, not KV cache management.
 
 ---
@@ -64,7 +66,7 @@ OOM             → LRU eviction to host memory (swap)
 |--------|---------|-------|-------------|------------------|
 | **IFR** | `(total_slots − total_tokens) / total_slots` | [0, 1) | ✅ Directly | Last-block internal waste. Identical across systems for same workload. |
 | **BU** | `blocks_in_use / total_blocks_allocated` | [0, 1] | ✅ Directly | Pool utilization. Low at light load, rises with demand for grow-on-demand systems. |
-| **PME** | `ideal_bytes / actual_physical_bytes` | (0, 1] | ⚠️ System-specific | Allocator-granularity waste. PME = BU when no extra granularity overhead. |
+| **PME** | `total_tokens × BPT / actual_physical_bytes` | (0, 1] | ⚠️ System-specific | Physical memory efficiency: fraction of allocated GPU memory holding actual token data. Captures internal fragmentation + pool underutilization. Orthogonal to BU. |
 | **RFI** | `1 − (total_tokens × BPT / actual_active_bytes)` | [0, 1) | ⚠️ System-specific | Combined waste in active allocations. Does NOT capture idle-block waste; must be read with BU. |
 
 **System-specific formulas:**
@@ -105,21 +107,41 @@ OOM             → LRU eviction to host memory (swap)
 | 32 | 0.033 | 0.005 | 0.005 | 0.033 | 39.43 | 886 |
 | 64 | 0.013 | 0.005 | 0.005 | 0.013 | 59.73 | 866 |
 
+> **⚠️ Sample count asymmetry:** Baseline and vLLM use different sampling
+> methodologies, producing vastly different sample counts per concurrency level.
+> Baseline polls at 0.2s intervals across longer test durations (≈200s at conc=1,
+> ≈17s at conc=64), yielding ~1,000 samples at low concurrency and ~85 at high
+> concurrency. vLLM polls at 0.3s intervals, but its higher throughput means each
+> 100-request level finishes much faster (≈62s at conc=1, ≈1.7s at conc=64),
+> yielding ~200 samples at conc=1 but only ~6 samples at conc=64 — insufficient
+> for meaningful statistics. vLLM UFS values at conc≥32 should be treated as
+> approximate. Fix pending (see next-steps #2: increase num-requests or reduce
+> poll interval at high concurrency).
+
 ### 4.2 Key Observations
 
 **IFR — stable and consistent.** Baseline IFR = 0.053 ± 0.005 across all concurrency
 levels. This confirms internal fragmentation is a function of block_size and workload,
-not allocator design. vLLM IFR is lower (<0.03) because many sequences terminate early
-(EOS), generating fewer tokens and filling their last block more completely.
+not allocator design. vLLM IFR is lower (<0.03) as an artifact of the cumulative
+estimation model used by the UFS collector: `blocks_in_use` is estimated from
+accumulated token counts (never decremented upon request completion), and
+IFR = 1 − total_tokens/⌈total_tokens/16⌉×16. For large cumulative token totals
+(1,000+ per test run), the mod-16 remainder averages to a small value — this is a
+measurement artifact, not a reflection of actual internal fragmentation. vLLM IFR
+will be re-measured after switching to live state queries (see next-steps #1).
 
 **BU — the core differentiator.** Baseline BU rises 17× from conc=1 (0.038) to
 conc=32 (0.645), proving grow-on-demand works. vLLM BU stays at 0.005 — the 53,126-block
 pre-allocated pool is 99.5% idle regardless of load. BU dips to 0.47 at conc=64 as new
 superblocks with many free blocks are created to handle the higher concurrency.
 
-**PME — equals BU for TinyLlama.** With 256 blocks/superblock, the 2 MiB granularity
-overhead is diluted. For larger models (fewer blocks/superblock), PME would diverge
-downward from BU.
+**PME — orthogonal to BU.** PME measures the fraction of physically-allocated GPU
+memory that holds actual token KV data: `total_tokens × BPT / actual_physical_bytes`.
+Unlike BU (which measures block-level pool utilization), PME captures both internal
+fragmentation (partially-filled last blocks) and block-pool underutilization
+(idle blocks). For TinyLlama, PME ≈ BU × (1 − IFR) when blocks_in_use ≈
+total_blocks_used_by_seqs. The PME values in Table 4.1 reflect the pre-fix
+formula (where PME ≡ BU); re-measurement pending with the tokens-based ideal_bytes.
 
 **RFI — must be read with BU.** Baseline RFI drops from 0.96 (one seq wastes an entire
 superblock) to 0.39 (pool well-utilized). vLLM RFI is <0.04 — but RFI excludes idle

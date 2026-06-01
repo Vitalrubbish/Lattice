@@ -31,7 +31,7 @@ so vLLM benchmarks produce directly comparable results.
 
 All byte values account for ALL layers (K+V).
   BPT (bytes per token, all layers) = kv_heads × head_dim × 2 × num_layers × 2
-  ideal_bytes = blocks_in_use × block_bytes × num_layers × 2
+  ideal_bytes = total_tokens × BPT
 
 ## System-specific actual bytes
 
@@ -143,11 +143,13 @@ def compute_metrics(
     block_utilization = blocks_in_use / max(total_blocks_allocated, 1)
 
     # PME: physical memory efficiency
-    ideal_physical_bytes = blocks_in_use * block_bytes * num_layers * 2
+    # ideal_physical_bytes uses actual token count (not block count),
+    # so PME captures internal fragmentation + block-pool underutilization,
+    # making it orthogonal to BU (which only captures block-pool utilization).
+    bpt_all = kv_heads * head_dim * 2 * num_layers * 2
+    ideal_physical_bytes = total_tokens * bpt_all
     physical_memory_efficiency = ideal_physical_bytes / max(actual_physical_bytes, 1)
 
-    # BPT (bytes per token, all layers)
-    bpt_all = kv_heads * head_dim * 2 * num_layers * 2
     ideal_active_bytes = total_tokens * bpt_all
 
     # RFI: runtime fragmentation index
