@@ -111,15 +111,24 @@ class BenchResult:
 # ═══════════════════════════════════════════════════════════════
 
 def send_completion(port: int, model: str, prompt_len: int,
-                     max_tokens: int, timeout: int = 120) -> dict:
-    """Send one completion request; return timings + token counts."""
+                     max_tokens: int, timeout: int = 120,
+                     ignore_eos: bool = False) -> dict:
+    """Send one completion request; return timings + token counts.
+
+    When ignore_eos=True, the model is instructed not to stop on EOS,
+    guaranteeing max_tokens tokens are generated for fair capacity benchmarks.
+    """
     prompt = "Hello " * max(1, prompt_len)
 
-    body = json.dumps({
+    req_body = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
-    })
+    }
+    if ignore_eos:
+        req_body["ignore_eos"] = True
+
+    body = json.dumps(req_body)
 
     t0 = time.time()
     try:
@@ -149,9 +158,11 @@ def send_completion(port: int, model: str, prompt_len: int,
 
 
 def send_completion_concurrent(port: int, model: str, prompt_len: int,
-                                max_tokens: int, timeout: int = 300) -> dict:
+                                max_tokens: int, timeout: int = 300,
+                                ignore_eos: bool = False) -> dict:
     """Send one completion request with longer timeout for concurrency tests."""
-    return send_completion(port, model, prompt_len, max_tokens, timeout)
+    return send_completion(port, model, prompt_len, max_tokens, timeout,
+                           ignore_eos=ignore_eos)
 
 
 def wait_for_server(port: int, timeout_s: int = 300) -> bool:
@@ -263,19 +274,32 @@ class UFSStatsCollector:
                   f"estimated {self.num_gpu_blocks} blocks", file=sys.stderr)
 
     def _parse_num_blocks_from_log(self) -> int:
-        """Parse 'GPU KV cache size: N tokens' from vLLM server log."""
+        """Parse 'GPU KV cache size: N tokens' from vLLM server log.
+
+        Retries up to 5 times with a 1-second delay in case the log file
+        hasn't been fully flushed to disk yet when we read it.
+        """
         if not self._server_log_path:
             return 0
-        try:
-            with open(self._server_log_path, 'r') as f:
-                for line in f:
-                    m = re.search(r'GPU KV cache size:\s*([0-9,]+)\s+tokens', line)
-                    if m:
-                        tokens_str = m.group(1).replace(',', '')
-                        tokens = int(tokens_str)
-                        return tokens // self.block_size
-        except Exception:
-            pass
+        import time as _time
+        for attempt in range(5):
+            try:
+                if not os.path.exists(self._server_log_path):
+                    if attempt < 4:
+                        _time.sleep(1.0)
+                        continue
+                    return 0
+                with open(self._server_log_path, 'r', errors='replace') as f:
+                    for line in f:
+                        m = re.search(r'GPU KV cache size:\s*([0-9,]+)\s+tokens', line)
+                        if m:
+                            tokens = int(m.group(1).replace(',', ''))
+                            return tokens // self.block_size
+            except Exception as e:
+                if attempt == 4:
+                    print(f"   (log parse: {e})", file=sys.stderr)
+            if attempt < 4:
+                _time.sleep(1.0)
         return 0
 
     def _query_num_blocks_from_metrics(self) -> int:
@@ -404,7 +428,8 @@ def bench_max_concurrency(port: int, model: str, max_tokens: int = 64,
         with ThreadPoolExecutor(max_workers=min(concurrency, 64)) as executor:
             futures = {
                 executor.submit(
-                    send_completion_concurrent, port, model, pl, max_tokens, timeout_per_req
+                    send_completion_concurrent, port, model, pl, max_tokens, timeout_per_req,
+                    True  # ignore_eos: ensure full max_tokens for fair capacity comparison
                 ): i
                 for i, pl in enumerate(prompt_lens)
             }

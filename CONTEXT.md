@@ -111,11 +111,33 @@ measured under a specified token-length distribution and max_new_tokens (not wor
 Replaces the misleading "max concurrent requests" that used hardcoded blocks-per-seq.
 _Avoid_: Max concurrent requests, peak concurrency, max batch size
 
+**EOS-Controlled Benchmark**:
+A capacity or fragmentation benchmark where EOS generation is suppressed (via an unreachable
+`eos_token_id`) so every sequence generates exactly `max_new_tokens` tokens. Without this,
+natural EOS termination frees KV blocks early, giving an unfairly high capacity count.
+Baseline tests always use EOS-controlled semantics; vLLM benchmarks must explicitly configure it.
+_Avoid_: Unfair capacity comparison, EOS-biased benchmark
+
+**Stress Mode / Concurrency Ramp**:
+Running the same benchmark workload at increasing concurrency levels (e.g., 1 → 2 → 4 → 8 → … → 64)
+to observe how UFS metrics change with load. Baseline's BU should rise sharply (grow-on-demand),
+while vLLM's BU stays flat (pre-allocation). Each level produces one row of the comparison table.
+_Avoid_: Multi-level benchmark, scalability test
+
 **Continuous Batching**:
 A scheduler that admits new requests and evicts completed ones on every step,
 rather than waiting for the whole batch to finish. Enables dynamic request join/leave
 and on-the-fly KV cache block allocation during decode.
 _Avoid_: Dynamic batching, in-flight batching, iteration-level scheduling
+
+### Measurement Pitfalls
+
+**nvidia-smi Diff Trap**:
+Subtracting a post-startup GPU memory baseline from `nvidia-smi` readings to estimate
+KV cache memory usage. This hides the pre-allocated block pool because it was already
+accounted for in the baseline. Always query the allocator directly for `total_blocks_allocated`
+(vLLM: `num_gpu_blocks` from server log or `/metrics`; baseline: `total_physical_blocks()`).
+_Avoid_: GPU memory delta, VRAM difference
 
 ### Data Loading
 
