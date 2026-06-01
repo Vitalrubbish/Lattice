@@ -108,9 +108,8 @@ OOM             → LRU eviction to host memory (swap)
 ### 4.2 Key Observations
 
 **IFR — stable and consistent.** Baseline IFR = 0.053 ± 0.005 across all concurrency
-levels, matching the GPU simulation test (0.039, with a different prompt distribution).
-This confirms internal fragmentation is a function of block_size and workload, not
-allocator design. vLLM IFR is lower (<0.03) because many sequences terminate early
+levels. This confirms internal fragmentation is a function of block_size and workload,
+not allocator design. vLLM IFR is lower (<0.03) because many sequences terminate early
 (EOS), generating fewer tokens and filling their last block more completely.
 
 **BU — the core differentiator.** Baseline BU rises 17× from conc=1 (0.038) to
@@ -151,32 +150,6 @@ Baseline saturates at ~6 req/s (compute-bound by serial per-layer GEMM).
 
 Both systems use a comparable number of blocks (~5,500). CUDA VMM's 2 MiB granularity
 does not impose a meaningful capacity penalty on TinyLlama (256 blocks/superblock).
-
-### 4.5 Dedicated Fragmentation Test (GPU Simulation)
-
-200 requests, bimodal prompt distribution (p50=44, p95=410, max=500), max 32 concurrent.
-
-| UFS Metric | Average | Peak | StdDev |
-|------------|:---:|:---:|:---:|
-| IFR | 0.039 | 0.089 | 0.012 |
-| BU | 0.514 | — | 0.224 |
-| PME | 0.514 | — | 0.224 |
-| RFI | 0.331 | 0.787 | 0.184 |
-
-448 samples over 224 simulation rounds, 0 OOM failures, 3 superblocks (264 MiB).
-
-### 4.6 vLLM Dedicated Fragmentation Test
-
-| UFS Metric | Average | Peak |
-|------------|:---:|:---:|
-| IFR | 0.006 | 0.083 |
-| BU | 1.000 | — |
-| PME | 1.000 | — |
-| RFI | 0.006 | 0.083 |
-
-vLLM BU=1.0 here because `total_blocks_allocated` for this test came from the
-estimation fallback (~56,301 blocks), not the corrected server-log parse (~53,126).
-The vLLM stress test uses the corrected value and shows BU=0.005.
 
 ---
 

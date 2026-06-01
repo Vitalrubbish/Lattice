@@ -1,8 +1,8 @@
 # Step 3 Next Steps
 
-**Date:** 2026-06-01
-**Status:** Planned
-**Prerequisite:** commit `23884b1` (UFS measurement fixes)
+**Date:** 2026-06-01  
+**Status:** Updated after final report audit  
+**Prerequisite:** commit `d347701` (IFR fix), commit `d344ada` (EOS fix), commit `23884b1` (UFS measurement fixes)
 
 ## Completed So Far
 
@@ -11,123 +11,124 @@
 - [x] Baseline `step3_max_concurrent_requests` → Capacity at Workload
 - [x] Baseline internal: `CacheStats` source, `fragmentation_ratio` → `physical_idle_ratio`, legacy ratio cleanup, `record()` privatised
 - [x] CONTEXT.md glossary (18 terms)
+- [x] IFR measurement bug fixed: `update_seq_len(seq_idx, prompt_len)` during prefill (`d6c96d6`, `d347701`)
+- [x] vLLM EOS fix: `ignore_eos=True` in max-concurrency bench (`d344ada`)
+- [x] Stress test (concurrency ramp 1..64) executed for both baseline and vLLM
+- [x] Deleted misleading GPU Simulation fragmentation test and vLLM dedicated fragmentation test (sections 4.5/4.6 of final report)
+- [x] Deleted `step3_runtime_fragmentation` test and `bench_fragmentation` function
+- [x] Step 3 final report published at `docs/report/linux/step3/step3-final-report.md`
 
-## Remaining Work
+---
 
-### 1. Fix vLLM log parsing reliability
+## Remaining Work (P0 — must fix before next report)
 
-**Problem:** `_parse_num_blocks_from_log()` silently fails during bench runs
-(the log file exists and contains the expected line, but `open()` + `re.search()`
-return 0 — likely a race with vLLM's still-writing file handle).
+### 1. 🔴 Fix vLLM UFS measurement: query live server state, not accumulated tokens
 
-**Fix (already applied, needs verification):**
-- Added `os.path.exists()` check before attempting `open()`
-- Retry up to 5 times with 1-second delays
-- Added `errors='replace'` for encoding robustness
-- Added error message on final retry failure
+**Problem:** `UFSStatsCollector._take_snapshot()` estimates `blocks_in_use` from
+accumulated token counts (`_total_prompt_tokens + _total_completion_tokens`).
+These accumulators are **never decremented** when requests complete, so:
 
-**Validation:** Re-run and confirm "vLLM block pool: 53126 blocks" appears
-instead of "WARNING: could not query vLLM block pool, estimated ...".
+- `blocks_in_use` is a cumulative total, not an instantaneous live count
+- `total_blocks_used_by_seqs` is always equal to `blocks_in_use`, making IFR = RFI by mathematical identity for vLLM
+- `total_tokens` grows monotonically; the only thing bringing it down is the benchmark ending
+- BU ≈ 0.005 is just `avg(ceil(cumulative_tokens/16) / 53126)` over the test duration — a function of test parameters, not a measurement
+
+**Fix:** Replace the accumulated-token estimation with a query to vLLM's live state.
+Options:
+- a) Query `/metrics` for `vllm:num_blocks_used` (if available in vLLM v0.22.0 V1 engine)
+- b) Implement a custom `/kv_cache_state` endpoint in vLLM
+- c) Query vLLM's internal state via `/stats` or `/v1/metrics` endpoint
+
+**Files:** `scripts/bench_vllm_comprehensive.py` → `UFSStatsCollector._take_snapshot()` (line ~361)
+
+### 2. 🔴 Fix vLLM low sample count at high concurrency
+
+**Problem:** At conc=64, vLLM completes 100 requests in ~1.7 seconds. With 0.3s
+poll interval, only **6 samples** are collected. At conc=32, only **9 samples**.
+These are insufficient for meaningful statistics (avg, stddev, peak).
+
+**Fix options:**
+- a) Reduce poll interval to 0.05s at high concurrency levels
+- b) Increase `--num-requests` per level (e.g., 500 instead of 100) so the test runs longer
+- c) Run multiple iterations per concurrency level and pool samples
+
+**Files:** `scripts/bench_vllm_comprehensive.py`
+
+### 3. 🔴 Fix IFR explanation in report (Section 4.2, line 112-113)
+
+**Current text:**
+> "vLLM IFR is lower (<0.03) because many sequences terminate early (EOS),
+> generating fewer tokens and filling their last block more completely."
+
+**Problem:** This is wrong. vLLM IFR is a function of the cumulative estimation
+model: `IFR = 1 - total_tokens/(ceil(total_tokens/16)*16)`. For large cumulative N,
+the mod-16 fluctuation is small, so IFR ≈ 0. It has nothing to do with EOS behavior.
+
+**Fix:** Rewrite this sentence to accurately describe the estimation artifact.
+After issue #1 (live state query) is fixed, the explanation may change entirely.
+
+**Files:** `docs/report/linux/step3/step3-final-report.md`
+
+---
+
+## Remaining Work (P1 — important but not blocking)
+
+### 4. 🟡 Capacity at Workload: asymmetric test harnesses
+
+**Problem:** Baseline capacity (1,024) comes from a GPU simulation
+(`tests/step3_benchmarks.rs::step3_max_concurrent_requests`), while vLLM capacity
+(896) comes from a live HTTP benchmark (`bench_max_concurrency`). Different
+harnesses introduce different overhead (HTTP latency, vLLM scheduler overhead vs.
+none in baseline simulation).
+
+**Fix:** Either:
+- a) Run baseline capacity test as a live HTTP benchmark (matching vLLM setup)
+- b) Document the asymmetry clearly in the report
+- c) Both
+
+**Files:** `tests/step3_benchmarks.rs`, `scripts/bench_vllm_comprehensive.py`, report
+
+### 5. 🟡 Report sample counts in stress test table
+
+**Problem:** The stress test table (Section 4.1) presents IFR/BU/PME/RFI with
+equal apparent precision but the underlying sample counts vary enormously:
+baseline conc=1: 999 samples; vLLM conc=64: 6 samples.
+
+**Fix:** Add a `samples` column to the stress test tables, or add a footnote
+about sampling methodology.
+
+**Files:** `docs/report/linux/step3/step3-final-report.md`
+
+### 6. 🟡 Executive summary "17× improvement" is misleading
+
+**Problem:** The headline compares baseline BU against itself at different loads
+(0.04 → 0.65), not against vLLM. This is measuring grow-on-demand working as designed,
+not a "vs vLLM" improvement. vLLM's BU is structurally low because of pre-allocation,
+which is a design choice, not a bug.
+
+**Fix:** Rephrase to clarify that the 17× refers to baseline's own BU growth
+under increasing load, demonstrating that grow-on-demand adapts to demand.
+
+**Files:** `docs/report/linux/step3/step3-final-report.md`
+
+---
+
+## Optional Cleanup (P2)
+
+### 7. Clean up vLLM log parsing reliability
+
+**Problem:** `_parse_num_blocks_from_log()` may silently fail during bench runs
+(log file race). Retry logic was added but needs verification.
+
+**Validation:** Re-run and confirm "vLLM block pool: 53126 blocks" appears.
 
 ```bash
-# Quick verification — skip baseline to save time
 ./scripts/step3_test_baremetal.sh vllm
 ```
 
-### 2. Fix vLLM max-concurrency EOS asymmetry
+### 8. Remove or `#[deprecated]` the now-redundant `legacy_ratio_*` fields
 
-**Problem:** vLLM's `bench_max_concurrency` sends real text prompts
-(`"Hello " * N`) which cause EOS generation for some sequences.
-These sequences free their KV blocks early, giving vLLM an
-unfairly high capacity count compared to baseline (which always
-grows every sequence to `prompt_len + max_new_tokens`).
-
-**Fix — in `scripts/bench_vllm_comprehensive.py`:**
-
-a) Add `--eos-token-id` CLI argument to `bench_max_concurrency`:
-
-```python
-# In bench_max_concurrency signature
-def bench_max_concurrency(port: int, model: str, max_tokens: int = 64,
-                          step: int = 4, timeout_per_req: int = 300,
-                          eos_token_id: int = 1_000_000) -> dict:
-```
-
-b) Pass `eos_token_id` through to completion requests:
-
-```python
-# In send_completion_concurrent
-body = json.dumps({
-    "model": model,
-    "prompt": "Hello " * max(1, prompt_len),
-    "max_tokens": max_tokens,
-    "stop_token_ids": [],       # disable built-in stop tokens
-})
-```
-
-Or alternatively, use random token IDs instead of "Hello" text so the
-model can't organically generate EOS.
-
-c) Also apply to `bench_fragmentation` and `bench_throughput` where
-appropriate (throughput should keep natural EOS behavior; max-concurrency
-and fragmentation benches should use deterministic full-length generation).
-
-**Estimated:** ~15 lines changed in `bench_vllm_comprehensive.py`.
-
-### 3. Run stress mode for load-dependent UFS curves
-
-**Goal:** Show how BU, PME, and RFI change as concurrency increases,
-demonstrating CUDA VMM's grow-on-demand advantage at low load and
-convergence at high load.
-
-**Command:**
-```bash
-# Baseline stress (concurrency ramp 1..64)
-cargo build --release --example bench_throughput
-timeout 600 target/release/examples/bench_throughput \
-    --addr 127.0.0.1:8000 \
-    --num-requests 100 \
-    --stress-concurrency "1,2,4,8,16,32,64" \
-    --max-new-tokens 64 \
-    --output-csv results/stress_baseline_results.csv
-
-# vLLM stress
-python3 scripts/bench_vllm_comprehensive.py \
-    --port 8001 --model /users/Lattice/models/tinyllama \
-    --mode stress \
-    --num-requests 100 \
-    --concurrency-levels "1,2,4,8,16,32,64" \
-    --max-new-tokens 64 \
-    --output-dir results/stress_vllm/
-```
-
-**Expected output:** CSV with one row per concurrency level, columns
-for throughput + all 4 UFS metrics. The key chart: BU vs concurrency,
-showing baseline rising from ~0.01 to ~0.5+ while vLLM stays flat at ~0.001.
-
-### 4. Regenerate UFS_REPORT.md with corrected data
-
-After fixes 1-3 are applied and validated, re-run the full comparison:
-
-```bash
-MODEL_PATH=/users/Lattice/models/tinyllama \
-./scripts/step3_test_baremetal.sh compare
-```
-
-Update `UFS_REPORT.md` with:
-- [ ] Allocator semantics notice (why BU/PME differ)
-- [ ] Per-concurrency-level UFS breakdown (from stress results)
-- [ ] Capacity-at-workload comparison (aligned EOS behavior)
-- [ ] Interpretation guide for each metric
-
-### 5. Optional: clean up remaining code smells
-
-- [ ] Remove or `#[deprecated]` the now-redundant `legacy_ratio_*` fields
-      (these are now fully unused in StatsHandle; double-check no consumers)
-- [ ] Merge `record()` body into `record_unified()` — no point maintaining
-      two parallel sample vecs when `record_unified` always calls `record`
-- [ ] Add `--skip-baseline` flag to `step3_test_baremetal.sh` for faster
-      vLLM-only iteration
+These are fully unused in StatsHandle; double-check no consumers remain.
 
 ---
 
@@ -135,8 +136,11 @@ Update `UFS_REPORT.md` with:
 
 | Priority | Item | Effort | Impact |
 |----------|------|:---:|--------|
-| P0 | Fix vLLM EOS asymmetry (#2) | Small | High — makes capacity comparison fair |
-| P1 | Verify log parsing (#1) | Tiny | High — removes estimation fallback |
-| P1 | Stress mode (#3) | Medium | High — shows CUDA VMM benefit curve |
-| P2 | Regenerate report (#4) | Small | Medium — documentation |
-| P3 | Code cleanup (#5) | Small | Low — hygiene |
+| P0 | Fix vLLM UFS measurement (live state query) | Medium | High — all vLLM UFS data currently artificial |
+| P0 | Fix vLLM low sample count at high concurrency | Small | High — makes high-conc stats meaningless |
+| P0 | Fix IFR explanation in report | Tiny | High — currently factually wrong |
+| P1 | Capacity test harness symmetry | Medium | Medium — affects one comparison |
+| P1 | Add sample counts to stress table | Tiny | Low — transparency |
+| P1 | Rephrase "17× improvement" headline | Tiny | Low — clarity |
+| P2 | Verify vLLM log parsing | Tiny | Low — fallback already works |
+| P2 | Remove legacy ratio fields | Small | Low — hygiene |

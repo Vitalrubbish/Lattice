@@ -2,19 +2,18 @@
 """
 bench_vllm_comprehensive.py — Comprehensive vLLM benchmark for Step 3.
 
-Measures three dimensions matching the Rust baseline tests:
-  1. Memory fragmentation rate (UFS standard: IFR, BU, PME, RFI)
-  2. Maximum concurrent requests
-  3. Throughput under concurrent load
+Measures dimensions matching the Rust baseline tests:
+  1. Maximum concurrent requests
+  2. Throughput under concurrent load (with UFS metrics collection)
 
-Now implements the Unified Fragmentation Standard (UFS) for directly
+Uses the Unified Fragmentation Standard (UFS) for directly
 comparable metrics between baseline and vLLM.
 
 Usage:
   python3 bench_vllm_comprehensive.py \
     --model /path/to/model \
     --port 8001 \
-    --mode {fragmentation|max_concurrency|throughput|all|stress} \
+    --mode {max_concurrency|throughput|all|stress} \
     --output-dir ./results
 """
 
@@ -488,183 +487,6 @@ def _get_gpu_memory() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Benchmark: Fragmentation Rate (UFS Standard)
-# ═══════════════════════════════════════════════════════════════
-
-def bench_fragmentation(port: int, model: str, max_tokens: int = 64,
-                       vllm_log_path: str = "") -> dict:
-    """
-    Measure fragmentation using the UFS standard.
-
-    Strategy:
-      1. Calibrate GPU memory baseline
-      2. Run requests with a stats collector in background
-      3. Compute UFS metrics from collected data
-    """
-    print("=" * 60, file=sys.stderr)
-    print(" Benchmark: Fragmentation Rate (UFS Standard)", file=sys.stderr)
-    print("=" * 60, file=sys.stderr)
-
-    collector = UFSStatsCollector(poll_interval_s=0.3,
-                                   server_log_path=vllm_log_path,
-                                   vllm_port=port)
-    collector.calibrate()
-
-    # Phase 1: Fill cache
-    print("\n  Phase 1: Filling KV cache with concurrent requests...", file=sys.stderr)
-    num_fill = 32
-    fill_prompt_len = 128
-    fill_max_tokens = 128
-
-    collector.start()
-    collector.update_request_stats(active_delta=num_fill)
-
-    fill_results = []
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=min(num_fill, 16)) as executor:
-        futures = [
-            executor.submit(
-                send_completion_concurrent, port, model,
-                fill_prompt_len, fill_max_tokens, timeout=300
-            )
-            for _ in range(num_fill)
-        ]
-        for f in as_completed(futures):
-            try:
-                r = f.result()
-                fill_results.append(r)
-                pt = r.get("prompt_tokens", 0)
-                ct = r.get("completion_tokens", 0)
-                collector.update_request_stats(
-                    prompt_tokens=pt, completion_tokens=ct,
-                    active_delta=-1, completed=True,
-                )
-            except Exception:
-                pass
-
-    fill_elapsed = time.time() - t0
-    fill_ok = [r for r in fill_results if r.get("success")]
-    print(f"    Phase 1: {len(fill_ok)}/{num_fill} succeeded in {fill_elapsed:.1f}s",
-          file=sys.stderr)
-
-    # Phase 2: Mixed pattern (creates fragmentation)
-    print("\n  Phase 2: Mixed request pattern...", file=sys.stderr)
-    mixed_configs = []
-    for i in range(48):
-        if i % 2 == 0:
-            mixed_configs.append((64, 32))
-        else:
-            mixed_configs.append((128, 96))
-
-    collector.update_request_stats(active_delta=len(mixed_configs))
-    mixed_results = []
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=min(len(mixed_configs), 16)) as executor:
-        futures = {
-            executor.submit(
-                send_completion_concurrent, port, model, pl, mt, timeout=300
-            ): i
-            for i, (pl, mt) in enumerate(mixed_configs)
-        }
-        for f in as_completed(futures):
-            try:
-                r = f.result()
-                mixed_results.append(r)
-                pt = r.get("prompt_tokens", 0)
-                ct = r.get("completion_tokens", 0)
-                collector.update_request_stats(
-                    prompt_tokens=pt, completion_tokens=ct,
-                    active_delta=-1, completed=True,
-                )
-            except Exception:
-                pass
-
-    mixed_elapsed = time.time() - t0
-    mixed_ok = [r for r in mixed_results if r.get("success")]
-    print(f"    Phase 2: {len(mixed_ok)}/{len(mixed_configs)} succeeded in {mixed_elapsed:.1f}s",
-          file=sys.stderr)
-
-    # Phase 3: Re-fill
-    print("\n  Phase 3: Re-filling after fragmentation...", file=sys.stderr)
-    collector.update_request_stats(active_delta=32)
-    re_fill_results = []
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        futures = [
-            executor.submit(
-                send_completion_concurrent, port, model,
-                random.choice([32, 48, 64]), 32, timeout=300
-            )
-            for _ in range(32)
-        ]
-        for f in as_completed(futures):
-            try:
-                r = f.result()
-                re_fill_results.append(r)
-                pt = r.get("prompt_tokens", 0)
-                ct = r.get("completion_tokens", 0)
-                collector.update_request_stats(
-                    prompt_tokens=pt, completion_tokens=ct,
-                    active_delta=-1, completed=True,
-                )
-            except Exception:
-                pass
-
-    re_elapsed = time.time() - t0
-    re_ok = [r for r in re_fill_results if r.get("success")]
-    print(f"    Phase 3: {len(re_ok)}/32 succeeded in {re_elapsed:.1f}s",
-          file=sys.stderr)
-
-    # Stop and compute summary
-    samples = collector.stop()
-    summary = compute_summary(samples)
-
-    print(f"\n  UFS Fragmentation Results:", file=sys.stderr)
-    print_summary(summary, prefix="  ", file=sys.stderr)
-
-    # Also compute legacy-style internal fragmentation from completed requests
-    all_ok = fill_ok + mixed_ok + re_ok
-    total_prompts = sum(r.get("prompt_tokens", 0) for r in all_ok)
-    total_completions = sum(r.get("completion_tokens", 0) for r in all_ok)
-    total_stored = total_prompts + total_completions
-    estimated_blocks = (total_stored + DEFAULT_BLOCK_SIZE - 1) // DEFAULT_BLOCK_SIZE
-    total_slots = estimated_blocks * DEFAULT_BLOCK_SIZE
-    wasted = max(0, total_slots - total_stored)
-    internal_frag = wasted / max(total_slots, 1)
-
-    return {
-        # UFS standard metrics
-        "ufs_samples": [{
-            "internal_frag_rate": s.internal_frag_rate,
-            "block_utilization": s.block_utilization,
-            "physical_memory_efficiency": s.physical_memory_efficiency,
-            "runtime_frag_index": s.runtime_frag_index,
-            "active_sequences": s.active_sequences,
-            "blocks_in_use": s.blocks_in_use,
-            "total_blocks_allocated": s.total_blocks_allocated,
-            "total_tokens": s.total_tokens,
-        } for s in samples],
-        "ufs_summary": {
-            "sample_count": summary.sample_count,
-            "ifr_avg": summary.ifr_avg, "ifr_peak": summary.ifr_peak, "ifr_stddev": summary.ifr_stddev,
-            "bu_avg": summary.bu_avg, "bu_min": summary.bu_min, "bu_stddev": summary.bu_stddev,
-            "pme_avg": summary.pme_avg, "pme_min": summary.pme_min, "pme_stddev": summary.pme_stddev,
-            "rfi_avg": summary.rfi_avg, "rfi_peak": summary.rfi_peak, "rfi_stddev": summary.rfi_stddev,
-        },
-        # Legacy metrics (backward compat)
-        "internal_frag_ratio": internal_frag,
-        "external_frag_ratio": 0.0,
-        "blocks_estimated": estimated_blocks,
-        "total_slots": total_slots,
-        "total_tokens_stored": total_stored,
-        "wasted_slots": wasted,
-        "phase1_success": len(fill_ok),
-        "phase2_success": len(mixed_ok),
-        "phase3_success": len(re_ok),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
 #  Benchmark: Throughput (with UFS stats collection)
 # ═══════════════════════════════════════════════════════════════
 
@@ -957,7 +779,7 @@ def main():
                     default="/home/vitalrubbish/models/tinyllama",
                     help="Model path")
     ap.add_argument("--mode", type=str,
-                    choices=["fragmentation", "max_concurrency", "throughput", "all", "stress"],
+                    choices=["max_concurrency", "throughput", "all", "stress"],
                     default="all")
     ap.add_argument("--num-requests", type=int, default=100)
     ap.add_argument("--concurrency", type=int, default=4)
@@ -1009,27 +831,6 @@ def main():
         print(f"\n>>> MAX CONCURRENT REQUESTS: {mc['max_concurrent_requests']}",
               file=sys.stderr)
 
-    # ── Fragmentation ──
-    if args.mode in ("fragmentation", "all"):
-        frag = bench_fragmentation(args.port, args.model,
-                                   max_tokens=args.max_new_tokens,
-                                   vllm_log_path=vllm_server_log)
-        all_results["fragmentation"] = frag
-
-        with open(os.path.join(args.output_dir, "fragmentation.json"), "w") as f:
-            json.dump(frag, f, indent=2, default=str)
-
-        ufs = frag.get("ufs_summary", {})
-        print(f"\n>>> UFS INTERNAL FRAG RATE:  {ufs.get('ifr_avg', 0):.4f} "
-              f"(avg) / {ufs.get('ifr_peak', 0):.4f} (peak)", file=sys.stderr)
-        print(f">>> UFS BLOCK UTILIZATION:   {ufs.get('bu_avg', 0):.4f} "
-              f"(avg) / {ufs.get('bu_min', 0):.4f} (min)", file=sys.stderr)
-        print(f">>> UFS PHYS MEM EFFICIENCY: {ufs.get('pme_avg', 0):.4f} "
-              f"(avg) / {ufs.get('pme_min', 0):.4f} (min)", file=sys.stderr)
-        print(f">>> UFS RUNTIME FRAG INDEX:  {ufs.get('rfi_avg', 0):.4f} "
-              f"(avg) / {ufs.get('rfi_peak', 0):.4f} (peak)", file=sys.stderr)
-
-    # ── Throughput ──
     if args.mode in ("throughput", "all"):
         tp = bench_throughput(
             args.port, args.model,
@@ -1115,18 +916,6 @@ def main():
 
     if "max_concurrency" in all_results:
         print(f"  max_concurrent_requests:  {all_results['max_concurrency']['max_concurrent_requests']}",
-              file=sys.stderr)
-
-    if "fragmentation" in all_results:
-        f = all_results["fragmentation"]
-        ufs = f.get("ufs_summary", {})
-        print(f"  [UFS] IFR avg/peak:        {ufs.get('ifr_avg', 0):.4f} / {ufs.get('ifr_peak', 0):.4f}",
-              file=sys.stderr)
-        print(f"  [UFS] BU  avg/min:         {ufs.get('bu_avg', 0):.4f} / {ufs.get('bu_min', 0):.4f}",
-              file=sys.stderr)
-        print(f"  [UFS] PME avg/min:         {ufs.get('pme_avg', 0):.4f} / {ufs.get('pme_min', 0):.4f}",
-              file=sys.stderr)
-        print(f"  [UFS] RFI avg/peak:        {ufs.get('rfi_avg', 0):.4f} / {ufs.get('rfi_peak', 0):.4f}",
               file=sys.stderr)
 
     if "throughput" in all_results:
