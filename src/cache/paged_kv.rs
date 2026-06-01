@@ -540,12 +540,27 @@ impl PagedKvCache {
     }
 
     /// Write one step of KV data for a batch of sequences.
+    /// Convenience wrapper — copies the same source to both K and V caches.
     pub fn append_step(
         &self,
         layer_idx: usize,
         seq_indices: &[usize],
         positions: &[usize],
         hidden: &CudaSlice<f16>,
+    ) -> Result<()> {
+        self.append_kv_step(layer_idx, seq_indices, positions, hidden, hidden)
+    }
+
+    /// Write one step of KV data for a batch of sequences, using separate
+    /// K and V sources (post-projection, post-RoPE).  Each source is expected
+    /// to be laid out as [batch, kv_heads * head_dim] in F16.
+    pub fn append_kv_step(
+        &self,
+        layer_idx: usize,
+        seq_indices: &[usize],
+        positions: &[usize],
+        k_src: &CudaSlice<f16>,
+        v_src: &CudaSlice<f16>,
     ) -> Result<()> {
         let batch = seq_indices.len();
         let kv = self.cfg.kv_heads();
@@ -556,7 +571,8 @@ impl PagedKvCache {
 
         let va_k = self.va_k[layer_idx];
         let va_v = self.va_v[layer_idx];
-        let src_base: CUdeviceptr = *hidden.device_ptr();
+        let k_base: CUdeviceptr = *k_src.device_ptr();
+        let v_base: CUdeviceptr = *v_src.device_ptr();
         let meta = self.seq_metadata.lock();
         let info = self.block_info.lock();
 
@@ -584,17 +600,18 @@ impl PagedKvCache {
 
             let dk = va_k + (dst_off * eb) as u64;
             let dv = va_v + (dst_off * eb) as u64;
-            let src = src_base + (src_off * eb) as u64;
+            let sk = k_base + (src_off * eb) as u64;
+            let sv = v_base + (src_off * eb) as u64;
 
             unsafe {
                 let r = cudarc::driver::sys::lib().cuMemcpyDtoDAsync_v2(
-                    dk, src, nbytes, std::ptr::null_mut(),
+                    dk, sk, nbytes, std::ptr::null_mut(),
                 );
                 if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                     return Err(anyhow!("cuMemcpyDtoDAsync K: {:?}", r));
                 }
                 let r = cudarc::driver::sys::lib().cuMemcpyDtoDAsync_v2(
-                    dv, src, nbytes, std::ptr::null_mut(),
+                    dv, sv, nbytes, std::ptr::null_mut(),
                 );
                 if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                     return Err(anyhow!("cuMemcpyDtoDAsync V: {:?}", r));

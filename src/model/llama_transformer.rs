@@ -313,48 +313,8 @@ impl Transformer for LlamaTransformer {
                 qb.leak(); kb.leak();
             }
 
-            // Pre-compute block byte offsets for KV write
-            let block_byte_offsets: Vec<u64> = {
-                let offsets = cache.get_all_block_offsets_f16();
-                offsets.iter().map(|&off_f16| off_f16.wrapping_mul(2)).collect()
-            };
-
-            // Write K,V to paged cache
-            {
-                let va_k = cache.va_k(li);
-                let va_v = cache.va_v(li);
-                let meta = cache.seq_metadata.lock();
-                let k_arr_ptr: u64 = *k.device_ptr();
-                let v_arr_ptr: u64 = *v.device_ptr();
-
-                for b in 0..batch {
-                    let seq_idx = seq_indices[b];
-                    let pos = positions[b];
-                    let seq = &meta[seq_idx];
-                    let lb = pos / block_size;
-                    let off = pos % block_size;
-                    let block_idx = seq.block_table[lb] as usize;
-                    let va_off = block_byte_offsets.get(block_idx).copied().unwrap_or(0);
-                    let dst_off = va_off + (off * kvd * 2) as u64;
-
-                    unsafe {
-                        cudarc::driver::sys::lib().cuMemcpyDtoDAsync_v2(
-                            va_k.wrapping_add(dst_off as u64),
-                            k_arr_ptr.wrapping_add((b * kvd * 2) as u64),
-                            kvd * 2,
-                            std::ptr::null_mut(),
-                        );
-                    }
-                    unsafe {
-                        cudarc::driver::sys::lib().cuMemcpyDtoDAsync_v2(
-                            va_v.wrapping_add(dst_off as u64),
-                            v_arr_ptr.wrapping_add((b * kvd * 2) as u64),
-                            kvd * 2,
-                            std::ptr::null_mut(),
-                        );
-                    }
-                }
-            }
+            // Write K,V to paged cache via VMM-mapped addresses
+            cache.append_kv_step(li, seq_indices, positions, &k, &v)?;
 
             // Paged attention
             let mut attn = self.ctx.device.alloc_zeros::<f16>(batch * h)?;
