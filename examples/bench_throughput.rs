@@ -7,6 +7,15 @@
 // Now supports Unified Fragmentation Standard (UFS) stats collection
 // and a --stress mode for concurrency ramping.
 //
+// **NOTE (2026-06-02):** For cross-system (baseline vs vLLM) comparison, prefer
+// the Python benchmarks at scripts/bench/ which use identical parameters and
+// output formats for both targets:
+//   python3 scripts/bench/bench_max_concurrency.py --target baseline
+//   python3 scripts/bench/bench_throughput.py --target baseline
+//   python3 scripts/bench/bench_fragmentation.py --target baseline
+// Or use the unified shell entry point:
+//   ./scripts/run_bench.sh baseline all
+//
 // Usage:
 //   cargo run --release --example bench_throughput -- \
 //     --addr 127.0.0.1:8000 \

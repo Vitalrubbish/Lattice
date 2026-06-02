@@ -83,6 +83,63 @@ OOM             → LRU eviction to host memory (swap)
 
 ### 4.1 Stress Test — UFS vs Concurrency
 
+#### Methodology
+
+**Objective:** Measure throughput, latency, and UFS fragmentation metrics (IFR, BU,
+PME, RFI) under increasing concurrent load — identical workload on both systems for
+direct comparison.
+
+**Common workload parameters (both systems):**
+
+| Parameter | Value |
+|-----------|-------|
+| Prompt distribution | 145-sample sonnet-derived (range 8–289, median 42) |
+| `max_new_tokens` | 64 |
+| EOS handling | Disabled (baseline: `eos_token_id=1_000_000`; vLLM: `ignore_eos=True`) — guarantees full 64-token generation for fair capacity comparison |
+| Concurrency levels | [1, 2, 4, 8, 16, 32, 64] |
+| Requests per level | 100 |
+| Seed | Fixed (`random.seed(42)`) for reproducible prompt selection |
+
+**Baseline methodology:**
+
+1. **Driver:** Rust `examples/bench_throughput.rs` invoked with
+   `--stress-concurrency "1,2,4,8,16,32,64"`.
+2. **Protocol:** TCP JSON-lines. Each request opens a fresh TCP connection, sends
+   `{"type":"infer", "id":N, "prompt_tokens":[...], "max_new_tokens":64, "eos_token_id":1000000}`,
+   reads one response line, and closes.
+3. **Concurrency control:** `tokio::sync::Semaphore` with `concurrency` permits. All
+   100 requests are spawned as async tasks immediately; the semaphore gates how many
+   run simultaneously.
+4. **Metrics collection:** Background stats poller queries the baseline server every
+   200 ms (`{"type":"stats"}`), recording per-snapshot UFS values (IFR, BU, PME, RFI,
+   blocks_in_use, total_blocks_allocated, active_sequences, total_tokens). Poller runs
+   for the duration of the concurrency level and stops before the next level begins.
+5. **Output per level:** Per-request latency CSV + per-level UFS time-series CSV
+   (`stress_c{concurrency}.frag.csv`) + aggregate summary CSV (`_summary.csv`).
+
+**vLLM methodology:**
+
+1. **Driver:** Python `scripts/bench_vllm_comprehensive.py` invoked with `--mode stress`.
+2. **Protocol:** HTTP `POST /v1/completions` (OpenAI-compatible API). Each request
+   sends `{"model": "...", "prompt": "Hello Hello ...", "max_tokens": 64, "ignore_eos": true}`.
+3. **Concurrency control:** `concurrent.futures.ThreadPoolExecutor` with
+   `max_workers=concurrency`. All 100 requests submitted at once; thread pool caps
+   simultaneous in-flight requests.
+4. **Metrics collection:** `UFSStatsCollector` background thread polls at 0.3 s
+   intervals. `total_blocks_allocated` is calibrated once from the vLLM server log
+   (`GPU KV cache size: N tokens` → `num_gpu_blocks = N / block_size`), not from
+   nvidia-smi diff. `blocks_in_use` is estimated from accumulated token counts
+   (cumulative model — never decremented; see §4.2 IFR discussion).
+5. **Output per level:** Per-request latency CSV + per-level UFS time-series CSV
+   (`vllm_stress_c{concurrency}.frag.csv`) + aggregate summary CSV
+   (`vllm_stress_summary.csv`).
+
+**Sample count asymmetry note:** Baseline polls faster (200 ms vs 300 ms) and runs
+longer per level (lower throughput), producing ~85–1,000 samples per level. vLLM's
+higher throughput means each 100-request level completes faster, yielding ~6–200
+samples. vLLM UFS values at conc ≥32 should be treated as approximate (see §7
+next-steps).
+
 **Baseline (CUDA VMM, grow-on-demand):**
 
 | Conc | IFR | BU | PME | RFI | req/s | P95 (ms) |
@@ -163,7 +220,63 @@ The 3–10× throughput gap and 11–16× P95 latency gap come from attention ke
 quality (NaiveTransformer vs FlashInfer/PagedAttention), not KV cache management.
 Baseline saturates at ~6 req/s (compute-bound by serial per-layer GEMM).
 
-### 4.4 Capacity at Workload
+### 4.4 Capacity at Workload (Max Concurrent Requests)
+
+#### Methodology
+
+**Objective:** Determine the maximum number of concurrent sequences each system can
+admit and sustain through a full decode cycle (64 generated tokens), using short
+prompts to maximize the count of admitted sequences. This is a pure capacity
+measurement — not a throughput benchmark.
+
+**Common workload parameters:**
+
+| Parameter | Baseline | vLLM |
+|-----------|----------|------|
+| Prompt lengths | {8, 16, 32} (cycled deterministically) | {8, 16, 32} (randomly sampled) |
+| `max_new_tokens` | 64 | 64 |
+| EOS handling | Disabled (`eos_token_id=99999`) | Disabled (`ignore_eos=True`) |
+| `max_batch` | 1,024 | 128 (`--max-num-seqs`) |
+| `max_seq_len` | 512 | 512 |
+| `block_size` | 16 | 16 |
+
+**Baseline methodology:**
+
+1. **Driver:** Rust unit test `step3_max_concurrent_requests` in
+   `tests/step3_benchmarks.rs`. Exercises the `PagedKvCache` API directly — no
+   network, no inference, no GPU kernels. Pure KV cache allocator test.
+2. **Phase 1 (Admission):** Iterate `i = 0..max_batch`. For each `i`, compute
+   `prompt_len = [8, 16, 32][i % 3]`. Call `cache.alloc_sequence(prompt_len / 16)`
+   to reserve initial blocks. If successful, register the sequence and set
+   `seq_len = prompt_len`. If `alloc_sequence` returns OOM, stop admission.
+   Record `admitted` count.
+3. **Phase 2 (Decode growth):** For each admitted sequence, simulate token-by-token
+   decode growth: increment `seq_len` by 1, and if the new length crosses a block
+   boundary, call `cache.alloc_block()` and `append_block_to_sequence()`. Continue
+   until `seq_len` reaches `prompt_len + 64` (or `max_seq_len=512`). If
+   `alloc_block()` fails (OOM), mark the sequence as "capped" and stop growing it.
+4. **Output:** `capacity at workload = admitted` (Phase 1), number of sequences
+   that achieved full growth vs. were capped (Phase 2), and allocator statistics
+   (total_blocks_allocated, blocks_in_use, physical_memory_mib, etc.).
+5. **Why no inference:** This test isolates the allocator from GPU compute. The
+   bottleneck is block pool capacity, not kernel throughput. The prompt/decode
+   growth pattern mirrors real serving behavior without spending GPU cycles on
+   actual attention.
+
+**vLLM methodology:**
+
+1. **Driver:** Python `scripts/bench_vllm_comprehensive.py` invoked with
+   `--mode max_concurrency`. Communicates with vLLM over HTTP — real inference.
+2. **Concurrency ramp:** Start at `concurrency=4` and step up through
+   [4, 8, 12, ..., 64, 80, ..., 128, 160, ..., 256, 320, ..., 512, 640, ..., 1024].
+   At each level, send `concurrency` requests simultaneously via
+   `ThreadPoolExecutor(max_workers=min(concurrency, 64))`.
+3. **Request:** HTTP POST `/v1/completions` with short prompt (∈{8,16,32}),
+   `max_tokens=64`, `ignore_eos=True`, `timeout=300s`.
+4. **Stop condition:** If `n_failed > concurrency × 0.2` (failure rate exceeds 20%),
+   or 120 s time budget per run is exhausted, stop the ramp.
+5. **Output:** `max_concurrent_requests` = highest `n_ok` observed across all
+   levels, plus per-level breakdown (ok, failed, elapsed, ok_ratio).
 
 | System | Capacity | Conditions |
 |--------|:---:|------|
