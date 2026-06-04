@@ -10,6 +10,19 @@
    - [0.5 向后兼容性约束](#05-向后兼容性约束)
    - [0.6 关键风险与缓解措施](#06-关键风险与缓解措施)
 1. [现有代码能力 vs KCMM 差距分析](#1-现有代码能力-vs-kcmm-差距分析)
+   - [1.1 `cuda_vmm.rs` — GPU 物理页管理](#11-srccachecuda_vmmrs--gpu-物理页管理)
+   - [1.2 `paged_kv.rs` — PagedKvCache](#12-srccachepaged_kvrs--pagedkvcache)
+   - [1.3 `swap.rs` — SwapManager](#13-srccacheswaprs--swapmanager)
+   - [1.4 `fragmentation_tracker.rs` — 碎片追踪](#14-srccachefragmentation_trackerrs--碎片追踪)
+   - [1.5 `unified_frag.rs` — UFS 指标](#15-srccacheunified_fragrs--ufs-指标)
+   - [1.6 KCMM 置换策略的进阶优化手段](#16-kcmm-置换策略的进阶优化手段)
+     - [1.6.1 利用 KV Cache 独有的语义信号](#161-利用-kv-cache-独有的语义信号)
+     - [1.6.2 注意力信号指导的差异化置换](#162-注意力信号指导的差异化置换)
+     - [1.6.3 预测性操作](#163-预测性操作)
+     - [1.6.4 传输层面的优化](#164-传输层面的优化)
+     - [1.6.5 跨引擎的全局优化](#165-跨引擎的全局优化)
+     - [1.6.6 引擎提示接口（Hint API）](#166-引擎提示接口hint-api)
+     - [1.6.7 优化手段汇总与优先级](#167-优化手段汇总与优先级)
 2. [需要新建的文件](#2-需要新建的文件)
 3. [需要修改的现有文件](#3-需要修改的现有文件)
 4. [实现顺序](#4-实现顺序)
@@ -176,7 +189,7 @@ KCMM 并非从零开始，而是从项目前序步骤的代码库直接演进：
 | `src/cache/paged_kv.rs` | 块分配 + 序列追踪 + BlockLocation | 提取 `PhysicalBlockAllocator`，扩展 `BlockInfo` → `BlockLocation` |
 | `src/cache/swap.rs` | TieringEngine（GPU↔CPU↔NVMe 迁移） | 序列粒度 → 块粒度，新增可插拔策略 |
 | `src/cache/fragmentation_tracker.rs` | UFS 指标收集（IFR、PME、RFI） | 暴露给 KCMM C API |
-| `src/cache/unified_frag.rs` | 跨引擎对比的标准化指标 | 泛化 `from_cache` → `from_kcmm_pool` |
+| `src/cache/unified_frag.rs` | 跨引擎对比的标准化指标 | 泛化 `from_cache` → `  from_kcmm_pool` |
 
 #### 性能目标
 
@@ -449,6 +462,327 @@ struct TieringEngine {
 | `from_cache` 依赖 `PagedKvCache` | 需要泛化为依赖 `KcmmPool` | **需添加泛化方法** |
 
 **需要的修改：** 添加 `from_kcmm_pool` 方法或泛化现有方法以支持 `KcmmPool`。
+
+---
+
+### 1.6 KCMM 置换策略的进阶优化手段
+
+传统置换策略（LRU/LFU/FIFO）本质上只回答了"**该换出哪个**"这一个问题。但 KCMM 作为一个独立的内存管理服务，在 KV Cache 这个特定领域，拥有比 OS 虚拟内存更丰富的信息优势——KV Cache 的访问模式比通用内存页**可预测得多**。以下从六个维度系统性地分析可用的优化手段。
+
+#### 1.6.1 利用 KV Cache 独有的语义信号
+
+##### 序列生命周期感知
+
+OS 的页表不知道一个页面属于哪个进程的哪个阶段。但 KCMM 知道每个块属于哪个序列，以及该序列处于什么生命周期：
+
+```
+prefill 阶段: 大量块一次性分配，之后不再写入（只读）
+decode 阶段: 每步分配 1 个新块，所有历史块被 attention 读取
+完成阶段: 所有块立即可回收
+```
+
+**优化手段：**
+
+1. **分层温控（Tiered Temperature）：** decode 阶段最后几个块是"灼热"的（下一步立刻需要），中间块是"温"的（每步都读），prefill 块在最前面（也每步都读但更可预测）。这比 LRU 的一维"冷-热"模型精细得多。可以为不同温度区间维护独立的换出优先级队列：
+   - 灼热区（序列尾部 4 个块）→ 永不换出
+   - 温区（序列中间块）→ 正常 LRU
+   - 常温区（序列头部 prefill 块）→ 正常 LRU
+   - 冷区（已完成序列的块）→ 首选受害者
+
+2. **显式回收（Explicit Reclamation）：** 序列完成后，`kcmm_cool` 不应该把它的块放入普通 LRU 队列，而应该直接标记为"首选受害者"——这些块**永远不会再被访问**。减少 LRU 队列的扫描开销，同时避免"已完成序列的冷块恰好排在队列深处、迟迟不被换出"的问题。
+
+##### 多轮对话的"休眠-唤醒"模式
+
+Chatbot 场景下，同一用户的多次对话之间存在长时间的"休眠期"：
+
+```
+Turn 1: [==== 序列 A ====]
+                         ... 30秒空闲 ...
+Turn 2:                   [==== 序列 A' 继续 ====]
+```
+
+LRU 会在 30 秒空闲期内把序列 A 的块全部换出，导致 Turn 2 时全部冷启动——每次换出和恢复都带来数百微秒的延迟和 PCIe 带宽消耗。
+
+**优化手段——"休眠标记"（Hibernation Marker）：**
+
+- 引擎通过 Hint API 告知 KCMM：这个序列可能还会有后续轮次（`HINT_MULTI_TURN`）
+- KCMM 对这类序列采用**延迟换出（Delayed Eviction）**策略：比普通冷序列多保留 N 秒（允许内存压力有足够时间消退）
+- 配合**对话轮次预取**：检测到同用户新请求到达时，在前一个请求完成 prefill 之前就后台预取上一轮被换出的 KV Cache
+
+```
+时间线：
+  Turn 1 完成 → 标记 HINT_MULTI_TURN → 延迟换出计时器启动（如 60s）
+  30s 后 Turn 2 到达 → 预取 Turn 1 块 → 0 恢复延迟
+  （若无 Turn 2，60s 后正常换出）
+```
+
+#### 1.6.2 注意力信号指导的差异化置换
+
+这是最具学术前沿性的优化方向——不是所有块都同等重要。近期研究（H2O、StreamingLLM、SnapKV）表明，不同位置的 token 对未来生成的重要性差异巨大。
+
+##### 注意力熵指导的块重要性分级
+
+```
+重要性分级（按注意力模式）：
+┌────────────────────────────────────────────┐
+│ Attention Sink (前 ~4 token)    ⭐⭐⭐⭐⭐  │  ← 几乎所有注意力头高度关注，不可丢弃
+│ Heavy Hitters (高注意力 token)   ⭐⭐⭐⭐    │  ← 少数 token 被大多数注意力头关注
+│ 普通 token                       ⭐⭐      │  ← 只有局部注意力窗口关注
+│ 可丢弃 token                     ⭐       │  ← 注意力分数接近于零
+└────────────────────────────────────────────┘
+```
+
+**优化手段：**
+
+```c
+// 新增 API：标记块的保护级别
+void kcmm_protect(pool, seq_id, block_ids, KCMM_PROTECT_NEVER_EVICT);
+void kcmm_evictable(pool, seq_id, block_ids, KCMM_EVICT_PREFERRED);
+```
+
+引擎在 decode 过程中可以轻量级地追踪注意力分数（取每个 token 被所有注意力头关注的最大值或平均值），把 Attention Sink 和 Heavy Hitters 的物理块标记为受保护。当内存压力来临时，KCMM 优先换出"可丢弃块"——即使它们的 `last_access` 比某些受保护块更近。
+
+**设计要点：**
+- 注意力分数的追踪在引擎侧完成（KCMM 只管物理块位置，不解析 attention 矩阵）
+- 通过 `kcmm_protect` / `kcmm_evictable` 将重要性信号注入 KCMM 的换出决策
+- 保护标记是**软性的**：极端内存压力下（`free_blocks < 5%`），KCMM 仍可降级换出受保护块
+
+##### 逐层差异化策略
+
+不同 Transformer 层的 KV Cache 特性不同：
+
+| 层 | 特性 | 换出策略 |
+|---|------|---------|
+| 早期层 (L0-L7) | 更位置化，注意力模式更均匀，信息熵高 | 可以更激进地**量化后换出**（损失容忍度高） |
+| 中间层 (L8-L23) | 语义丰富，信息密度最高 | **优先保留在 GPU**（对输出质量影响最大） |
+| 后期层 (L24-L31) | 任务相关，注意力更集中 | 用注意力信号做**细粒度筛选**，部分块保护、部分换出 |
+
+**优化手段：** 为不同层维护独立的换出优先级队列。内存压力时先从早期层开刀——这与 StreamingLLM 的发现一致：早期层的注意力模式更稳定，换出-恢复带来的信息损失最小。
+
+#### 1.6.3 预测性操作
+
+##### 投机预取的增强
+
+文档中已提到"逻辑块 K 活跃 → 预取 K+1、K+2"，但这可以做得更精细：
+
+1. **批量预取合并（Batch Prefetch Coalescing）：** 多个序列同时在 decode，它们的预取块可以合并为一次批量 H2D 传输，摊销 `cuMemMap` 延迟（`cuMemMap` 是已知瓶颈，vAttention 实测比简单 malloc 慢 ~115×）。
+
+```rust
+// 每次预取 tick：收集所有序列的预取候选，合并为一次批量操作
+fn prefetch_tick(&mut self) {
+    let mut batch: Vec<BlockHandle> = Vec::new();
+    for seq in self.active_sequences() {
+        batch.extend(seq.prefetch_candidates(self.prefetch_window));
+    }
+    self.streams.prefetch_batch_async(&batch); // 一次批量 cuMemMap + H2D
+}
+```
+
+2. **勿预取"即将结束"的序列：** 如果 `max_tokens - current_tokens < prefetch_window`，该序列即将结束，不需要浪费 PCIe 带宽做预取。
+
+3. **预取取消（Prefetch Cancellation）：** 如果预取传输尚未完成但序列已经结束（`free_blocks`），立即取消正在进行的 H2D memcpy 并回收已分配的 GPU 物理页。
+
+##### 自适应水位线（Adaptive Watermark）
+
+固定的低水位线（如"free < 20% 触发换出"）在不同负载下表现差异巨大：
+
+```
+负载类型 A — "水滴石穿"：大量短序列 → 自然释放快，水位线可以设低
+负载类型 B — "洪峰型"：突发大量长序列 → 需要提前换出，否则来不及
+```
+
+**优化手段：** KCMM 追踪最近的分配/释放速率，计算 GPU 池耗尽时间的预测值，让换出操作在 **OOM 发生之前完成**，而不是被动响应：
+
+```rust
+fn adaptive_watermark(&self) -> f64 {
+    let alloc_rate = self.metrics.alloc_rate_ewma;   // 指数加权移动平均
+    let free_rate = self.metrics.free_rate_ewma;
+    let net_drain_rate = alloc_rate - free_rate;
+
+    if net_drain_rate <= 0.0 {
+        return self.config.low_watermark; // 正常水位线
+    }
+
+    let time_to_oom = self.free_blocks as f64 / net_drain_rate;
+    let eviction_latency = self.tiering.avg_eviction_latency();
+
+    // 在 OOM 前提前触发，留足换出操作的时间窗口
+    if time_to_oom < eviction_latency * SAFETY_FACTOR {
+        return self.config.high_watermark; // 提前触发，更激进地换出
+    }
+
+    self.config.low_watermark
+}
+```
+
+#### 1.6.4 传输层面的优化
+
+##### 有损换出（Quantized Eviction）
+
+KV Cache 对精度损失有一定容忍度，尤其是早期层和低重要性块。将块换出到 CPU 前做量化，可以显著降低传输带宽和 CPU 存储占用：
+
+```
+GPU HBM (FP16, 128KB/block)
+    ↓  量化到 INT8 (64KB/block) 或 INT4 (32KB/block)
+CPU DRAM (量化存储)
+    ↓  反量化（恢复时）
+GPU HBM (FP16, 128KB/block)
+```
+
+**收益分析：**
+
+| 量化精度 | 传输带宽 | CPU 存储 | 精度风险 |
+|---------|---------|---------|---------|
+| 无量化 (FP16) | 1× | 1× | 无 |
+| INT8 | 2× | 2× | 极低（广泛验证） |
+| INT4 | 4× | 4× | 低（KV Cache 特化量化方案逐步成熟） |
+| NF4 (如 QLoRA) | 4× | 4× | 低-中 |
+
+**关键设计选择：**
+- 量化/反量化在 **KCMM 的专用 CUDA Stream** 上完成，不阻塞推理计算
+- 仅对**低重要性块**（按 1.6.2 的分级）做激进量化；Attention Sink 和 Heavy Hitters 保持无损换出
+- 量化内核可以复用 vLLM/SGLang 已有的量化算子，或使用 CUDA 原生 `cublasLtMatmul` 的 INT8 路径
+
+##### 流式恢复（Streaming Restore）
+
+当前设计是"等整个块从 CPU 恢复到 GPU 后才返回给引擎"。可以改为流水线化：
+
+```
+标准恢复（当前设计）：
+  [cuMemMap] [====== H2D 128KB ======] → 引擎可访问
+                                   ↑ 整个传输完成
+
+流式恢复（优化）：
+  [cuMemMap] [= H2D 32KB =] → 引擎可访问块的前 25%
+             [= H2D 32KB =] → 前 50%
+             [= H2D 32KB =] → 前 75%
+             [= H2D 32KB =] → 100%
+              ↑ 引擎在第一批传输完成后即可开始计算
+```
+
+对于长上下文场景（块很大时如 128KB/block），流式恢复的 latency hiding 效果显著——引擎可以在第一批数据到位后立即开始 attention 计算，后续数据以流水线方式进入。
+
+##### 写入缓冲与批量持久化
+
+每次换出一个块立即执行 `cudaMemcpy D2H` + `cuMemUnmap` 会导致大量小粒度的 I/O 操作，无法充分利用 PCIe 带宽。
+
+**优化手段——写入缓冲区（Write Buffer）：**
+
+```rust
+struct WriteBuffer {
+    pending: Vec<BlockHandle>,    // 待换出的块
+    staging: *mut u8,             // 暂存缓冲区（GPU 侧）
+    threshold: usize,             // 如 16 个块或 2MB 总量
+}
+
+impl WriteBuffer {
+    fn flush(&mut self) {
+        // 批量 cuMemUnmap → 一次大粒度 cudaMemcpy D2H
+        // NVMe 场景：顺序写 vs 随机写，吞吐量差 10× 以上
+        self.streams.evict_batch_async(&self.pending);
+        self.pending.clear();
+    }
+}
+```
+
+NVMe 层尤其受益——随机小写 vs 顺序大批量写，吞吐量差异可达 **10× 以上**。
+
+#### 1.6.5 跨引擎的全局优化
+
+这是 KCMM 作为独立 OS 服务的**独特优势**——单个引擎内部的置换策略无法获得全局视角。
+
+##### 全局压力平衡
+
+```
+引擎 A 池: 90% 利用率，但大部分是已完成序列的冷块
+引擎 B 池: 95% 利用率，全部是正在 decode 的热块
+
+→ 传统 LRU（各自决策）: A 和 B 各自换出最冷的块
+→ KCMM 全局决策: 从 A 换出更多（即使 B 的利用率更高）
+  因为 A 的受害者块更"冷"，换出 A 的块不会影响任何活跃推理
+```
+
+**实现关键：** `TieringEngine` 维护所有注册池的全局 victim 优先级队列，而非每个池独立的队列。
+
+##### 跨引擎块借用（Block Lending）
+
+当引擎 A 空间充裕而引擎 B 面临 OOM 时，KCMM 可以在池之间临时借用物理块：
+
+```
+引擎 A (空闲，30 blocks free) ──→ 借用 10 blocks ──→ 引擎 B (OOM 危机)
+                                                  ↓
+                                           B 的 decode 完成后归还
+```
+
+"借用"只需要更新 KCMM 内部的映射表（所有权转移），比换出到 CPU 快几个数量级：
+- 块借用延迟：~ns（纯内存操作，映射表更新）
+- 换出-恢复延迟：~200μs（D2H + H2D + cuMemMap）
+
+这要求 KCMM 的 `KcmmPool` 支持**物理块在池之间动态转移**，这是当前设计中未涵盖的能力。
+
+#### 1.6.6 引擎提示接口（Hint API）
+
+传统置换策略之所以"笨"，是因为它们只能被动观察访问模式——`touch` 和 `cool` 提供了比 OS 页表更多的信号，但仍然不够。推理引擎的调度器**知道得更多**，却无法将这些知识传递给内存管理层。
+
+**当前 API（仅被动观察）：**
+
+```c
+kcmm_touch(pool, seq_id);   // "刚才访问了"
+kcmm_cool(pool, seq_id);    // "现在空闲了"
+```
+
+**扩展 Hint API（主动告知，新增功能模块 I）：**
+
+```c
+// 生命周期提示
+kcmm_hint(pool, seq_id, KCMM_HINT_MULTI_TURN);     // "这个会话还有后续，延迟换出"
+kcmm_hint(pool, seq_id, KCMM_HINT_NEAR_END);        // "快结束了，优先受害者"
+kcmm_hint(pool, seq_id, KCMM_HINT_SYSTEM_PROMPT);   // "系统提示词，缓存价值极高"
+
+// 优先级提示
+kcmm_hint(pool, seq_id, KCMM_HINT_HIGH_PRIORITY);   // "SLO 关键请求，保护其块"
+kcmm_hint(pool, seq_id, KCMM_HINT_LOW_PRIORITY);     // "后台/批处理请求，可激进换出"
+
+// 注意力信号提示
+kcmm_hint(pool, block_ids, KCMM_HINT_ATTENTION_SINK); // "注意力沉没，永不换出"
+kcmm_hint(pool, block_ids, KCMM_HINT_HEAVY_HITTER);   // "高注意力，受保护"
+kcmm_hint(pool, block_ids, KCMM_HINT_EVICTABLE);      // "可丢弃，优先换出"
+```
+
+**设计原则：**
+- Hint 是**建议性的**（advisory），不是强制命令——KCMM 在极端压力下仍可降级处理
+- Hint 不改变 KCMM 的核心机制（块迁移、状态追踪、CUDA Stream 管理），只给策略层提供更丰富的决策信号
+- 引擎侧不需要实现任何内存管理逻辑，只需在现有调度循环中插入 1-2 行 hint 调用
+
+#### 1.6.7 优化手段汇总与优先级
+
+```
+                     ┌──────────────────────────────────────────────┐
+ 维度                 │ 优化手段                                      │
+                     ├──────────────────────────────────────────────┤
+ 时间维度（传统）       │ LRU, LFU, FIFO, ARC                         │
+ 生命周期维度           │ 分层温控、显式回收、多轮对话休眠标记            │
+ 注意力维度             │ Attention Sink 保护、重要块分级、逐层差异化     │
+ 预测维度               │ 自适应水位线、投机预取增强、预取取消            │
+ 传输维度               │ 有损换出（量化）、流式恢复、写入缓冲             │
+ 跨引擎维度             │ 全局压力平衡、跨引擎块借用                     │
+ 引擎提示维度           │ Hint API（调度器 → KCMM 主动传递语义信号）     │
+                     └──────────────────────────────────────────────┘
+```
+
+**建议的实现优先级（按步骤 3 可实现性排序）：**
+
+| 优先级 | 优化手段 | 理由 |
+|--------|---------|------|
+| P0（步骤 3 即实现） | 分层温控 + 显式回收 | 改动小（仅扩展 `EvictionPolicy`），收益高 |
+| P0 | 自适应水位线 | 纯 KCMM 内部逻辑，不依赖引擎侧改动 |
+| P1（步骤 3 有额外时间） | Hint API 基础框架 | 定义 C ABI + trait，预留扩展空间 |
+| P1 | 批量预取合并 | 与现有 `prefetch_stream` 设计兼容 |
+| P2（步骤 4） | 跨引擎块借用 | 需要多池管理成熟后才有意义 |
+| P2 | 注意力信号分级 + 有损换出 | 需要引擎侧配合输出注意力分数 |
+| P3（未来探索） | 流式恢复、逐层差异化 | 更多工程复杂度，收益需实测验证 |
+
+传统置换策略只用了第一行。KCMM 真正的竞争力来自**后面六行**——这些优化任何一个单独实现都不难，但由于它们散落在不同论文和工程实践中，且都依赖于对推理引擎内部状态的感知，现有系统很少有系统性地整合。KCMM 作为独立的内存管理服务的定位，恰好给了它一个可以同时运用所有这些信号的平台。
 
 ---
 
