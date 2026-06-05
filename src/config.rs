@@ -83,3 +83,64 @@ pub struct PipelineConfig {
     pub next_addr: Option<String>,
     pub listen_addr: String,
 }
+
+// --- KCMM Configuration ---
+
+/// Configuration for the KCMM (KV Cache Memory Manager) pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KcmmConfig {
+    /// Tokens per block. Default: 16.
+    #[serde(default = "default_block_size")]
+    pub block_size: usize,
+    /// Maximum number of blocks in the pool. Default: 16384.
+    #[serde(default = "default_max_blocks")]
+    pub max_blocks: usize,
+    /// Path to the CPU swap buffer (typically in /dev/shm).
+    /// Default: "/dev/shm/kcmm_swap".
+    #[serde(default = "default_cpu_cache_path")]
+    pub cpu_cache_path: String,
+    /// Whether multi-tier storage (GPU→CPU→NVMe) is enabled.
+    /// Default: true.
+    #[serde(default = "default_tiering")]
+    pub tiering: bool,
+    /// Eviction policy: "lru", "lfu", or "fifo".
+    /// Default: "lru".
+    #[serde(default = "default_eviction_policy")]
+    pub eviction_policy: String,
+    /// Number of look-ahead blocks to prefetch per active sequence.
+    /// Default: 4.
+    #[serde(default = "default_prefetch_window")]
+    pub prefetch_window: usize,
+}
+
+fn default_block_size() -> usize {
+    16
+}
+fn default_max_blocks() -> usize {
+    16384
+}
+fn default_cpu_cache_path() -> String {
+    "/dev/shm/kcmm_swap".to_string()
+}
+fn default_tiering() -> bool {
+    true
+}
+fn default_eviction_policy() -> String {
+    "lru".to_string()
+}
+fn default_prefetch_window() -> usize {
+    4
+}
+
+impl Default for KcmmConfig {
+    fn default() -> Self {
+        Self {
+            block_size: default_block_size(),
+            max_blocks: default_max_blocks(),
+            cpu_cache_path: default_cpu_cache_path(),
+            tiering: default_tiering(),
+            eviction_policy: default_eviction_policy(),
+            prefetch_window: default_prefetch_window(),
+        }
+    }
+}

@@ -8,111 +8,13 @@ use std::sync::Arc;
 use super::cuda_vmm::CudaVmm;
 use crate::config::ModelConfig;
 use crate::cuda::CudaContext;
+use crate::kcmm::superblock::{
+    align_up, BlockHandle, LayerKvPool, SuperblockInfo, SUPERBLOCK_SIZE,
+};
 
 /// Tokens per block — matches typical vLLM default.
 pub const BLOCK_SIZE: usize = 16;
 pub const BLOCK_BYTES: usize = 8192; // BLOCK_SIZE * kv_heads * head_dim * sizeof(f16)
-pub(crate) const SUPERBLOCK_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
-
-// --- Physical block sub-allocator ---
-
-/// Tracks one 2 MiB physical allocation and its VA placement
-/// within a specific layer's K or V region.
-pub(crate) struct SuperblockInfo {
-    phys_handle: u64,
-    /// Byte offset within the owning VA region where this superblock starts.
-    va_base: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockHandle {
-    superblock_idx: u32,
-    block_index: u32,
-}
-
-pub struct PhysicalBlockAllocator {
-    pub block_bytes: usize,
-    pub blocks_per_superblock: usize,
-    free_blocks: Mutex<Vec<BlockHandle>>,
-    superblock_count: Mutex<usize>,
-}
-
-impl PhysicalBlockAllocator {
-    pub fn new(elem_count: usize) -> Self {
-        let block_bytes = elem_count * std::mem::size_of::<f16>();
-        let blocks_per_superblock = SUPERBLOCK_SIZE / block_bytes;
-        assert!(blocks_per_superblock > 0,
-            "block_bytes ({}) too large; reduce BLOCK_SIZE or model dims", block_bytes);
-        assert_eq!(SUPERBLOCK_SIZE % block_bytes, 0,
-            "block_bytes ({}) must divide superblock evenly", block_bytes);
-
-        Self {
-            block_bytes,
-            blocks_per_superblock,
-            free_blocks: Mutex::new(Vec::new()),
-            superblock_count: Mutex::new(0),
-        }
-    }
-
-    /// Try to allocate one block from the free list.
-    /// Returns `None` if no free blocks are available (caller must add a superblock).
-    pub fn try_allocate(&self) -> Option<BlockHandle> {
-        self.free_blocks.lock().pop()
-    }
-
-    /// Add a new superblock's blocks to the free list.
-    /// Increments the superblock count.
-    /// All blocks (including index 0) are added to the free list so that
-    /// fragmentation tracking sees the correct free-block count.
-    pub fn add_superblock(&self) {
-        let mut sb_count = self.superblock_count.lock();
-        let sb_idx = *sb_count;
-        *sb_count += 1;
-        drop(sb_count);
-
-        let mut free = self.free_blocks.lock();
-        for i in 0..self.blocks_per_superblock {
-            free.push(BlockHandle {
-                superblock_idx: sb_idx as u32,
-                block_index: i as u32,
-            });
-        }
-    }
-
-    /// Return a block to the free pool.
-    pub fn free(&self, handle: BlockHandle) {
-        self.free_blocks.lock().push(handle);
-    }
-
-    pub fn free_count(&self) -> usize {
-        self.free_blocks.lock().len()
-    }
-
-    pub fn total_blocks_allocated(&self) -> usize {
-        *self.superblock_count.lock() * self.blocks_per_superblock
-    }
-
-    pub fn superblock_count(&self) -> usize {
-        *self.superblock_count.lock()
-    }
-}
-
-// --- Per-layer KV pool ---
-
-/// Physical memory pool for one layer's K or V cache.
-pub(crate) struct LayerKvPool {
-    pub(crate) allocator: PhysicalBlockAllocator,
-    pub(crate) superblocks: Mutex<Vec<SuperblockInfo>>,
-}
-
-impl LayerKvPool {
-    fn new(elem_count: usize) -> Self {
-        Self {
-            allocator: PhysicalBlockAllocator::new(elem_count),
-            superblocks: Mutex::new(Vec::new()),
-        }
-    }
-}
 
 // --- Per-block info (tracked by PagedKvCache) ---
 
@@ -396,9 +298,15 @@ impl PagedKvCache {
     }
 
     /// Free all blocks belonging to a sequence.
+    ///
+    /// Lock ordering: `block_info` → then `free_block_indices`.
+    /// We collect recycled indices into a temporary Vec, drop `block_info`,
+    /// and then extend `free_block_indices` — this avoids an AB-BA deadlock
+    /// with `install_block` which acquires the locks in reverse order.
     pub fn free_sequence(&self, block_table: &[u32]) {
         let mut info = self.block_info.lock();
         let num_layers = self.cfg.num_hidden_layers;
+        let mut recycled = Vec::new();
 
         for &block_idx in block_table {
             let bi = &mut info[block_idx as usize];
@@ -416,10 +324,10 @@ impl PagedKvCache {
                 self.k_pools[l].allocator.free(handle);
                 self.v_pools[l].allocator.free(handle);
             }
-
-            // Recycle the block index
-            self.free_block_indices.lock().push(block_idx);
+            recycled.push(block_idx);
         }
+        drop(info);
+        self.free_block_indices.lock().extend(recycled);
     }
 
     /// Register a new sequence with its block table. Returns the sequence index.
@@ -778,73 +686,9 @@ pub struct CacheStats {
     pub physical_memory_mib: f32,
 }
 
-fn align_up(x: usize, align: usize) -> usize {
-    (x + align - 1) & !(align - 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- PhysicalBlockAllocator unit tests (no GPU needed) ---
-
-    #[test]
-    fn test_allocator_sizing() {
-        let elem_count = 4 * 16 * 128; // 8192
-        let alloc = PhysicalBlockAllocator::new(elem_count);
-        assert_eq!(alloc.block_bytes, 8192 * 2); // 16384
-        assert_eq!(alloc.blocks_per_superblock, 128);
-        assert_eq!(alloc.free_count(), 0);
-        assert_eq!(alloc.total_blocks_allocated(), 0);
-    }
-
-    #[test]
-    fn test_allocator_sizing_tinyllama() {
-        let elem_count = 4 * 16 * 64;
-        let alloc = PhysicalBlockAllocator::new(elem_count);
-        assert_eq!(alloc.block_bytes, 8192);
-        assert_eq!(alloc.blocks_per_superblock, 256);
-    }
-
-    #[test]
-    fn test_allocator_free_reuse() {
-        let alloc = PhysicalBlockAllocator::new(4 * 16 * 128);
-        alloc.free(BlockHandle {
-            superblock_idx: 0,
-            block_index: 0,
-        });
-        alloc.free(BlockHandle {
-            superblock_idx: 0,
-            block_index: 1,
-        });
-        alloc.free(BlockHandle {
-            superblock_idx: 1,
-            block_index: 5,
-        });
-        assert_eq!(alloc.free_count(), 3);
-    }
-
-    #[test]
-    fn test_allocator_add_superblock() {
-        let alloc = PhysicalBlockAllocator::new(4 * 16 * 128);
-        assert_eq!(alloc.free_count(), 0);
-
-        alloc.add_superblock();
-        assert_eq!(alloc.superblock_count(), 1);
-        // All blocks (including block 0) are now in the free list.
-        assert_eq!(alloc.free_count(), alloc.blocks_per_superblock);
-    }
-
-    #[test]
-    fn test_allocator_try_allocate() {
-        let alloc = PhysicalBlockAllocator::new(4 * 16 * 128);
-        assert!(alloc.try_allocate().is_none());
-
-        alloc.add_superblock();
-        let h = alloc.try_allocate().unwrap();
-        assert_eq!(h.superblock_idx, 0);
-        // Block 0 may be returned since all blocks are in the free list.
-    }
 
     // --- Block address computation tests ---
 
@@ -917,28 +761,4 @@ mod tests {
         assert_eq!(max_blocks_total, 1024);
     }
 
-    #[test]
-    fn test_align_up() {
-        assert_eq!(align_up(0, SUPERBLOCK_SIZE), 0);
-        assert_eq!(align_up(1, SUPERBLOCK_SIZE), SUPERBLOCK_SIZE);
-        assert_eq!(
-            align_up(SUPERBLOCK_SIZE, SUPERBLOCK_SIZE),
-            SUPERBLOCK_SIZE
-        );
-        assert_eq!(
-            align_up(SUPERBLOCK_SIZE + 1, SUPERBLOCK_SIZE),
-            4 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn test_superblock_block_carving() {
-        let elem_count = 4 * 16 * 128;
-        let block_bytes = elem_count * std::mem::size_of::<f16>();
-        assert_eq!(
-            SUPERBLOCK_SIZE % block_bytes,
-            0,
-            "block_bytes must divide superblock evenly"
-        );
-    }
 }
