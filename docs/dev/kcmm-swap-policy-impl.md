@@ -181,7 +181,7 @@ let eviction_policy: Box<dyn EvictionPolicy> = match config.eviction_policy.as_s
 
 ---
 
-### 阶段 B：单块换出实现（预计 3 天）— **核心攻坚战**
+### 阶段 B：单块换出实现（预计 3 天）
 
 #### B.1 CPU 缓冲区槽位管理
 

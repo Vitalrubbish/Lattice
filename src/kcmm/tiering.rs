@@ -14,6 +14,7 @@ use std::time::Instant;
 use anyhow::Result;
 use parking_lot::Mutex;
 use crate::config::KcmmConfig;
+use crate::kcmm::pool::{BlockLocation, KcmmPool};
 use crate::kcmm::superblock::BlockHandle;
 
 // --- Eviction policy trait ---
@@ -331,9 +332,14 @@ impl TieringEngine {
     /// as the CPU swap buffer.  Using a file-backed mapping (instead of
     /// `MAP_ANONYMOUS`) enables cross-process sharing of the swap region
     /// and persistence of swapped data across engine restarts.
-    pub fn new(config: &KcmmConfig) -> Result<Self> {
-        // TODO: add KcmmConfig::cpu_buffer_size; for now estimate.
-        let cpu_buffer_size = config.max_blocks * config.block_size * 2;
+    ///
+    /// `num_layers` and `block_bytes` determine the total swap buffer size:
+    /// every evicted block needs `num_layers * 2 * block_bytes` bytes of
+    /// CPU storage (K+V for every layer).
+    pub fn new(config: &KcmmConfig, num_layers: usize, block_bytes: usize) -> Result<Self> {
+        // Total buffer size: enough to hold all blocks if every one is evicted.
+        let per_block_bytes = num_layers * 2 * block_bytes;
+        let cpu_buffer_size = config.max_blocks * per_block_bytes;
 
         let cpu_buffer = if cpu_buffer_size > 0 {
             let file = OpenOptions::new()
@@ -391,6 +397,346 @@ impl TieringEngine {
     pub fn cpu_buffer_size(&self) -> usize {
         self.cpu_buffer_size
     }
+
+    /// Allocate a CPU swap buffer slot of at least `size` bytes.
+    ///
+    /// Returns the byte offset into the CPU buffer, or an error if
+    /// the buffer is exhausted.
+    pub fn alloc_cpu_slot(&self, size: usize) -> Result<usize> {
+        let mut allocator = self.slot_allocator.lock();
+        allocator
+            .allocate(size)
+            .ok_or_else(|| anyhow::anyhow!("CPU swap buffer exhausted (need {} bytes)", size))
+    }
+
+    /// Return a previously allocated CPU swap buffer slot to the free pool.
+    pub fn free_cpu_slot(&self, offset: usize, size: usize) {
+        let mut allocator = self.slot_allocator.lock();
+        allocator.free(offset, size);
+    }
+
+    // --- Eviction ---
+
+    /// Evict up to `count` blocks from GPU to CPU.
+    ///
+    /// Uses the configured eviction policy to select victims from
+    /// `candidates`, then copies each victim's data for all layers
+    /// (K and V) to the CPU swap buffer and releases the GPU physical
+    /// resources.
+    ///
+    /// Returns the list of successfully evicted block handles.
+    pub fn evict_blocks(
+        &self,
+        pool: &KcmmPool,
+        candidates: &[BlockHandle],
+        count: usize,
+    ) -> Result<Vec<BlockHandle>> {
+        if candidates.is_empty() || count == 0 {
+            return Ok(Vec::new());
+        }
+        // 1. Select victims
+        let victims = self.eviction_policy.select_victims(candidates, count);
+        if victims.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 2. Evict each victim
+        let mut evicted = Vec::with_capacity(victims.len());
+        for &victim in &victims {
+            // Find the logical block index for this BlockHandle
+            let block_idx = pool
+                .find_block_idx(victim)
+                .ok_or_else(|| anyhow::anyhow!("victim block {:?} not found in pool", victim))?;
+
+            match self.evict_single_block(pool, block_idx, victim) {
+                Ok(()) => {
+                    self.eviction_policy.on_evict(victim);
+                    evicted.push(victim);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        block_idx,
+                        ?victim,
+                        error = %e,
+                        "KCMM: evict_single_block failed, skipping"
+                    );
+                    // Continue with the next victim — partial success is
+                    // better than total failure under memory pressure.
+                }
+            }
+        }
+
+        Ok(evicted)
+    }
+
+    /// Evict a single block from GPU to CPU.
+    ///
+    /// 1. Allocates a CPU swap buffer slot.
+    /// 2. Marks the block as `Evicting` (blocks concurrent access).
+    /// 3. Copies all layers' K+V data from GPU to CPU (async, on evict stream).
+    /// 4. Synchronises the evict stream.
+    /// 5. Releases GPU physical resources.
+    /// 6. Marks the block as `CpuResident`.
+    fn evict_single_block(
+        &self,
+        pool: &KcmmPool,
+        block_idx: u32,
+        handle: BlockHandle,
+    ) -> Result<()> {
+        let block_bytes = pool.block_bytes;
+        // Total bytes to copy: num_layers * 2 (K+V) * block_bytes
+        let total_bytes = pool.num_layers * 2 * block_bytes;
+
+        // 1. Allocate CPU slot
+        let cpu_offset = self.alloc_cpu_slot(total_bytes)?;
+
+        // 2. Mark as Evicting — concurrent access will see this and back off
+        pool.set_block_location(block_idx, BlockLocation::Evicting)?;
+
+        // 3. Copy all layers (async)
+        let copy_result = self.evict_single_block_all_layers(pool, handle, cpu_offset);
+
+        if let Err(e) = copy_result {
+            // Rollback: return CPU slot, restore location
+            self.free_cpu_slot(cpu_offset, total_bytes);
+            // Best-effort restore to GpuResident — the original VA is still valid
+            // since we haven't released physical resources yet.
+            match pool.block_va_offset(handle) {
+                Ok(va_off) => {
+                    if let Err(rollback_err) = pool.set_block_location(
+                        block_idx,
+                        BlockLocation::GpuResident(handle, va_off as u64),
+                    ) {
+                        tracing::error!(
+                            block_idx,
+                            ?handle,
+                            error = %rollback_err,
+                            "KCMM: CRITICAL — failed to rollback location after memcpy error; block stuck as Evicting"
+                        );
+                    }
+                }
+                Err(va_err) => {
+                    tracing::error!(
+                        block_idx,
+                        ?handle,
+                        error = %va_err,
+                        "KCMM: CRITICAL — failed to compute VA offset during rollback; block stuck as Evicting"
+                    );
+                }
+            }
+            return Err(e);
+        }
+
+        // 4. Synchronise evict stream
+        pool.streams.evict.synchronize()?;
+
+        // 5. Release GPU physical resources (return to per-layer free lists)
+        pool.release_block_physical(block_idx)?;
+
+        // 6. Mark as CpuResident
+        pool.set_block_location(block_idx, BlockLocation::CpuResident(cpu_offset))?;
+
+        tracing::debug!(
+            block_idx,
+            ?handle,
+            cpu_offset,
+            total_bytes,
+            "KCMM: evicted block to CPU"
+        );
+
+        Ok(())
+    }
+
+    /// Copy all K and V layers for a block from GPU to CPU.
+    ///
+    /// Data layout in CPU buffer (conceptual):
+    ///
+    /// `[K layer 0][V layer 0][K layer 1][V layer 1]...[K layer N][V layer N]`
+    fn evict_single_block_all_layers(
+        &self,
+        pool: &KcmmPool,
+        handle: BlockHandle,
+        cpu_offset: usize,
+    ) -> Result<()> {
+        let block_bytes = pool.block_bytes;
+        let num_layers = pool.num_layers;
+        let mut byte_offset = cpu_offset;
+
+        for l in 0..num_layers {
+            // Copy K layer
+            let gpu_va_k = pool.gpu_va_for_block(handle, l, false)?;
+            unsafe {
+                pool.streams.evict.memcpy_d2h_async(
+                    self.cpu_buffer.add(byte_offset),
+                    gpu_va_k,
+                    block_bytes,
+                )?;
+            }
+            byte_offset += block_bytes;
+
+            // Copy V layer
+            let gpu_va_v = pool.gpu_va_for_block(handle, l, true)?;
+            unsafe {
+                pool.streams.evict.memcpy_d2h_async(
+                    self.cpu_buffer.add(byte_offset),
+                    gpu_va_v,
+                    block_bytes,
+                )?;
+            }
+            byte_offset += block_bytes;
+        }
+
+        Ok(())
+    }
+
+    // --- Restoration ---
+
+    /// Copy all K and V layers for a block from CPU to GPU.
+    ///
+    /// Reads from the CPU swap buffer at `cpu_offset` and writes to each
+    /// layer's K+V VA region at `va_offset`.  Uses the dedicated `restore`
+    /// CUDA stream for asynchronous H2D transfers.
+    ///
+    /// Data layout in CPU buffer (same as eviction):
+    /// `[K layer 0][V layer 0][K layer 1][V layer 1]...[K layer N][V layer N]`
+    fn restore_block_all_layers(
+        &self,
+        pool: &KcmmPool,
+        cpu_offset: usize,
+        va_offset: usize,
+    ) -> Result<()> {
+        let block_bytes = pool.block_bytes;
+        let num_layers = pool.num_layers;
+        let mut byte_offset = cpu_offset;
+        let va_off = va_offset as u64;
+
+        for l in 0..num_layers {
+            // Restore K layer
+            let gpu_va_k = pool.va_k(l) + va_off;
+            unsafe {
+                pool.streams.restore.memcpy_h2d_async(
+                    gpu_va_k,
+                    self.cpu_buffer.add(byte_offset) as *const u8,
+                    block_bytes,
+                )?;
+            }
+            byte_offset += block_bytes;
+
+            // Restore V layer
+            let gpu_va_v = pool.va_v(l) + va_off;
+            unsafe {
+                pool.streams.restore.memcpy_h2d_async(
+                    gpu_va_v,
+                    self.cpu_buffer.add(byte_offset) as *const u8,
+                    block_bytes,
+                )?;
+            }
+            byte_offset += block_bytes;
+        }
+
+        Ok(())
+    }
+
+    /// Restore a single block from CPU back to GPU.
+    ///
+    /// Called by `KcmmPool::restore_evicted_block` when a `CpuResident`
+    /// block needs to be brought back into GPU HBM (e.g. when its owning
+    /// sequence becomes active again).
+    ///
+    /// # Flow
+    ///
+    /// 1. Mark `Restoring` (blocks concurrent access).
+    /// 2. Allocate a new GPU physical block via `pool.alloc_one_block_internal`.
+    /// 3. Update `BlockInfo` with the new physical allocation.
+    /// 4. H2D memcpy all layers from CPU buffer to GPU (async, on restore stream).
+    /// 5. Synchronise the restore stream.
+    /// 6. Mark `GpuResident` with the new handle and VA offset.
+    /// 7. Free the CPU swap buffer slot.
+    /// 8. Notify the eviction policy (`on_access`).
+    ///
+    /// On copy failure the new physical allocation is released and the
+    /// block reverts to `CpuResident`.
+    pub(crate) fn restore_block(
+        &self,
+        pool: &KcmmPool,
+        block_idx: u32,
+        cpu_offset: usize,
+    ) -> Result<()> {
+        let block_bytes = pool.block_bytes;
+        let total_bytes = pool.num_layers * 2 * block_bytes;
+
+        // 1. Mark as Restoring — concurrent access will see this and back off
+        pool.set_block_location(block_idx, BlockLocation::Restoring)?;
+
+        // 2. Allocate new GPU physical block
+        let (va_offset, sb_idx, blk_in_sb) = pool.alloc_one_block_internal()?;
+        let new_handle = BlockHandle {
+            superblock_idx: sb_idx,
+            block_index: blk_in_sb,
+        };
+
+        // 3. Update BlockInfo with the new physical allocation (va_offset,
+        //    superblock_idx, and block_index_in_sb all change because the
+        //    new physical slot may be in a different superblock).
+        pool.update_block_physical(block_idx, va_offset, sb_idx, blk_in_sb)?;
+
+        // 4. H2D memcpy for all layers (async on restore stream)
+        let copy_result =
+            self.restore_block_all_layers(pool, cpu_offset, va_offset);
+
+        if let Err(e) = copy_result {
+            // Rollback: release the new physical allocation and revert to CpuResident.
+            // Each step is best-effort with its own error log — we must attempt both
+            // even if the first fails, so the block doesn't stay stuck as Restoring.
+            if let Err(phys_err) = pool.release_block_physical(block_idx) {
+                tracing::error!(
+                    block_idx,
+                    ?new_handle,
+                    error = %phys_err,
+                    "KCMM: CRITICAL — failed to release physical block during restore rollback"
+                );
+            }
+            if let Err(loc_err) = pool.set_block_location(
+                block_idx,
+                BlockLocation::CpuResident(cpu_offset),
+            ) {
+                tracing::error!(
+                    block_idx,
+                    cpu_offset,
+                    error = %loc_err,
+                    "KCMM: CRITICAL — failed to revert location during restore rollback; block stuck as Restoring"
+                );
+            }
+            return Err(e);
+        }
+
+        // 5. Synchronise restore stream — memcpy must complete before we
+        //    consider the block available for GPU access.
+        pool.streams.restore.synchronize()?;
+
+        // 6. Mark as GpuResident
+        pool.set_block_location(
+            block_idx,
+            BlockLocation::GpuResident(new_handle, va_offset as u64),
+        )?;
+
+        // 7. Free CPU slot — the data is now on GPU, the CPU copy is stale
+        self.free_cpu_slot(cpu_offset, total_bytes);
+
+        // 8. Notify policy — the block was just "accessed" via restore
+        self.eviction_policy.on_access(new_handle);
+
+        tracing::debug!(
+            block_idx,
+            ?new_handle,
+            cpu_offset,
+            va_offset,
+            total_bytes,
+            "KCMM: restored block from CPU to GPU"
+        );
+
+        Ok(())
+    }
 }
 
 impl Drop for TieringEngine {
@@ -438,7 +784,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 16; // cpu_buffer_size = 16 * 16 * 2 = 512
 
-        let engine = TieringEngine::new(&config).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
         let expected_size = config.max_blocks * config.block_size * 2;
 
         // Buffer should be non-null and the expected size.
@@ -475,7 +821,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 0;
 
-        let engine = TieringEngine::new(&config).expect("create engine with zero blocks");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine with zero blocks");
         assert!(engine.cpu_buffer.is_null());
         assert_eq!(engine.cpu_buffer_size, 0);
 
@@ -493,7 +839,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 4;
 
-        let engine = TieringEngine::new(&config).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
         let expected = config.max_blocks * config.block_size * 2;
         let ptr = engine.cpu_buffer_ptr();
         assert!(!ptr.is_null());
@@ -513,7 +859,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 8;
 
-        let engine = TieringEngine::new(&config).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
         // Just dropping should not panic or segfault.
         drop(engine);
         drop(dir);
@@ -533,7 +879,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 4;
 
-        let engine = TieringEngine::new(&config).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
         assert_send_sync(&engine);
 
         drop(engine);
@@ -550,7 +896,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 32;
 
-        let engine = TieringEngine::new(&config).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
         let expected_size = config.max_blocks * config.block_size * 2;
         assert_eq!(engine.cpu_buffer_size, expected_size);
 
@@ -566,7 +912,7 @@ mod tests {
         let mut config = test_config();
         config.cpu_cache_path = "/nonexistent/path/should/fail/kcmm_swap".to_string();
 
-        let result = TieringEngine::new(&config);
+        let result = TieringEngine::new(&config, 1, 16);
         assert!(result.is_err(), "should fail on nonexistent directory");
     }
 
@@ -933,7 +1279,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 4;
         // eviction_policy defaults to "lru"
-        let engine = TieringEngine::new(&config).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
 
         // Verify the policy works like LRU by exercising its behavior.
         let h0 = bh(0, 0);
@@ -960,7 +1306,7 @@ mod tests {
         config.max_blocks = 4;
         config.eviction_policy = "lfu".to_string();
 
-        let engine = TieringEngine::new(&config).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
 
         // Verify LFU behavior: least-frequently accessed block evicted first.
         let h0 = bh(0, 0);
@@ -988,7 +1334,7 @@ mod tests {
         config.max_blocks = 4;
         config.eviction_policy = "fifo".to_string();
 
-        let engine = TieringEngine::new(&config).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
 
         // Verify FIFO behavior: earliest-allocated evicted first.
         let h0 = bh(0, 0);
@@ -1016,7 +1362,7 @@ mod tests {
         config.max_blocks = 4;
         config.eviction_policy = "nonexistent".to_string();
 
-        let engine = TieringEngine::new(&config).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
 
         // Should behave like LRU (fallback), not crash.
         let h = bh(0, 0);
@@ -1192,6 +1538,631 @@ mod tests {
             let off3 = alloc.allocate(256).unwrap();
             assert_eq!(off3, 0); // best-fit: 0..512 fits 256, returns 0
             assert_eq!(alloc.free_ranges, vec![256..512]);
+        }
+    }
+
+    // --- TieringEngine eviction tests (GPU required) ---
+
+    mod eviction_gpu {
+        use super::*;
+        use crate::cuda::CudaContext;
+        use std::sync::Arc;
+
+        fn make_pool_with_tiering() -> (Arc<CudaContext>, KcmmPool, tempfile::TempDir) {
+            let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path = dir.path().join("kcmm_evict_test");
+            let path_str = path.to_str().expect("valid UTF-8 path").to_string();
+
+            let config = KcmmConfig {
+                block_size: 16,
+                max_blocks: 256,   // enough for CPU buffer = 256 * 16 * 2 = 8192 bytes
+                cpu_cache_path: path_str,
+                tiering: true,      // enable tiering
+                eviction_policy: "lru".to_string(),
+                prefetch_window: 4,
+            };
+
+            let pool = KcmmPool::new(
+                ctx.clone(),
+                config,
+                2,  // num_layers — small to keep tests fast
+                4,  // kv_heads
+                64, // head_dim
+                4,  // max_batch
+                64, // max_seq_len
+            )
+            .expect("create KcmmPool with tiering");
+            (ctx, pool, dir)
+        }
+
+        #[test]
+        fn test_evict_single_block_location_transition() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            // Allocate a block and get its handle
+            let block_idx = pool.alloc_block().expect("alloc block");
+            let handle = pool.get_block_handle(block_idx).expect("get handle");
+            let initial_loc = pool.get_block_location(block_idx).expect("get location");
+            assert!(
+                matches!(initial_loc, BlockLocation::GpuResident(_, _)),
+                "new block should be GpuResident"
+            );
+
+            // Evict the block
+            let evicted = tiering
+                .evict_blocks(&pool, &[handle], 1)
+                .expect("evict blocks");
+            assert_eq!(evicted.len(), 1);
+            assert_eq!(evicted[0], handle);
+
+            // Verify location is CpuResident
+            let loc = pool.get_block_location(block_idx).expect("get location after evict");
+            assert!(
+                matches!(loc, BlockLocation::CpuResident(_)),
+                "evicted block should be CpuResident, got {:?}",
+                loc
+            );
+            if let BlockLocation::CpuResident(offset) = loc {
+                // Offset should be within the CPU buffer
+                let total = pool.num_layers * 2 * pool.block_bytes;
+                assert!(offset < tiering.cpu_buffer_size());
+                // First eviction should be at offset 0
+                assert_eq!(offset, 0);
+                let _ = total; // suppress unused warning
+            }
+        }
+
+        #[test]
+        fn test_evict_multiple_blocks_cpu_offsets_sequential() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            // Allocate 3 blocks
+            let table = pool.alloc_sequence(3).expect("alloc 3 blocks");
+            let handles: Vec<BlockHandle> = table
+                .iter()
+                .map(|&idx| pool.get_block_handle(idx).expect("get handle"))
+                .collect();
+            assert_eq!(handles.len(), 3);
+
+            // Record initial locations
+            for &h in &handles {
+                let idx = pool.find_block_idx(h).expect("find block");
+                assert!(matches!(
+                    pool.get_block_location(idx).expect("get location"),
+                    BlockLocation::GpuResident(_, _)
+                ));
+            }
+
+            // Evict all 3
+            let evicted = tiering
+                .evict_blocks(&pool, &handles, 3)
+                .expect("evict 3 blocks");
+            assert_eq!(evicted.len(), 3);
+
+            // Verify each block is CpuResident with sequential offsets
+            let total_per_block = pool.num_layers * 2 * pool.block_bytes;
+            let mut offsets: Vec<usize> = Vec::new();
+            for &h in &evicted {
+                let idx = pool.find_block_idx(h).expect("find block");
+                let loc = pool.get_block_location(idx).expect("get location");
+                match loc {
+                    BlockLocation::CpuResident(off) => {
+                        assert!(off < tiering.cpu_buffer_size());
+                        offsets.push(off);
+                    }
+                    other => panic!("expected CpuResident, got {:?}", other),
+                }
+            }
+            // Offsets should be sequential: 0, total_per_block, 2*total_per_block
+            offsets.sort();
+            for (i, &off) in offsets.iter().enumerate() {
+                assert_eq!(off, i * total_per_block,
+                    "block {} should be at offset {}", i, i * total_per_block);
+            }
+        }
+
+        #[test]
+        fn test_evict_empty_candidates_returns_empty() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            let result = tiering.evict_blocks(&pool, &[], 5).expect("evict empty");
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn test_evict_zero_count_returns_empty() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            let table = pool.alloc_sequence(2).expect("alloc");
+            let handles: Vec<BlockHandle> = table
+                .iter()
+                .map(|&idx| pool.get_block_handle(idx).expect("get handle"))
+                .collect();
+
+            let result = tiering.evict_blocks(&pool, &handles, 0).expect("evict 0");
+            assert!(result.is_empty());
+
+            // Blocks should still be GpuResident
+            for &h in &handles {
+                let idx = pool.find_block_idx(h).expect("find block");
+                assert!(matches!(
+                    pool.get_block_location(idx).expect("get location"),
+                    BlockLocation::GpuResident(_, _)
+                ));
+            }
+        }
+
+        #[test]
+        fn test_evict_count_exceeds_candidates() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            let table = pool.alloc_sequence(2).expect("alloc");
+            let handles: Vec<BlockHandle> = table
+                .iter()
+                .map(|&idx| pool.get_block_handle(idx).expect("get handle"))
+                .collect();
+
+            // Ask for 10 evictions, only 2 available
+            let evicted = tiering
+                .evict_blocks(&pool, &handles, 10)
+                .expect("evict");
+            assert_eq!(evicted.len(), 2);
+        }
+
+        #[test]
+        fn test_evict_then_new_allocation_reuses_physical() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            // Allocate and evict 2 blocks
+            let table = pool.alloc_sequence(2).expect("alloc 2");
+            let handles: Vec<BlockHandle> = table
+                .iter()
+                .map(|&idx| pool.get_block_handle(idx).expect("get handle"))
+                .collect();
+
+            let physical_total_before = pool.total_physical_blocks();
+            let _ = tiering
+                .evict_blocks(&pool, &handles, 2)
+                .expect("evict");
+
+            // Evicted blocks should NOT reduce total_physical_blocks (we only
+            // returned them to the free list — they're still in the superblock).
+            let physical_total_after = pool.total_physical_blocks();
+            assert_eq!(physical_total_before, physical_total_after,
+                "physical total should be unchanged after eviction");
+        }
+
+        #[test]
+        fn test_alloc_cpu_slot_and_free_roundtrip() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            let size = 1024;
+            let off1 = tiering.alloc_cpu_slot(size).expect("alloc slot 1");
+            assert_eq!(off1, 0);
+
+            let off2 = tiering.alloc_cpu_slot(size).expect("alloc slot 2");
+            assert_eq!(off2, 1024);
+
+            // Free off1
+            tiering.free_cpu_slot(off1, size);
+
+            // Re-allocate — should get off1 back (best-fit: only range that fits)
+            let off3 = tiering.alloc_cpu_slot(size).expect("alloc slot 3");
+            assert_eq!(off3, 0, "reclaimed slot should be at offset 0");
+
+            // Free all
+            tiering.free_cpu_slot(off2, size);
+            tiering.free_cpu_slot(off3, size);
+        }
+
+        #[test]
+        fn test_evict_preserves_lru_policy_state() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            // Allocate 3 blocks
+            let table = pool.alloc_sequence(3).expect("alloc");
+            let h0 = pool.get_block_handle(table[0]).expect("get handle");
+            let h1 = pool.get_block_handle(table[1]).expect("get handle");
+            let h2 = pool.get_block_handle(table[2]).expect("get handle");
+
+            // Register with LRU policy (on_allocate)
+            tiering.eviction_policy.on_allocate(h0);
+            tiering.eviction_policy.on_allocate(h1);
+            tiering.eviction_policy.on_allocate(h2);
+
+            // Evict h0 (oldest) — should be removed from policy tracking
+            let evicted = tiering
+                .evict_blocks(&pool, &[h0, h1, h2], 1)
+                .expect("evict");
+            assert_eq!(evicted.len(), 1);
+            // LRU should select h0 (oldest on_allocate)
+            assert_eq!(evicted[0], h0);
+
+            // h0 should no longer be tracked by policy (on_evict called)
+            let remaining = tiering.eviction_policy.select_victims(&[h0, h1, h2], 2);
+            // h0 should be skipped (no tracking) — only h1, h2 selected
+            assert_eq!(remaining.len(), 2);
+            assert!(!remaining.contains(&h0));
+        }
+
+        #[test]
+        fn test_evict_single_block_data_integrity() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            let block_idx = pool.alloc_block().expect("alloc block");
+            let handle = pool.get_block_handle(block_idx).expect("get handle");
+            let block_bytes = pool.block_bytes;
+
+            // Write a known pattern to the GPU block's K and V layers
+            // We use layer 0, K cache for simplicity
+            let num_elements = block_bytes / 2; // f16 = 2 bytes each
+            let pattern: Vec<u16> = (0..num_elements).map(|i| (i % 256) as u16).collect();
+            let gpu_va_k0 = pool.gpu_va_for_block(handle, 0, false).expect("va k0");
+
+            // Copy pattern to GPU (H2D on evict stream)
+            unsafe {
+                pool.streams.evict
+                    .memcpy_h2d_async(
+                        gpu_va_k0,
+                        pattern.as_ptr() as *const u8,
+                        block_bytes,
+                    )
+                    .expect("h2d memcpy");
+            }
+            pool.streams.evict.synchronize().expect("sync");
+
+            // Evict the block
+            let evicted = tiering
+                .evict_blocks(&pool, &[handle], 1)
+                .expect("evict");
+            assert_eq!(evicted.len(), 1);
+
+            // Read back the CPU buffer at the evicted offset
+            let loc = pool.get_block_location(block_idx).expect("get location");
+            let cpu_offset = match loc {
+                BlockLocation::CpuResident(off) => off,
+                _ => panic!("expected CpuResident"),
+            };
+
+            // The K layer data is at cpu_offset
+            let cpu_base = tiering.cpu_buffer_ptr();
+            let readback: Vec<u16> = unsafe {
+                let src = cpu_base.add(cpu_offset) as *const u16;
+                std::slice::from_raw_parts(src, num_elements).to_vec()
+            };
+
+            assert_eq!(readback, pattern,
+                "CPU buffer should contain the exact pattern written to GPU K layer");
+        }
+    }
+
+    // --- TieringEngine restore tests (GPU required) ---
+
+    mod restore_gpu {
+        use super::*;
+        use crate::cuda::CudaContext;
+        use std::sync::Arc;
+
+        fn make_pool_with_tiering() -> (Arc<CudaContext>, KcmmPool, tempfile::TempDir) {
+            let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path = dir.path().join("kcmm_restore_test");
+            let path_str = path.to_str().expect("valid UTF-8 path").to_string();
+
+            let config = KcmmConfig {
+                block_size: 16,
+                max_blocks: 256,
+                cpu_cache_path: path_str,
+                tiering: true,
+                eviction_policy: "lru".to_string(),
+                prefetch_window: 4,
+            };
+
+            let pool = KcmmPool::new(
+                ctx.clone(),
+                config,
+                2,  // num_layers — small for fast tests
+                4,  // kv_heads
+                64, // head_dim
+                4,  // max_batch
+                64, // max_seq_len
+            )
+            .expect("create KcmmPool with tiering");
+            (ctx, pool, dir)
+        }
+
+        #[test]
+        fn test_restore_single_block_location_transition() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            // Allocate a block and evict it
+            let block_idx = pool.alloc_block().expect("alloc block");
+            let handle = pool.get_block_handle(block_idx).expect("get handle");
+
+            let evicted = tiering
+                .evict_blocks(&pool, &[handle], 1)
+                .expect("evict");
+            assert_eq!(evicted.len(), 1);
+
+            // Verify CpuResident
+            let loc = pool.get_block_location(block_idx).expect("get location");
+            assert!(
+                matches!(loc, BlockLocation::CpuResident(_)),
+                "should be CpuResident after eviction"
+            );
+
+            // Restore the block
+            let va_offset = pool
+                .restore_evicted_block(block_idx)
+                .expect("restore evicted block");
+            assert!(va_offset > 0, "restored VA offset should be positive");
+
+            // Verify GpuResident
+            let loc = pool.get_block_location(block_idx).expect("get location after restore");
+            assert!(
+                matches!(loc, BlockLocation::GpuResident(_, _)),
+                "should be GpuResident after restore, got {:?}",
+                loc
+            );
+        }
+
+        #[test]
+        fn test_restore_already_gpu_resident_is_noop() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+
+            // Allocate a block — it starts as GpuResident
+            let block_idx = pool.alloc_block().expect("alloc block");
+            let loc_before = pool.get_block_location(block_idx).expect("get location");
+            let va_before = match loc_before {
+                BlockLocation::GpuResident(_, va) => va,
+                _ => panic!("expected GpuResident"),
+            };
+
+            // Restore on an already-GpuResident block should return the same VA offset
+            let va_after = pool
+                .restore_evicted_block(block_idx)
+                .expect("restore on GpuResident should be noop");
+            assert_eq!(va_before, va_after,
+                "restore on GpuResident block should return same VA offset");
+
+            // Location should still be GpuResident
+            let loc = pool.get_block_location(block_idx).expect("get location");
+            assert!(matches!(loc, BlockLocation::GpuResident(_, _)));
+        }
+
+        #[test]
+        fn test_evict_then_restore_multiple_blocks() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            // Allocate 3 blocks
+            let table = pool.alloc_sequence(3).expect("alloc 3");
+            let handles: Vec<BlockHandle> = table
+                .iter()
+                .map(|&idx| pool.get_block_handle(idx).expect("get handle"))
+                .collect();
+
+            // Evict all 3
+            tiering
+                .evict_blocks(&pool, &handles, 3)
+                .expect("evict all");
+
+            for &h in &handles {
+                let idx = pool.find_block_idx(h).expect("find block");
+                assert!(matches!(
+                    pool.get_block_location(idx).expect("get location"),
+                    BlockLocation::CpuResident(_)
+                ));
+            }
+
+            // Restore each block
+            for &idx in &table {
+                let va = pool
+                    .restore_evicted_block(idx)
+                    .expect("restore block");
+                assert!(va > 0);
+                assert!(matches!(
+                    pool.get_block_location(idx).expect("get location"),
+                    BlockLocation::GpuResident(_, _)
+                ));
+            }
+        }
+
+        #[test]
+        fn test_restore_cpu_slot_freed() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+            let total_per_block = pool.num_layers * 2 * pool.block_bytes;
+
+            // Allocate and evict a block
+            let block_idx = pool.alloc_block().expect("alloc block");
+            let handle = pool.get_block_handle(block_idx).expect("get handle");
+
+            tiering
+                .evict_blocks(&pool, &[handle], 1)
+                .expect("evict");
+
+            let cpu_offset = match pool.get_block_location(block_idx).expect("get location") {
+                BlockLocation::CpuResident(off) => off,
+                _ => panic!("expected CpuResident"),
+            };
+            assert_eq!(cpu_offset, 0, "first eviction should be at offset 0");
+
+            // Restore — should free the CPU slot
+            pool.restore_evicted_block(block_idx).expect("restore");
+
+            // Allocate a new CPU slot — should get the same offset back
+            let new_offset = tiering.alloc_cpu_slot(total_per_block).expect("alloc cpu slot");
+            assert_eq!(new_offset, 0,
+                "CPU slot should be freed after restore and reallocatable at offset 0");
+        }
+
+        #[test]
+        fn test_restore_then_evict_again() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            // Allocate
+            let block_idx = pool.alloc_block().expect("alloc block");
+            let orig_handle = pool.get_block_handle(block_idx).expect("get handle");
+
+            // Evict
+            tiering
+                .evict_blocks(&pool, &[orig_handle], 1)
+                .expect("evict 1");
+            assert!(matches!(
+                pool.get_block_location(block_idx).expect("get location"),
+                BlockLocation::CpuResident(_)
+            ));
+
+            // Restore
+            pool.restore_evicted_block(block_idx).expect("restore");
+            assert!(matches!(
+                pool.get_block_location(block_idx).expect("get location"),
+                BlockLocation::GpuResident(_, _)
+            ));
+
+            // Get the NEW handle (physical allocation changes on restore)
+            let new_handle = pool.get_block_handle(block_idx).expect("get new handle");
+
+            // Evict again — should work with the new handle
+            let evicted2 = tiering
+                .evict_blocks(&pool, &[new_handle], 1)
+                .expect("evict 2");
+            assert_eq!(evicted2.len(), 1);
+
+            assert!(matches!(
+                pool.get_block_location(block_idx).expect("get location after 2nd evict"),
+                BlockLocation::CpuResident(_)
+            ));
+        }
+
+        #[test]
+        fn test_restore_preserves_policy_state() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            // Allocate and evict
+            let block_idx = pool.alloc_block().expect("alloc block");
+            let handle = pool.get_block_handle(block_idx).expect("get handle");
+
+            tiering
+                .evict_blocks(&pool, &[handle], 1)
+                .expect("evict");
+
+            // After eviction, the old handle should NOT be tracked by LRU
+            let victims = tiering.eviction_policy.select_victims(&[handle], 1);
+            assert!(victims.is_empty(),
+                "evicted block's old handle should not be tracked by policy");
+
+            // Restore — policy should be notified (on_access with new handle)
+            pool.restore_evicted_block(block_idx).expect("restore");
+
+            // The new handle should be tracked by policy (on_access)
+            let new_handle = pool.get_block_handle(block_idx).expect("get new handle");
+            let victims = tiering.eviction_policy.select_victims(&[new_handle], 1);
+            assert_eq!(victims.len(), 1,
+                "restored block's new handle should be tracked by policy");
+            assert_eq!(victims[0], new_handle);
+        }
+
+        #[test]
+        fn test_restore_data_integrity_roundtrip() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+
+            let block_idx = pool.alloc_block().expect("alloc block");
+            let handle = pool.get_block_handle(block_idx).expect("get handle");
+            let block_bytes = pool.block_bytes;
+            let num_elements = block_bytes / 2; // f16 = 2 bytes each
+
+            // Write a known pattern to the GPU block's layer-0 K cache
+            let pattern: Vec<u16> = (0..num_elements).map(|i| (i % 256) as u16).collect();
+            let gpu_va_k0 = pool.gpu_va_for_block(handle, 0, false).expect("va k0");
+            unsafe {
+                pool.streams.evict
+                    .memcpy_h2d_async(
+                        gpu_va_k0,
+                        pattern.as_ptr() as *const u8,
+                        block_bytes,
+                    )
+                    .expect("h2d memcpy");
+            }
+            pool.streams.evict.synchronize().expect("sync");
+
+            // Evict the block (GPU → CPU)
+            tiering
+                .evict_blocks(&pool, &[handle], 1)
+                .expect("evict");
+
+            // Restore the block (CPU → GPU)
+            pool.restore_evicted_block(block_idx).expect("restore");
+
+            // Read back from the NEW GPU location and verify data integrity
+            let new_handle = pool.get_block_handle(block_idx).expect("get new handle");
+            let new_gpu_va = pool.gpu_va_for_block(new_handle, 0, false).expect("va k0 new");
+
+            let mut readback: Vec<u16> = vec![0u16; num_elements];
+            unsafe {
+                pool.streams.restore.memcpy_d2h_async(
+                    readback.as_mut_ptr() as *mut u8,
+                    new_gpu_va,
+                    block_bytes,
+                )
+                .expect("d2h memcpy");
+            }
+            pool.streams.restore.synchronize().expect("sync");
+
+            assert_eq!(readback, pattern,
+                "restored GPU data should match the original pattern (full roundtrip)");
+        }
+
+        #[test]
+        fn test_restore_invalid_block_idx_errors() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+
+            let result = pool.restore_evicted_block(999);
+            assert!(result.is_err(), "restore on invalid block index should error");
+        }
+
+        #[test]
+        fn test_restore_evicting_block_errors() {
+            // This tests that the Evicting guard state is respected.
+            // We can't easily create an Evicting block without a race,
+            // but we can test that the error path exists for the variant.
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+
+            let block_idx = pool.alloc_block().expect("alloc block");
+            // Manually set to Evicting to simulate in-flight transfer
+            pool.set_block_location(block_idx, BlockLocation::Evicting)
+                .expect("set Evicting");
+
+            let result = pool.restore_evicted_block(block_idx);
+            assert!(result.is_err(), "restore on Evicting block should error");
+        }
+
+        #[test]
+        fn test_restore_restoring_block_errors() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+
+            let block_idx = pool.alloc_block().expect("alloc block");
+            // Manually set to Restoring to simulate concurrent restore
+            pool.set_block_location(block_idx, BlockLocation::Restoring)
+                .expect("set Restoring");
+
+            let result = pool.restore_evicted_block(block_idx);
+            assert!(result.is_err(), "restore on Restoring block should error");
         }
     }
 }

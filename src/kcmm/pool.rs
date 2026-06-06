@@ -8,6 +8,7 @@
 //   - Built-in fragmentation tracking
 
 use anyhow::{anyhow, Result};
+use cudarc::driver::sys::CUdeviceptr;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
@@ -199,7 +200,7 @@ impl KcmmPool {
 
         // Create tiering engine if enabled
         let tiering = if config.tiering {
-            Some(TieringEngine::new(&config)?)
+            Some(TieringEngine::new(&config, num_layers, block_bytes)?)
         } else {
             None
         };
@@ -299,7 +300,7 @@ impl KcmmPool {
     // --- Block allocation ---
 
     /// Allocate a single physical block across all per-layer pools.
-    fn alloc_one_block_internal(&self) -> Result<(usize, u32, u32)> {
+    pub(crate) fn alloc_one_block_internal(&self) -> Result<(usize, u32, u32)> {
         self.ensure_capacity()?;
 
         let num_layers = self.num_layers;
@@ -352,29 +353,39 @@ impl KcmmPool {
         };
         let location = BlockLocation::GpuResident(block_handle, va_offset as u64);
 
-        let mut free = self.free_block_indices.lock();
-        if let Some(idx) = free.pop() {
-            let mut info = self.block_info.lock();
-            info[idx as usize] = BlockInfo {
-                va_offset,
-                superblock_idx: sb_idx,
-                block_index_in_sb: blk_in_sb,
-                in_use: true,
-                location,
-            };
-            idx
-        } else {
-            let mut info = self.block_info.lock();
-            let idx = info.len() as u32;
-            info.push(BlockInfo {
-                va_offset,
-                superblock_idx: sb_idx,
-                block_index_in_sb: blk_in_sb,
-                in_use: true,
-                location,
-            });
-            idx
+        let idx = {
+            let mut free = self.free_block_indices.lock();
+            if let Some(recycled) = free.pop() {
+                let mut info = self.block_info.lock();
+                info[recycled as usize] = BlockInfo {
+                    va_offset,
+                    superblock_idx: sb_idx,
+                    block_index_in_sb: blk_in_sb,
+                    in_use: true,
+                    location,
+                };
+                recycled
+            } else {
+                let mut info = self.block_info.lock();
+                let new_idx = info.len() as u32;
+                info.push(BlockInfo {
+                    va_offset,
+                    superblock_idx: sb_idx,
+                    block_index_in_sb: blk_in_sb,
+                    in_use: true,
+                    location,
+                });
+                new_idx
+            }
+        };
+
+        // Register with the eviction policy so the tiering engine
+        // knows about this block for victim selection.
+        if let Some(ref tiering) = self.tiering {
+            tiering.eviction_policy.on_allocate(block_handle);
         }
+
+        idx
     }
 
     /// Allocate a single block. Returns the block index.
@@ -557,6 +568,198 @@ impl KcmmPool {
         info.get(block_idx as usize)
             .filter(|bi| bi.in_use)
             .map(|bi| bi.location.clone())
+    }
+
+    /// Get the `BlockHandle` for a logical block index.
+    pub fn get_block_handle(&self, block_idx: u32) -> Option<BlockHandle> {
+        let info = self.block_info.lock();
+        info.get(block_idx as usize)
+            .filter(|bi| bi.in_use)
+            .map(|bi| BlockHandle {
+                superblock_idx: bi.superblock_idx,
+                block_index: bi.block_index_in_sb,
+            })
+    }
+
+    /// Find the logical block index for a given `BlockHandle`.
+    pub fn find_block_idx(&self, handle: BlockHandle) -> Option<u32> {
+        let info = self.block_info.lock();
+        info.iter()
+            .position(|bi| {
+                bi.in_use
+                    && bi.superblock_idx == handle.superblock_idx
+                    && bi.block_index_in_sb == handle.block_index
+            })
+            .map(|i| i as u32)
+    }
+
+    /// Update the `BlockLocation` for a block.
+    ///
+    /// Returns an error if the block index is out of bounds or not in use.
+    pub fn set_block_location(&self, block_idx: u32, location: BlockLocation) -> Result<()> {
+        let mut info = self.block_info.lock();
+        let bi = info
+            .get_mut(block_idx as usize)
+            .ok_or_else(|| anyhow!("block_idx {} out of bounds", block_idx))?;
+        if !bi.in_use {
+            return Err(anyhow!("block_idx {} is not in use", block_idx));
+        }
+        bi.location = location;
+        Ok(())
+    }
+
+    /// Update the physical allocation fields for a block index.
+    ///
+    /// Used during `restore_block` when a new physical block is allocated
+    /// to replace the previously-evicted one.  The `BlockHandle` changes
+    /// because the new physical slot may be in a different superblock.
+    ///
+    /// Returns an error if the block index is out of bounds or not in use.
+    pub(crate) fn update_block_physical(
+        &self,
+        block_idx: u32,
+        va_offset: usize,
+        sb_idx: u32,
+        blk_in_sb: u32,
+    ) -> Result<()> {
+        let mut info = self.block_info.lock();
+        let bi = info
+            .get_mut(block_idx as usize)
+            .ok_or_else(|| anyhow!("block_idx {} out of bounds", block_idx))?;
+        if !bi.in_use {
+            return Err(anyhow!("block_idx {} is not in use", block_idx));
+        }
+        bi.va_offset = va_offset;
+        bi.superblock_idx = sb_idx;
+        bi.block_index_in_sb = blk_in_sb;
+        Ok(())
+    }
+
+    /// Restore an evicted block from CPU memory back to GPU.
+    ///
+    /// If the block is already `GpuResident`, this is a no-op and the
+    /// current VA offset is returned.  If the block is `CpuResident`,
+    /// the tiering engine allocates a new GPU physical block, copies
+    /// all K+V layer data from the CPU swap buffer to GPU, and marks
+    /// the block as `GpuResident`.
+    ///
+    /// Returns the GPU VA offset of the restored (or already-resident) block.
+    pub fn restore_evicted_block(&self, block_idx: u32) -> Result<u64> {
+        let tiering = self
+            .tiering
+            .as_ref()
+            .ok_or_else(|| anyhow!("tiering is disabled; cannot restore evicted block"))?;
+
+        // Extract the CPU offset (if CpuResident) without holding the lock
+        // across the call to tiering.restore_block — parking_lot::Mutex is
+        // not re-entrant and restore_block will lock block_info itself.
+        let cpu_offset = {
+            let info = self.block_info.lock();
+            let bi = info
+                .get(block_idx as usize)
+                .ok_or_else(|| anyhow!("block_idx {} out of bounds", block_idx))?;
+            if !bi.in_use {
+                return Err(anyhow!("block_idx {} is not in use", block_idx));
+            }
+            match &bi.location {
+                BlockLocation::CpuResident(offset) => Some(*offset),
+                BlockLocation::GpuResident(_, va_offset) => return Ok(*va_offset),
+                BlockLocation::Evicting | BlockLocation::Restoring => {
+                    return Err(anyhow!(
+                        "block {} is in transit ({:?}); cannot restore",
+                        block_idx,
+                        bi.location
+                    ));
+                }
+                BlockLocation::NvmeResident(_) => {
+                    return Err(anyhow!(
+                        "block {} is NVMe-resident; NVMe restore not yet implemented",
+                        block_idx
+                    ));
+                }
+            }
+        }; // lock dropped here
+
+        let cpu_offset =
+            cpu_offset.ok_or_else(|| anyhow!("block {} is not CpuResident", block_idx))?;
+        tiering.restore_block(self, block_idx, cpu_offset)?;
+
+        // Read back the new VA offset
+        let info = self.block_info.lock();
+        let bi = info.get(block_idx as usize).unwrap();
+        match &bi.location {
+            BlockLocation::GpuResident(_, va_offset) => Ok(*va_offset),
+            other => Err(anyhow!(
+                "restore did not result in GpuResident (got {:?})",
+                other
+            )),
+        }
+    }
+
+    /// Compute the byte offset of a block within each layer's VA region.
+    ///
+    /// All K/V pools across all layers are in lockstep — the same
+    /// `BlockHandle` maps to the same VA offset in every layer's VA region.
+    pub fn block_va_offset(&self, handle: BlockHandle) -> Result<usize> {
+        let sbs = self.k_pools[0].superblocks.lock();
+        let sb = sbs
+            .get(handle.superblock_idx as usize)
+            .ok_or_else(|| {
+                anyhow!(
+                    "superblock_idx {} out of bounds",
+                    handle.superblock_idx
+                )
+            })?;
+        Ok(sb.va_base + handle.block_index as usize * self.block_bytes)
+    }
+
+    /// Get the raw GPU virtual address for a block at a given layer and K/V split.
+    ///
+    /// `is_v` selects the V cache (`true`) or K cache (`false`).
+    pub fn gpu_va_for_block(
+        &self,
+        handle: BlockHandle,
+        layer: usize,
+        is_v: bool,
+    ) -> Result<CUdeviceptr> {
+        let va_offset = self.block_va_offset(handle)? as u64;
+        let va_base = if is_v {
+            self.va_v
+                .get(layer)
+                .ok_or_else(|| anyhow!("V layer {} out of bounds", layer))?
+        } else {
+            self.va_k
+                .get(layer)
+                .ok_or_else(|| anyhow!("K layer {} out of bounds", layer))?
+        };
+        Ok(*va_base + va_offset)
+    }
+
+    /// Release a block's physical GPU resources back to all per-layer allocators.
+    ///
+    /// After this call the block's physical slot may be re-used by a future
+    /// `alloc_one_block_internal`.  The logical block index remains in-use
+    /// (its `BlockLocation` should be updated to `CpuResident` or `NvmeResident`
+    /// before or after this call).
+    pub fn release_block_physical(&self, block_idx: u32) -> Result<()> {
+        let info = self.block_info.lock();
+        let bi = info
+            .get(block_idx as usize)
+            .ok_or_else(|| anyhow!("block_idx {} out of bounds", block_idx))?;
+        if !bi.in_use {
+            return Err(anyhow!("block_idx {} is not in use", block_idx));
+        }
+        let handle = BlockHandle {
+            superblock_idx: bi.superblock_idx,
+            block_index: bi.block_index_in_sb,
+        };
+
+        let num_layers = self.num_layers;
+        for l in 0..num_layers {
+            self.k_pools[l].allocator.free(handle);
+            self.v_pools[l].allocator.free(handle);
+        }
+        Ok(())
     }
 
     // --- VA accessors ---

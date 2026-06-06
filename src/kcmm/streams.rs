@@ -6,7 +6,7 @@
 // to overlap with the inference compute stream.
 
 use anyhow::{anyhow, Result};
-use cudarc::driver::sys;
+use cudarc::driver::sys::{self, CUdeviceptr};
 
 /// Wrapper around a CUDA stream for async operations.
 pub struct CudaStream {
@@ -43,6 +43,52 @@ impl CudaStream {
     pub fn is_done(&self) -> bool {
         let cu_result = unsafe { sys::lib().cuStreamQuery(self.inner) };
         cu_result == sys::CUresult::CUDA_SUCCESS
+    }
+
+    /// Asynchronous Device-to-Host memcpy (GPU → CPU) on this stream.
+    ///
+    /// # Safety
+    /// `dst` must point to a valid host buffer of at least `nbytes` bytes.
+    /// `src` must be a valid GPU virtual address.
+    pub unsafe fn memcpy_d2h_async(
+        &self,
+        dst: *mut u8,
+        src: CUdeviceptr,
+        nbytes: usize,
+    ) -> Result<()> {
+        let r = sys::lib().cuMemcpyDtoHAsync_v2(
+            dst as *mut std::ffi::c_void,
+            src,
+            nbytes,
+            self.inner,
+        );
+        if r != sys::CUresult::CUDA_SUCCESS {
+            return Err(anyhow!("cuMemcpyDtoHAsync failed: {:?}", r));
+        }
+        Ok(())
+    }
+
+    /// Asynchronous Host-to-Device memcpy (CPU → GPU) on this stream.
+    ///
+    /// # Safety
+    /// `src` must point to a valid host buffer of at least `nbytes` bytes.
+    /// `dst` must be a valid GPU virtual address.
+    pub unsafe fn memcpy_h2d_async(
+        &self,
+        dst: CUdeviceptr,
+        src: *const u8,
+        nbytes: usize,
+    ) -> Result<()> {
+        let r = sys::lib().cuMemcpyHtoDAsync_v2(
+            dst,
+            src as *const std::ffi::c_void,
+            nbytes,
+            self.inner,
+        );
+        if r != sys::CUresult::CUDA_SUCCESS {
+            return Err(anyhow!("cuMemcpyHtoDAsync failed: {:?}", r));
+        }
+        Ok(())
     }
 }
 
