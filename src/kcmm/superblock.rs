@@ -365,4 +365,96 @@ mod tests {
             "all blocks should be returned to free list");
         assert_eq!(alloc.total_blocks_allocated(), blocks_per_sb);
     }
+
+    // --- Multiple superblock index tests ---
+
+    #[test]
+    fn test_multiple_superblocks_correct_indices() {
+        let alloc = PhysicalBlockAllocator::new_with_block_bytes(65536);
+        // Add 3 superblocks
+        alloc.add_superblock();
+        alloc.add_superblock();
+        alloc.add_superblock();
+        assert_eq!(alloc.superblock_count(), 3);
+
+        // Allocate all blocks and track what superblock_idx values we see
+        let total_blocks = alloc.blocks_per_superblock * 3;
+        let mut seen_indices: Vec<u32> = Vec::new();
+        for _ in 0..total_blocks {
+            let h = alloc.try_allocate().expect("should have blocks");
+            seen_indices.push(h.superblock_idx);
+        }
+
+        // We should see all three superblock indices (0, 1, 2)
+        seen_indices.sort();
+        seen_indices.dedup();
+        assert_eq!(seen_indices, vec![0, 1, 2],
+            "should have blocks from superblocks 0, 1, and 2");
+
+        // Verify total_blocks_allocated is correct
+        assert_eq!(alloc.total_blocks_allocated(), total_blocks);
+    }
+
+    #[test]
+    fn test_multiple_superblocks_sequential_allocation() {
+        let alloc = PhysicalBlockAllocator::new_with_block_bytes(65536);
+        let bps = alloc.blocks_per_superblock;
+
+        // Add first superblock and exhaust it
+        alloc.add_superblock();
+        let first_batch: Vec<_> = (0..bps).map(|_| alloc.try_allocate().unwrap()).collect();
+        assert!(alloc.try_allocate().is_none(), "should be exhausted");
+        assert_eq!(alloc.superblock_count(), 1);
+        assert!(first_batch.iter().all(|h| h.superblock_idx == 0));
+
+        // Add second superblock
+        alloc.add_superblock();
+        let second_batch: Vec<_> = (0..bps).map(|_| alloc.try_allocate().unwrap()).collect();
+        assert!(second_batch.iter().all(|h| h.superblock_idx == 1));
+        assert_eq!(alloc.superblock_count(), 2);
+
+        // Free some from first batch and re-allocate — should get them back
+        for h in &first_batch[..10] {
+            alloc.free(*h);
+        }
+        let reclaimed: Vec<_> = (0..10).map(|_| alloc.try_allocate().unwrap()).collect();
+        assert!(reclaimed.iter().all(|h| h.superblock_idx == 0),
+            "reclaimed blocks should be from superblock 0");
+    }
+
+    // --- Handle reuse LIFO ordering test ---
+
+    #[test]
+    fn test_handle_reuse_lifo_order() {
+        let alloc = PhysicalBlockAllocator::new_with_block_bytes(65536);
+        alloc.add_superblock();
+
+        let h1 = alloc.try_allocate().unwrap();
+        let h2 = alloc.try_allocate().unwrap();
+
+        // Free h1 then h2
+        alloc.free(h1);
+        alloc.free(h2);
+
+        // Re-allocate: should get h2 back first (LIFO — last pushed = first popped)
+        let r1 = alloc.try_allocate().unwrap();
+        let r2 = alloc.try_allocate().unwrap();
+        assert_eq!(r1, h2, "LIFO: last freed (h2) should be returned first");
+        assert_eq!(r2, h1, "LIFO: first freed (h1) should be returned second");
+    }
+
+    // --- Misaligned block_bytes test for new() ---
+
+    #[test]
+    fn test_new_rejects_misaligned_block_bytes() {
+        // 2 MiB / odd_block_bytes → not evenly divisible
+        // SUPERBLOCK_SIZE = 2 * 1024 * 1024 = 2,097,152
+        // Choose 3 * 2 * 1000 = 6000 bytes → 2,097,152 % 6000 = 1,152 ≠ 0
+        let odd_bytes = 6000;
+        let result = std::panic::catch_unwind(|| {
+            PhysicalBlockAllocator::new_with_block_bytes(odd_bytes);
+        });
+        assert!(result.is_err(),
+            "block_bytes not dividing superblock evenly should panic");
+    }
 }

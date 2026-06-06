@@ -251,4 +251,128 @@ mod tests {
         vmm.release_physical(phys).expect("release");
         vmm.free_address(va, 2 * 1024 * 1024).expect("free");
     }
+
+    #[test]
+    fn test_vmm_multiple_va_regions() {
+        let vmm = CudaVmm::new(0).expect("cuda init");
+        let size = 2 * 1024 * 1024;
+
+        let va1 = vmm.reserve_address(size).expect("reserve 1");
+        let va2 = vmm.reserve_address(size).expect("reserve 2");
+        assert_ne!(va1, va2, "VA regions should be distinct");
+
+        vmm.free_address(va1, size).expect("free 1");
+        vmm.free_address(va2, size).expect("free 2");
+    }
+
+    // Note: cuMemMap with non-zero physical offset AND sub-2MiB mapping sizes
+    // are not supported on this GPU/driver (CUDA_ERROR_NOT_SUPPORTED).
+    // This aligns with production: map_superblock_to_layer always maps
+    // full 2 MiB superblocks with phys_offset=0.
+
+    #[test]
+    fn test_vmm_va_offset_map() {
+        // Map a physical handle at a non-zero VA offset within the VA region.
+        // This verifies that VA offsets work (different superblock positions).
+        let vmm = CudaVmm::new(0).expect("cuda init");
+        let sb = 2 * 1024 * 1024; // 2 MiB superblock
+        let va = vmm.reserve_address(sb * 2).expect("reserve");
+        let phys = vmm.create_physical(sb).expect("create");
+
+        // Map physical at VA offset `sb` (second 2 MiB slot within the 4 MiB VA)
+        vmm.map(va, sb, phys, 0, sb).expect("map at VA offset");
+        vmm.unmap(va, sb, sb).expect("unmap");
+
+        vmm.release_physical(phys).expect("release");
+        vmm.free_address(va, sb * 2).expect("free");
+    }
+
+    #[test]
+    fn test_vmm_superblock_lifecycle_per_layer() {
+        // Mimics the real superblock mapping pattern used by PagedKvCache:
+        // one 2 MiB physical handle → mapped at VA offset 0 into each layer's
+        // K and V VA regions.
+        let vmm = CudaVmm::new(0).expect("cuda init");
+        let sb = 2 * 1024 * 1024; // 2 MiB
+        let num_layers = 4;
+
+        let va_k: Vec<u64> = (0..num_layers)
+            .map(|_| vmm.reserve_address(sb).expect("reserve K"))
+            .collect();
+        let va_v: Vec<u64> = (0..num_layers)
+            .map(|_| vmm.reserve_address(sb).expect("reserve V"))
+            .collect();
+
+        let phys = vmm.create_physical(sb).expect("create");
+
+        // Map into each layer
+        for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
+            vmm.map(vk, 0, phys, 0, sb).expect("map K");
+            vmm.map(vv, 0, phys, 0, sb).expect("map V");
+        }
+
+        // Unmap from each layer
+        for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
+            vmm.unmap(vk, 0, sb).expect("unmap K");
+            vmm.unmap(vv, 0, sb).expect("unmap V");
+        }
+
+        vmm.release_physical(phys).expect("release");
+        for va in va_k.iter().chain(va_v.iter()) {
+            vmm.free_address(*va, sb).expect("free");
+        }
+    }
+
+    #[test]
+    fn test_vmm_two_superblock_positions_per_layer() {
+        // Map 2 MiB physical superblocks at two different VA positions
+        // (sb_idx 0 and sb_idx 1) within each layer's VA region.
+        let vmm = CudaVmm::new(0).expect("cuda init");
+        let sb = 2 * 1024 * 1024; // 2 MiB
+        let num_layers = 2;
+
+        // Reserve 2 superblock slots per layer: 4 MiB of VA per layer
+        let va_k: Vec<u64> = (0..num_layers)
+            .map(|_| vmm.reserve_address(sb * 2).expect("reserve K"))
+            .collect();
+        let va_v: Vec<u64> = (0..num_layers)
+            .map(|_| vmm.reserve_address(sb * 2).expect("reserve V"))
+            .collect();
+
+        let phys1 = vmm.create_physical(sb).expect("create phys1");
+        let phys2 = vmm.create_physical(sb).expect("create phys2");
+
+        // Map phys1 at VA offset 0, phys2 at VA offset sb
+        for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
+            vmm.map(vk, 0, phys1, 0, sb).expect("map sb0 K");
+            vmm.map(vv, 0, phys1, 0, sb).expect("map sb0 V");
+            vmm.map(vk, sb, phys2, 0, sb).expect("map sb1 K");
+            vmm.map(vv, sb, phys2, 0, sb).expect("map sb1 V");
+        }
+
+        // Unmap all
+        for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
+            vmm.unmap(vk, 0, sb).expect("unmap sb0 K");
+            vmm.unmap(vv, 0, sb).expect("unmap sb0 V");
+            vmm.unmap(vk, sb, sb).expect("unmap sb1 K");
+            vmm.unmap(vv, sb, sb).expect("unmap sb1 V");
+        }
+
+        vmm.release_physical(phys1).expect("release1");
+        vmm.release_physical(phys2).expect("release2");
+        for va in va_k.iter().chain(va_v.iter()) {
+            vmm.free_address(*va, sb * 2).expect("free");
+        }
+    }
+
+    #[test]
+    fn test_vmm_reserve_aligned_size() {
+        let vmm = CudaVmm::new(0).expect("cuda init");
+        // Request a non-aligned size — reserve_address should align up to 2 MiB
+        let size = 1_000_000; // not 2 MiB aligned
+        let va = vmm.reserve_address(size).expect("reserve");
+        assert!(va > 0);
+        let aligned = align_up(size, 2 * 1024 * 1024);
+        vmm.free_address(va, aligned).expect("free");
+    }
 }

@@ -761,4 +761,313 @@ mod tests {
         assert_eq!(max_blocks_total, 1024);
     }
 
+    // --- GPU-dependent lifecycle tests ---
+
+    mod gpu {
+        use super::*;
+        use crate::cuda::CudaContext;
+
+        fn make_cache() -> (Arc<CudaContext>, PagedKvCache) {
+            let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+            let cfg = ModelConfig::tiny_llama();
+            let cache = PagedKvCache::new(ctx.clone(), cfg, 8, 128, 16)
+                .expect("create PagedKvCache");
+            (ctx, cache)
+        }
+
+        #[test]
+        fn test_cache_construction() {
+            let (_, cache) = make_cache();
+            assert_eq!(cache.block_size, 16);
+            assert_eq!(cache.max_batch, 8);
+            assert_eq!(cache.max_seq_len, 128);
+            assert_eq!(cache.max_blocks_per_seq, 8); // 128/16
+            assert_eq!(cache.max_blocks_total, 64); // 8 * 8
+            assert_eq!(cache.active_sequences(), 0);
+            assert_eq!(cache.blocks_in_use(), 0);
+            assert_eq!(cache.total_blocks(), 0);
+            assert_eq!(cache.total_physical_blocks(), 0);
+            assert!(!cache.has_free_blocks());
+            assert_eq!(cache.free_physical_blocks(), 0);
+        }
+
+        #[test]
+        fn test_alloc_single_block() {
+            let (_, cache) = make_cache();
+            let block_idx = cache.alloc_block().expect("alloc single block");
+            assert_eq!(cache.blocks_in_use(), 1);
+            assert_eq!(cache.total_blocks(), 1);
+
+            let va = cache.get_block_va_offset(block_idx);
+            assert!(va.is_some());
+            assert!(va.unwrap() > 0);
+        }
+
+        #[test]
+        fn test_alloc_sequence_multiple_blocks() {
+            let (_, cache) = make_cache();
+            let num_blocks = 5;
+            let table = cache.alloc_sequence(num_blocks).expect("alloc sequence");
+            assert_eq!(table.len(), num_blocks);
+            assert_eq!(cache.blocks_in_use(), num_blocks);
+            assert_eq!(cache.total_blocks(), num_blocks);
+
+            // Each block should have a valid VA offset
+            for &idx in &table {
+                assert!(cache.get_block_va_offset(idx).is_some(),
+                    "block {} should have VA offset", idx);
+            }
+
+            // All indices should be distinct
+            let mut sorted = table.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), num_blocks, "all block indices should be distinct");
+        }
+
+        #[test]
+        fn test_register_and_unregister_sequence() {
+            let (_, cache) = make_cache();
+            let table = cache.alloc_sequence(3).expect("alloc");
+            let seq_idx = cache.register_sequence(table.clone());
+            assert_eq!(cache.active_sequences(), 1);
+            assert_eq!(cache.seq_block_count(seq_idx), 3);
+
+            cache.unregister_sequence(seq_idx);
+            assert_eq!(cache.active_sequences(), 1); // seq_metadata still holds the slot
+            // Blocks should be freed
+            assert_eq!(cache.blocks_in_use(), 0);
+        }
+
+        #[test]
+        fn test_update_seq_len_and_get_seq_len() {
+            let (_, cache) = make_cache();
+            let table = cache.alloc_sequence(2).expect("alloc");
+            let seq_idx = cache.register_sequence(table);
+            assert_eq!(cache.get_seq_len(seq_idx), 0);
+
+            cache.update_seq_len(seq_idx, 32);
+            assert_eq!(cache.get_seq_len(seq_idx), 32);
+
+            cache.update_seq_len(seq_idx, 16);
+            assert_eq!(cache.get_seq_len(seq_idx), 16);
+        }
+
+        #[test]
+        fn test_get_seq_len_invalid_index() {
+            let (_, cache) = make_cache();
+            assert_eq!(cache.get_seq_len(999), 0);
+            assert_eq!(cache.seq_block_count(999), 0);
+            assert!(cache.get_block_table(999).is_none());
+        }
+
+        #[test]
+        fn test_get_block_va_offset_invalid_index() {
+            let (_, cache) = make_cache();
+            assert_eq!(cache.get_block_va_offset(999), None);
+        }
+
+        #[test]
+        fn test_free_sequence_returns_blocks_to_pool() {
+            let (_, cache) = make_cache();
+            let table = cache.alloc_sequence(4).expect("alloc");
+            assert_eq!(cache.blocks_in_use(), 4);
+
+            cache.free_sequence(&table);
+            assert_eq!(cache.blocks_in_use(), 0);
+
+            // After freeing, re-allocating should reuse indices
+            let new_table = cache.alloc_sequence(2).expect("re-alloc");
+            assert_eq!(cache.blocks_in_use(), 2);
+            assert!(new_table.iter().all(|&idx| idx < 4),
+                "re-alloc should reuse freed indices: got {:?}", new_table);
+        }
+
+        #[test]
+        fn test_append_block_to_sequence() {
+            let (_, cache) = make_cache();
+            let table = cache.alloc_sequence(2).expect("alloc");
+            let seq_idx = cache.register_sequence(table);
+            assert_eq!(cache.seq_block_count(seq_idx), 2);
+
+            let new_block = cache.alloc_block().expect("alloc extra block");
+            cache.append_block_to_sequence(seq_idx, new_block);
+            assert_eq!(cache.seq_block_count(seq_idx), 3);
+        }
+
+        #[test]
+        fn test_get_block_table() {
+            let (_, cache) = make_cache();
+            let table = vec![5u32, 10, 15];
+            let seq_idx = cache.register_sequence(table.clone());
+            let retrieved = cache.get_block_table(seq_idx).expect("should have table");
+            assert_eq!(retrieved, table);
+        }
+
+        #[test]
+        fn test_alloc_many_blocks_across_superblocks() {
+            // Use a larger config to get a VA region big enough for multiple
+            // superblock positions (each requires 2 MiB of VA space).
+            let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+            let cfg = ModelConfig::tiny_llama();
+            // max_seq_len=16384 → max_blocks_per_seq=1024. max_batch=2 → 2048 blocks.
+            // block_bytes=8192, so va_size = 2048*8192 = 16 MiB → fits 8 superblocks.
+            let cache = PagedKvCache::new(ctx, cfg, 2, 16384, 16)
+                .expect("create cache with large VA");
+
+            let sb_blocks = cache.blocks_per_superblock();
+            assert!(sb_blocks > 0);
+
+            // Fill first superblock, then allocate more to trigger ensure_capacity
+            let count = sb_blocks + 10; // force a second superblock
+            let table = cache.alloc_sequence(count).expect("alloc many blocks");
+            assert_eq!(table.len(), count);
+            assert!(cache.superblock_count() >= 2,
+                "should have at least 2 superblocks, got {}", cache.superblock_count());
+
+            for &idx in &table {
+                assert!(cache.get_block_va_offset(idx).is_some());
+            }
+
+            cache.free_sequence(&table);
+            assert_eq!(cache.blocks_in_use(), 0);
+        }
+
+        #[test]
+        fn test_lockstep_invariant_across_layers() {
+            // Verify that all per-layer K and V pools remain in lockstep:
+            // they should always have the same free_count and superblock_count.
+            let (_, cache) = make_cache();
+            let num_layers = cache.cfg.num_hidden_layers;
+
+            // Allocate some blocks
+            let table = cache.alloc_sequence(10).expect("alloc");
+            for l in 1..num_layers {
+                assert_eq!(
+                    cache.k_pools[0].allocator.free_count(),
+                    cache.k_pools[l].allocator.free_count(),
+                    "K pool layer {} free_count diverged from layer 0", l
+                );
+                assert_eq!(
+                    cache.v_pools[0].allocator.free_count(),
+                    cache.v_pools[l].allocator.free_count(),
+                    "V pool layer {} free_count diverged from layer 0", l
+                );
+                assert_eq!(
+                    cache.k_pools[0].allocator.superblock_count(),
+                    cache.k_pools[l].allocator.superblock_count(),
+                    "K pool layer {} superblock_count diverged", l
+                );
+            }
+
+            cache.free_sequence(&table);
+            for l in 1..num_layers {
+                assert_eq!(
+                    cache.k_pools[0].allocator.free_count(),
+                    cache.k_pools[l].allocator.free_count()
+                );
+            }
+        }
+
+        #[test]
+        fn test_stats_accurate() {
+            let (_, cache) = make_cache();
+            let table = cache.alloc_sequence(4).expect("alloc");
+            let seq_idx = cache.register_sequence(table.clone());
+            cache.update_seq_len(seq_idx, 50);
+
+            let stats = cache.stats();
+            assert_eq!(stats.active_sequences, 1);
+            assert_eq!(stats.blocks_in_use, 4);
+            assert!(stats.total_blocks_allocated >= 4);
+            assert_eq!(stats.total_tokens_stored, 50);
+            assert!(stats.block_bytes > 0);
+            assert!(stats.physical_memory_mib > 0.0);
+
+            cache.free_sequence(&table);
+            let after = cache.stats();
+            assert_eq!(after.blocks_in_use, 0);
+        }
+
+        #[test]
+        fn test_internal_fragmentation_zero_when_full() {
+            let (_, cache) = make_cache();
+            let table = cache.alloc_sequence(8).expect("alloc");
+            let seq_idx = cache.register_sequence(table.clone());
+            cache.update_seq_len(seq_idx, 128); // exactly 8 * 16
+
+            let frag = cache.internal_fragmentation();
+            assert!((frag - 0.0).abs() < 0.001,
+                "full blocks should have 0 fragmentation, got {}", frag);
+
+            cache.free_sequence(&table);
+        }
+
+        #[test]
+        fn test_internal_fragmentation_nonzero_with_partial() {
+            let (_, cache) = make_cache();
+            let table = cache.alloc_sequence(3).expect("alloc");
+            let seq_idx = cache.register_sequence(table.clone());
+            cache.update_seq_len(seq_idx, 20); // 3*16=48 slots, 20 used → (48-20)/48 = 0.583
+
+            let frag = cache.internal_fragmentation();
+            assert!(frag > 0.0, "partial block should have fragmentation > 0");
+            assert!(frag < 1.0, "fragmentation should be < 1.0");
+
+            cache.free_sequence(&table);
+        }
+
+        #[test]
+        fn test_physical_idle_ratio() {
+            let (_, cache) = make_cache();
+            let table = cache.alloc_sequence(10).expect("alloc");
+
+            let ratio = cache.physical_idle_ratio();
+            // After allocating some blocks from a superblock, some blocks are idle
+            assert!(ratio >= 0.0 && ratio <= 1.0,
+                "physical_idle_ratio should be in [0,1], got {}", ratio);
+
+            cache.free_sequence(&table);
+        }
+
+        #[test]
+        fn test_has_free_blocks_after_alloc_and_free() {
+            let (_, cache) = make_cache();
+            assert!(!cache.has_free_blocks());
+
+            let table = cache.alloc_sequence(8).expect("alloc");
+            assert_eq!(cache.free_physical_blocks(), cache.k_pools[0].allocator.free_count());
+
+            cache.free_sequence(&table);
+            // After freeing, there may be free blocks if alloc didn't consume all
+            let free = cache.free_physical_blocks();
+            let total = cache.total_physical_blocks();
+            assert_eq!(free, total, "after freeing all, free should equal total");
+        }
+
+        #[test]
+        fn test_va_k_and_va_v_nonzero() {
+            let (_, cache) = make_cache();
+            let num_layers = cache.cfg.num_hidden_layers;
+            for l in 0..num_layers {
+                assert!(cache.va_k(l) > 0, "va_k layer {} should be non-zero", l);
+                assert!(cache.va_v(l) > 0, "va_v layer {} should be non-zero", l);
+            }
+        }
+
+        #[test]
+        fn test_get_all_block_offsets_f16() {
+            let (_, cache) = make_cache();
+            let table = cache.alloc_sequence(3).expect("alloc");
+            let offsets = cache.get_all_block_offsets_f16();
+            assert_eq!(offsets.len(), cache.total_blocks());
+            // Active blocks should have non-zero offsets
+            for &idx in &table {
+                assert!(offsets[idx as usize] > 0,
+                    "active block {} should have non-zero f16 offset", idx);
+            }
+            cache.free_sequence(&table);
+        }
+    }
+
 }

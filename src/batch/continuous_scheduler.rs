@@ -733,4 +733,209 @@ mod integration_tests {
         );
         assert_eq!(resp.generated_tokens[0], 0);
     }
+
+    /// Test that the scheduler handles multiple requests correctly by
+    /// submitting several requests and verifying all complete.
+    #[test]
+    fn e2e_multiple_requests() {
+        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+        let cfg = small_config();
+        let max_batch = 4;
+        let max_seq_len = 64;
+        let block_size = 16;
+
+        let weights = ModelWeights::empty(&cfg);
+        let model = Arc::new(
+            NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights).expect("model"),
+        );
+
+        let cache = PagedKvCache::new(
+            ctx.clone(),
+            cfg.clone(),
+            max_batch,
+            max_seq_len,
+            block_size,
+        )
+        .expect("PagedKvCache");
+
+        let queue = Arc::new(InferenceQueue::new());
+
+        let stats = StatsHandle::new();
+        let sched = ContinuousScheduler::new(
+            cfg.clone(),
+            ctx.clone(),
+            model,
+            cache,
+            max_batch,
+            max_seq_len,
+            queue.clone(),
+            stats,
+        );
+        let _h = sched.spawn();
+
+        // Submit 4 requests concurrently
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let q = queue.clone();
+            handles.push(std::thread::spawn(move || {
+                let req = InferenceRequest {
+                    id: 300 + i,
+                    prompt_tokens: vec![1, 2, 3],
+                    max_new_tokens: 3,
+                    eos_token_id: 2,
+                };
+                q.submit_blocking(req).expect("response")
+            }));
+        }
+
+        for h in handles {
+            let resp = h.join().unwrap();
+            assert_eq!(resp.generated_tokens.len(), 3);
+            assert!(resp.generated_tokens.iter().all(|&t| t == 0));
+        }
+    }
+
+    /// Test the LRU victim selection logic in isolation.
+    #[test]
+    #[allow(unused_mut)]
+    fn test_select_victim_logic() {
+        // We can test select_victim by creating a scheduler with no cache needed
+        // and directly calling select_victim on manually crafted RunningRequests.
+        // Since select_victim only looks at seq_last_epoch and num_blocks,
+        // we can test it without a real cache.
+        let cfg = small_config();
+        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+        let weights = ModelWeights::empty(&cfg);
+        let model = Arc::new(
+            NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights).expect("model"),
+        );
+        let cache = PagedKvCache::new(ctx.clone(), cfg.clone(), 4, 64, 16)
+            .expect("PagedKvCache");
+        let queue = Arc::new(InferenceQueue::new());
+        let stats = StatsHandle::new();
+
+        let mut sched = ContinuousScheduler::new(
+            cfg, ctx, model, cache, 4, 64, queue, stats,
+        );
+
+        // Create mock running requests
+        let req_base = InferenceRequest {
+            id: 0,
+            prompt_tokens: vec![1],
+            max_new_tokens: 10,
+            eos_token_id: 2,
+        };
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+
+        let running = vec![
+            RunningRequest {
+                req: InferenceRequest { id: 10, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Decode,
+                position: 0,
+                seq_idx: 100,
+                num_blocks: 3,
+                generated: vec![],
+            },
+            RunningRequest {
+                req: InferenceRequest { id: 20, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Decode,
+                position: 0,
+                seq_idx: 200,
+                num_blocks: 5,
+                generated: vec![],
+            },
+            RunningRequest {
+                req: InferenceRequest { id: 30, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Prefill { prompt_pos: 0 },
+                position: 0,
+                seq_idx: 300,
+                num_blocks: 2,
+                generated: vec![],
+            },
+        ];
+
+        // All have epoch 0 (not in seq_last_epoch → default 0)
+        // seq 100: 3 blocks, seq 200: 5 blocks
+        // Both decode-stage, same epoch → larger block count (200) preferred
+        let victim = sched.select_victim(&running);
+        assert!(victim.is_some());
+        let idx = victim.unwrap();
+        assert_eq!(idx, 1, "should pick seq 200 (more blocks, same epoch)");
+
+        // Give seq 100 a newer epoch → seq 200 (epoch 0) is now older
+        sched.seq_last_epoch.insert(100, 10);
+        let victim2 = sched.select_victim(&running);
+        assert_eq!(victim2, Some(1), "should pick seq 200 (older epoch 0)");
+
+        // Both decode sequences with newer epoch, victim should be seq 200 (epoch 0)
+        sched.seq_last_epoch.insert(200, 5);
+        let victim3 = sched.select_victim(&running);
+        assert_eq!(victim3, Some(1), "should pick seq 200 (epoch 5 < epoch 10)");
+
+        // No decode-stage → falls back to any sequence.
+        // Reconstruct a prefill-only running list using index lookup.
+        let victim4 = sched.select_victim(&running[2..3]);
+        assert_eq!(victim4, Some(0), "should fall back to prefill-only sequence");
+
+        // Empty running → None
+        let victim5 = sched.select_victim(&[]);
+        assert!(victim5.is_none());
+    }
+
+    /// Test that prefill-stage sequences are skipped during victim selection
+    /// when decode-stage sequences exist.
+    #[test]
+    #[allow(unused_mut)]
+    fn test_select_victim_skips_prefill() {
+        let cfg = small_config();
+        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+        let weights = ModelWeights::empty(&cfg);
+        let model = Arc::new(
+            NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights).expect("model"),
+        );
+        let cache = PagedKvCache::new(ctx.clone(), cfg.clone(), 4, 64, 16)
+            .expect("PagedKvCache");
+        let queue = Arc::new(InferenceQueue::new());
+        let stats = StatsHandle::new();
+
+        let mut sched = ContinuousScheduler::new(
+            cfg, ctx, model, cache, 4, 64, queue, stats,
+        );
+
+        let req_base = InferenceRequest {
+            id: 0,
+            prompt_tokens: vec![1],
+            max_new_tokens: 10,
+            eos_token_id: 2,
+        };
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+
+        let running = vec![
+            RunningRequest {
+                req: InferenceRequest { id: 50, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Prefill { prompt_pos: 0 },
+                position: 0,
+                seq_idx: 50,
+                num_blocks: 10, // many blocks, but in prefill → should be skipped
+                generated: vec![],
+            },
+            RunningRequest {
+                req: InferenceRequest { id: 60, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Decode,
+                position: 0,
+                seq_idx: 60,
+                num_blocks: 1, // few blocks, but in decode → should be selected
+                generated: vec![],
+            },
+        ];
+
+        // seq 60 has epoch 0 (default), seq 50 has epoch 0 but is prefill
+        let victim = sched.select_victim(&running);
+        assert_eq!(victim, Some(1), "should pick decode-stage seq 60, not prefill seq 50");
+    }
 }

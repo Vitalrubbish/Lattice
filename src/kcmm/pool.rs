@@ -1050,4 +1050,309 @@ mod tests {
         t1.join().expect("install thread panicked");
         t2.join().expect("free thread panicked");
     }
+
+    // --- GPU-dependent KcmmPool lifecycle tests ---
+
+    mod gpu {
+        use super::*;
+        use crate::cuda::CudaContext;
+
+        fn make_pool() -> (Arc<CudaContext>, KcmmPool) {
+            let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+            let config = KcmmConfig {
+                block_size: 16,
+                max_blocks: 1024,
+                cpu_cache_path: String::new(),
+                tiering: false,
+                eviction_policy: "lru".to_string(),
+                prefetch_window: 4,
+            };
+            let pool = KcmmPool::new(
+                ctx.clone(),
+                config,
+                22,  // num_layers (matching tiny_llama)
+                4,   // kv_heads
+                64,  // head_dim
+                8,   // max_batch
+                128, // max_seq_len
+            )
+            .expect("create KcmmPool");
+            (ctx, pool)
+        }
+
+        #[test]
+        fn test_pool_construction() {
+            let (_, pool) = make_pool();
+            assert_eq!(pool.block_size, 16);
+            assert_eq!(pool.max_batch, 8);
+            assert_eq!(pool.max_seq_len, 128);
+            assert_eq!(pool.num_layers, 22);
+            assert_eq!(pool.max_blocks_per_seq, 8); // 128/16
+            assert_eq!(pool.max_blocks_total, 64); // 8*8
+            assert_eq!(pool.active_sequences(), 0);
+            assert_eq!(pool.blocks_in_use(), 0);
+            assert_eq!(pool.total_blocks(), 0);
+            assert!(!pool.has_free_blocks());
+            assert!(pool.tiering.is_none()); // tiering disabled
+            assert!(pool.sharing.is_none()); // step 3: no sharing
+        }
+
+        #[test]
+        fn test_alloc_single_block() {
+            let (_, pool) = make_pool();
+            let block_idx = pool.alloc_block().expect("alloc block");
+            assert_eq!(pool.blocks_in_use(), 1);
+            assert_eq!(pool.total_blocks(), 1);
+
+            let va = pool.get_block_va_offset(block_idx);
+            assert!(va.is_some());
+            assert!(va.unwrap() > 0);
+        }
+
+        #[test]
+        fn test_alloc_sequence() {
+            let (_, pool) = make_pool();
+            let table = pool.alloc_sequence(5).expect("alloc sequence");
+            assert_eq!(table.len(), 5);
+            assert_eq!(pool.blocks_in_use(), 5);
+
+            for &idx in &table {
+                assert!(pool.get_block_va_offset(idx).is_some());
+            }
+        }
+
+        #[test]
+        fn test_register_and_unregister() {
+            let (_, pool) = make_pool();
+            let table = pool.alloc_sequence(3).expect("alloc");
+            let seq_idx = pool.register_sequence(table.clone());
+            assert_eq!(pool.active_sequences(), 1);
+            assert_eq!(pool.get_seq_len(seq_idx), 0);
+
+            pool.update_seq_len(seq_idx, 45);
+            assert_eq!(pool.get_seq_len(seq_idx), 45);
+
+            pool.unregister_sequence(seq_idx);
+            assert_eq!(pool.blocks_in_use(), 0);
+        }
+
+        #[test]
+        fn test_append_block_to_sequence() {
+            let (_, pool) = make_pool();
+            let table = pool.alloc_sequence(2).expect("alloc");
+            let seq_idx = pool.register_sequence(table);
+            assert_eq!(pool.get_block_table(seq_idx).unwrap().len(), 2);
+
+            let new_block = pool.alloc_block().expect("alloc extra");
+            pool.append_block_to_sequence(seq_idx, new_block);
+            assert_eq!(pool.get_block_table(seq_idx).unwrap().len(), 3);
+        }
+
+        #[test]
+        fn test_touch_and_cool() {
+            let (_, pool) = make_pool();
+            let table = pool.alloc_sequence(2).expect("alloc");
+            let seq_idx = pool.register_sequence(table);
+
+            assert!(pool.is_active(seq_idx));
+
+            pool.cool(seq_idx);
+            assert!(!pool.is_active(seq_idx));
+
+            pool.touch(seq_idx);
+            assert!(pool.is_active(seq_idx));
+        }
+
+        #[test]
+        fn test_touch_and_cool_out_of_bounds() {
+            let (_, pool) = make_pool();
+            // Should not panic on invalid indices
+            pool.touch(999);
+            pool.cool(999);
+        }
+
+        #[test]
+        fn test_update_seq_len_out_of_bounds() {
+            let (_, pool) = make_pool();
+            // Should not panic on invalid index
+            pool.update_seq_len(999, 42);
+            assert_eq!(pool.get_seq_len(999), 0);
+        }
+
+        #[test]
+        fn test_unregister_out_of_bounds() {
+            let (_, pool) = make_pool();
+            // Should not panic on invalid index
+            pool.unregister_sequence(999);
+        }
+
+        #[test]
+        fn test_get_block_va_offsets() {
+            let (_, pool) = make_pool();
+            let table = pool.alloc_sequence(4).expect("alloc");
+            let seq_idx = pool.register_sequence(table);
+
+            let offsets = pool.get_block_va_offsets(seq_idx);
+            assert!(offsets.is_some());
+            let offsets = offsets.unwrap();
+            assert_eq!(offsets.len(), 4);
+            // All offsets should be distinct and non-zero
+            for o in &offsets {
+                assert!(*o > 0, "VA offset should be positive");
+            }
+            let mut sorted = offsets.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), 4);
+        }
+
+        #[test]
+        fn test_get_block_va_offsets_invalid_seq() {
+            let (_, pool) = make_pool();
+            assert_eq!(pool.get_block_va_offsets(999), None);
+        }
+
+        #[test]
+        fn test_get_block_location_gpu_resident() {
+            let (_, pool) = make_pool();
+            let block_idx = pool.alloc_block().expect("alloc");
+
+            let loc = pool.get_block_location(block_idx);
+            assert!(loc.is_some());
+            assert!(matches!(loc.unwrap(), BlockLocation::GpuResident(_, _)));
+        }
+
+        #[test]
+        fn test_get_block_location_invalid_index() {
+            let (_, pool) = make_pool();
+            assert!(pool.get_block_location(999).is_none());
+        }
+
+        #[test]
+        fn test_va_k_and_va_v() {
+            let (_, pool) = make_pool();
+            for l in 0..22 {
+                assert!(pool.va_k(l) > 0, "va_k layer {} zero", l);
+                assert!(pool.va_v(l) > 0, "va_v layer {} zero", l);
+            }
+        }
+
+        #[test]
+        fn test_blocks_in_use_and_total() {
+            let (_, pool) = make_pool();
+            assert_eq!(pool.blocks_in_use(), 0);
+            assert_eq!(pool.total_blocks(), 0);
+
+            let t1 = pool.alloc_sequence(3).expect("alloc");
+            assert_eq!(pool.blocks_in_use(), 3);
+            assert_eq!(pool.total_blocks(), 3);
+
+            let t2 = pool.alloc_sequence(5).expect("alloc");
+            assert_eq!(pool.blocks_in_use(), 8);
+            assert_eq!(pool.total_blocks(), 8);
+
+            pool.free_sequence(&t1);
+            assert_eq!(pool.blocks_in_use(), 5);
+            // total_blocks stays 8 (indices are recycled, not removed)
+            assert_eq!(pool.total_blocks(), 8);
+
+            pool.free_sequence(&t2);
+            assert_eq!(pool.blocks_in_use(), 0);
+        }
+
+        #[test]
+        fn test_collect_metrics() {
+            let (_, pool) = make_pool();
+            let table = pool.alloc_sequence(4).expect("alloc");
+            let seq_idx = pool.register_sequence(table.clone());
+            pool.update_seq_len(seq_idx, 50);
+
+            let metrics = pool.collect_metrics();
+            assert_eq!(metrics.active_sequences, 1);
+            assert_eq!(metrics.blocks_in_use, 4);
+            assert_eq!(metrics.total_tokens, 50);
+            assert!(metrics.ideal_physical_bytes > 0);
+            assert!(metrics.actual_physical_bytes > 0);
+            assert!(metrics.internal_frag_rate >= 0.0);
+            assert!(metrics.block_utilization > 0.0);
+            assert!(metrics.physical_memory_efficiency > 0.0);
+
+            pool.free_sequence(&table);
+        }
+
+        #[test]
+        fn test_below_low_watermark() {
+            let (_, pool) = make_pool();
+            // With no blocks, total_physical_blocks = 0 → not below watermark
+            assert!(!pool.below_low_watermark(0.2));
+
+            // Allocate some blocks
+            let table = pool.alloc_sequence(10).expect("alloc");
+            let total = pool.total_physical_blocks();
+            let free = pool.free_physical_blocks();
+            let ratio = free as f32 / total as f32;
+
+            let threshold = 0.01; // very low threshold
+            assert_eq!(pool.below_low_watermark(threshold), ratio < threshold);
+
+            pool.free_sequence(&table);
+        }
+
+        #[test]
+        fn test_alloc_many_blocks_across_superblocks() {
+            // Use a larger config to get a VA region big enough for multiple
+            // superblock positions.
+            let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+            let config = KcmmConfig {
+                block_size: 16,
+                max_blocks: 4096,
+                cpu_cache_path: String::new(),
+                tiering: false,
+                eviction_policy: "lru".to_string(),
+                prefetch_window: 4,
+            };
+            // max_seq_len=16384 → max_blocks_per_seq=1024. max_batch=4 → 4096 blocks.
+            let pool = KcmmPool::new(
+                ctx, config, 22, 4, 64, 4, 16384,
+            ).expect("create pool with large VA");
+
+            let sb_blocks = pool.k_pools[0].allocator.blocks_per_superblock;
+            let count = sb_blocks + 10;
+            let table = pool.alloc_sequence(count).expect("alloc many");
+            assert_eq!(table.len(), count);
+            assert!(pool.superblock_count() >= 2);
+            assert_eq!(pool.blocks_in_use(), count);
+
+            pool.free_sequence(&table);
+            assert_eq!(pool.blocks_in_use(), 0);
+        }
+
+        #[test]
+        fn test_lockstep_invariant() {
+            let (_, pool) = make_pool();
+            let num_layers = pool.num_layers;
+
+            let table = pool.alloc_sequence(10).expect("alloc");
+            for l in 1..num_layers {
+                assert_eq!(
+                    pool.k_pools[0].allocator.free_count(),
+                    pool.k_pools[l].allocator.free_count(),
+                    "K pool layer {} diverged", l
+                );
+                assert_eq!(
+                    pool.v_pools[0].allocator.free_count(),
+                    pool.v_pools[l].allocator.free_count(),
+                    "V pool layer {} diverged", l
+                );
+            }
+
+            pool.free_sequence(&table);
+            for l in 1..num_layers {
+                assert_eq!(
+                    pool.k_pools[0].allocator.free_count(),
+                    pool.k_pools[l].allocator.free_count()
+                );
+            }
+        }
+    }
 }
