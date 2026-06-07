@@ -111,6 +111,12 @@ pub struct KcmmConfig {
     /// Default: 4.
     #[serde(default = "default_prefetch_window")]
     pub prefetch_window: usize,
+    /// Maximum number of blocks to batch in a single eviction/restore
+    /// operation.  Controls staging-buffer allocation size:
+    /// `max_batch_blocks * block_bytes` bytes per staging buffer.
+    /// Default: 64.
+    #[serde(default = "default_max_batch_blocks")]
+    pub max_batch_blocks: usize,
 }
 
 fn default_block_size() -> usize {
@@ -131,6 +137,9 @@ fn default_eviction_policy() -> String {
 fn default_prefetch_window() -> usize {
     4
 }
+fn default_max_batch_blocks() -> usize {
+    64
+}
 
 impl Default for KcmmConfig {
     fn default() -> Self {
@@ -141,6 +150,7 @@ impl Default for KcmmConfig {
             tiering: default_tiering(),
             eviction_policy: default_eviction_policy(),
             prefetch_window: default_prefetch_window(),
+            max_batch_blocks: default_max_batch_blocks(),
         }
     }
 }
@@ -311,6 +321,7 @@ mod tests {
             tiering: false,
             eviction_policy: "lfu".to_string(),
             prefetch_window: 8,
+            max_batch_blocks: 32,
         };
         let json = serde_json::to_string(&cfg).expect("serialize");
         let parsed: KcmmConfig = serde_json::from_str(&json).expect("deserialize");
@@ -320,6 +331,7 @@ mod tests {
         assert!(!parsed.tiering);
         assert_eq!(parsed.eviction_policy, "lfu");
         assert_eq!(parsed.prefetch_window, 8);
+        assert_eq!(parsed.max_batch_blocks, 32);
     }
 
     // --- ServerConfig defaults ---

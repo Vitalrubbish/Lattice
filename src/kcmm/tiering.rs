@@ -9,11 +9,15 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice};
+use cudarc::driver::sys;
 use parking_lot::Mutex;
 use crate::config::KcmmConfig;
+use crate::cuda::CudaContext;
 use crate::kcmm::pool::{BlockLocation, KcmmPool};
 use crate::kcmm::superblock::BlockHandle;
 
@@ -323,6 +327,24 @@ pub struct TieringEngine {
     /// Serialises allocation/deallocation of byte ranges within the CPU buffer,
     /// preventing concurrent evict+restore operations from using overlapping regions.
     slot_allocator: Mutex<CpuSlotAllocator>,
+
+    // --- Memcpy batching infrastructure ---
+
+    /// GPU staging buffer for gather/scatter kernels (f16 elements).
+    /// Holds one layer's worth of batched data: `max_batch_blocks × half_count`.
+    gpu_staging: Option<CudaSlice<half::f16>>,
+    /// CPU staging buffer for batched transfers.
+    /// Holds `max_batch_blocks × num_layers × 2 × block_bytes` bytes for
+    /// all-layer gather before scatter to individual CPU slots.
+    cpu_staging: Vec<u8>,
+    /// Gather kernel: N scattered GPU sources → contiguous GPU destination.
+    gather_kernel: Option<CudaFunction>,
+    /// Scatter kernel: contiguous GPU source → N scattered GPU destinations.
+    scatter_kernel: Option<CudaFunction>,
+    /// CUDA device handle (for temporary GPU allocations during batching).
+    device: Option<Arc<CudaDevice>>,
+    /// Maximum blocks per batch (from config).
+    max_batch_blocks: usize,
 }
 
 /// Per-block state carried from async-submit to finalize during batched eviction.
@@ -353,7 +375,16 @@ impl TieringEngine {
     /// `num_layers` and `block_bytes` determine the total swap buffer size:
     /// every evicted block needs `num_layers * 2 * block_bytes` bytes of
     /// CPU storage (K+V for every layer).
-    pub fn new(config: &KcmmConfig, num_layers: usize, block_bytes: usize) -> Result<Self> {
+    ///
+    /// When `device` and `config.max_batch_blocks` are provided, GPU/CPU
+    /// staging buffers are allocated and the gather/scatter kernels are
+    /// compiled for batched memcpy operations.
+    pub fn new(
+        config: &KcmmConfig,
+        num_layers: usize,
+        block_bytes: usize,
+        device: Option<Arc<CudaDevice>>,
+    ) -> Result<Self> {
         // Total buffer size: enough to hold all blocks if every one is evicted.
         let per_block_bytes = num_layers * 2 * block_bytes;
         let cpu_buffer_size = config.max_blocks * per_block_bytes;
@@ -395,6 +426,35 @@ impl TieringEngine {
             _ => Box::new(LruPolicy::new()), // default: LRU
         };
 
+        let max_batch_blocks = config.max_batch_blocks;
+
+        // Compile gather/scatter kernels and allocate staging buffers if a
+        // device is available and batching is enabled.
+        let (gpu_staging, gather_kernel, scatter_kernel, device) =
+            if let Some(dev) = device {
+                if max_batch_blocks > 0 {
+                    let (gk, sk) = Self::compile_kv_gather_kernels(&dev)?;
+                    let half_count = block_bytes / std::mem::size_of::<half::f16>();
+                    let gpu_staging_elems = max_batch_blocks * half_count;
+                    let gs = dev.alloc_zeros::<half::f16>(gpu_staging_elems)
+                        .with_context(|| "alloc GPU staging buffer (f16) for memcpy batching")?;
+                    (Some(gs), Some(gk), Some(sk), Some(dev))
+                } else {
+                    (None, None, None, None)
+                }
+            } else {
+                (None, None, None, None)
+            };
+
+        // CPU staging buffer: holds all layers for a full batch.
+        // Layout: [batch*K0][batch*V0][batch*K1][batch*V1]...
+        let cpu_staging_size = if max_batch_blocks > 0 && num_layers > 0 {
+            max_batch_blocks * per_block_bytes
+        } else {
+            0
+        };
+        let cpu_staging = vec![0u8; cpu_staging_size];
+
         Ok(Self {
             cpu_buffer,
             cpu_buffer_size,
@@ -402,7 +462,47 @@ impl TieringEngine {
             nvme_enabled: false,
             eviction_policy,
             slot_allocator: Mutex::new(CpuSlotAllocator::new(cpu_buffer_size)),
+            gpu_staging,
+            cpu_staging,
+            gather_kernel,
+            scatter_kernel,
+            device,
+            max_batch_blocks,
         })
+    }
+
+    /// Compile the gather/scatter KV kernels via NVRTC.
+    fn compile_kv_gather_kernels(
+        device: &Arc<CudaDevice>,
+    ) -> Result<(CudaFunction, CudaFunction)> {
+        let mut include_paths = vec!["/usr/include".into()];
+        let cuda_home = std::env::var("CUDA_HOME")
+            .or_else(|_| std::env::var("CUDA_PATH"))
+            .unwrap_or_else(|_| "/usr/local/cuda".into());
+        include_paths.push(format!("{cuda_home}/include"));
+
+        let opts = cudarc::nvrtc::CompileOptions {
+            ftz: Some(true),
+            use_fast_math: Some(true),
+            include_paths,
+            ..Default::default()
+        };
+
+        let src = include_str!("../cuda/kernels/kv_gather.cu");
+        let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(src, opts)
+            .context("compile kv_gather kernel via NVRTC")?;
+        device
+            .load_ptx(ptx, "kv_gather", &["gather_kv_layer", "scatter_kv_layer"])
+            .context("load kv_gather PTX module")?;
+
+        let gather = device
+            .get_func("kv_gather", "gather_kv_layer")
+            .ok_or_else(|| anyhow::anyhow!("kernel not found: kv_gather::gather_kv_layer"))?;
+        let scatter = device
+            .get_func("kv_gather", "scatter_kv_layer")
+            .ok_or_else(|| anyhow::anyhow!("kernel not found: kv_gather::scatter_kv_layer"))?;
+
+        Ok((gather, scatter))
     }
 
     /// Get the CPU buffer base pointer.
@@ -565,6 +665,16 @@ impl TieringEngine {
             return Ok(Vec::new());
         }
 
+        // If memcpy batching is available and the victim count justifies the
+        // gather-kernel launch overhead, use the batched path.
+        const MIN_BATCH_FOR_GATHER: usize = 4;
+        if victims.len() >= MIN_BATCH_FOR_GATHER
+            && self.gather_kernel.is_some()
+            && self.gpu_staging.is_some()
+        {
+            return self.evict_blocks_batched(pool, &victims);
+        }
+
         // 2. Phase 1 — Submit all async D2H copies
         let mut pending: Vec<EvictContext> = Vec::with_capacity(victims.len());
         for &victim in &victims {
@@ -644,6 +754,194 @@ impl TieringEngine {
         Ok(evicted)
     }
 
+    /// Batched eviction using gather kernel + single D2H per layer.
+    ///
+    /// Instead of issuing `4 × N` individual `memcpy_d2h_async` calls
+    /// (K0, V0, K1, V1 per block), this method issues only 4 batched
+    /// transfers (one per layer×KV pair) by first gathering same-layer
+    /// KV data from scattered GPU VAs into the contiguous GPU staging
+    /// buffer via the `gather_kv_layer` kernel.
+    ///
+    /// Phases:
+    ///   1. Alloc CPU slot + mark Evicting (per block, CPU-side, fast)
+    ///   2. For each layer×KV: gather → batched D2H (all queued on evict stream)
+    ///   3. One `cuStreamSynchronize`
+    ///   4. CPU scatter: staging → per-block CPU slots
+    ///   5. Finalize: release physical + mark CpuResident
+    fn evict_blocks_batched(
+        &self,
+        pool: &KcmmPool,
+        victims: &[BlockHandle],
+    ) -> Result<Vec<BlockHandle>> {
+        let n = victims.len();
+        let block_bytes = pool.block_bytes;
+        let num_layers = pool.num_layers;
+        let per_block_bytes = num_layers * 2 * block_bytes;
+        let half_count = block_bytes / std::mem::size_of::<half::f16>();
+
+        let gather_kernel = self.gather_kernel.as_ref().unwrap();
+        let gpu_staging = self.gpu_staging.as_ref().unwrap();
+        let device = self.device.as_ref().unwrap();
+
+        // --- Phase 1: Alloc CPU slots + mark Evicting ---
+        let mut pending: Vec<EvictContext> = Vec::with_capacity(n);
+        for &victim in victims {
+            let block_idx = pool.find_block_idx(victim).ok_or_else(|| {
+                anyhow::anyhow!("victim block {:?} not found in pool", victim)
+            })?;
+
+            let cpu_offset = match self.alloc_cpu_slot(per_block_bytes) {
+                Ok(off) => off,
+                Err(e) => {
+                    tracing::warn!(block_idx, ?victim, error = %e,
+                        "KCMM: CPU slot alloc failed in batched evict, skipping");
+                    continue;
+                }
+            };
+
+            if let Err(e) = pool.set_block_location(block_idx, BlockLocation::Evicting) {
+                self.free_cpu_slot(cpu_offset, per_block_bytes);
+                tracing::warn!(block_idx, ?victim, error = %e,
+                    "KCMM: mark Evicting failed in batched evict, skipping");
+                continue;
+            }
+
+            pending.push(EvictContext {
+                block_idx,
+                handle: victim,
+                cpu_offset,
+                total_bytes: per_block_bytes,
+            });
+        }
+
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // --- Phase 2: GPU gather + batched D2H per layer ---
+        // Note: `htod_sync_copy_into` uses the default stream and therefore
+        // synchronizes all streams.  This means each layer's upload implicitly
+        // waits for the previous layer's GPU work to finish.  This adds ~120 µs
+        // (4 layers × 30 µs) but is correct and the overhead is negligible
+        // compared to the ~6.8 ms saved by eliminating per-block driver calls.
+        let mut layer_idx: usize = 0;
+        let _layer_count = num_layers * 2; // K+V per layer
+        for l in 0..num_layers {
+            for is_v in [false, true] {
+                let actual_n = pending.len(); // may be < n if slots failed
+
+                // Build host-side pointer array for this layer×KV
+                let mut ptrs_host: Vec<u64> = Vec::with_capacity(actual_n);
+                for ctx in &pending {
+                    let gpu_va = if is_v {
+                        pool.gpu_va_for_block(ctx.handle, l, true)?
+                    } else {
+                        pool.gpu_va_for_block(ctx.handle, l, false)?
+                    };
+                    ptrs_host.push(gpu_va);
+                }
+
+                // Upload to device (sync — see note above).
+                // Allocate a fresh device array each iteration (small: N × 8 bytes).
+                let mut ptrs_dev_layer = device
+                    .alloc_zeros::<u64>(actual_n)
+                    .context("alloc ptrs layer device array")?;
+                device.htod_sync_copy_into(&ptrs_host, &mut ptrs_dev_layer)?;
+
+                // Launch gather kernel: scattered blocks → contiguous GPU staging
+                // SAFETY: all source VAs are valid GPU addresses allocated by the pool.
+                unsafe {
+                    crate::cuda::kernels::launch_kv_gather(
+                        gather_kernel,
+                        &ptrs_dev_layer,
+                        gpu_staging,
+                        half_count,
+                        actual_n,
+                    )
+                    .context("launch gather_kv_layer for batched eviction")?;
+                }
+
+                // Batched D2H: GPU staging → CPU staging[this layer's region]
+                let layer_byte_offset = layer_idx * actual_n * block_bytes;
+                let nbytes = actual_n * block_bytes;
+                let gpu_staging_ptr =
+                    CudaContext::device_ptr(&gpu_staging) as sys::CUdeviceptr;
+                unsafe {
+                    pool.streams.evict.memcpy_d2h_async(
+                        (self.cpu_staging.as_ptr() as *mut u8)
+                            .add(layer_byte_offset),
+                        gpu_staging_ptr,
+                        nbytes,
+                    )?;
+                }
+
+                layer_idx += 1;
+            }
+        }
+
+        // --- Phase 3: Synchronise ---
+        if let Err(e) = pool.streams.evict.synchronize() {
+            tracing::error!(
+                pending_count = pending.len(),
+                error = %e,
+                "KCMM: batched evict synchronize failed; rolling back"
+            );
+            for ctx in &pending {
+                self.free_cpu_slot(ctx.cpu_offset, ctx.total_bytes);
+                let _ = pool.set_block_location(
+                    ctx.block_idx,
+                    BlockLocation::GpuResident(
+                        ctx.handle,
+                        pool.block_va_offset(ctx.handle).unwrap_or(0) as u64,
+                    ),
+                );
+            }
+            return Err(e);
+        }
+
+        // --- Phase 4: CPU scatter — staging → per-block CPU slots ---
+        // CPU staging layout: [batch_K0][batch_V0][batch_K1][batch_V1]
+        // Per-block slot layout: [K0][V0][K1][V1]
+        let actual_n = pending.len();
+        for (i, ctx) in pending.iter().enumerate() {
+            let mut slot_off = ctx.cpu_offset;
+            let mut layer_idx2: usize = 0;
+            for _l in 0..num_layers {
+                for _is_v in 0..2 {
+                    let staging_off = layer_idx2 * actual_n * block_bytes + i * block_bytes;
+                    // SAFETY: both staging and cpu_buffer are valid, non-overlapping.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.cpu_staging.as_ptr().add(staging_off),
+                            self.cpu_buffer.add(slot_off),
+                            block_bytes,
+                        );
+                    }
+                    slot_off += block_bytes;
+                    layer_idx2 += 1;
+                }
+            }
+        }
+
+        // --- Phase 5: Finalize ---
+        let mut evicted = Vec::with_capacity(actual_n);
+        for ctx in pending {
+            let handle = ctx.handle;
+            match self.evict_finalize(pool, ctx) {
+                Ok(()) => {
+                    self.eviction_policy.on_evict(handle);
+                    evicted.push(handle);
+                }
+                Err(e) => {
+                    tracing::error!(?handle, error = %e,
+                        "KCMM: evict_finalize failed in batched path, skipping");
+                }
+            }
+        }
+
+        Ok(evicted)
+    }
+
     /// Copy all K and V layers for a block from GPU to CPU.
     ///
     /// Data layout in CPU buffer (conceptual):
@@ -687,6 +985,190 @@ impl TieringEngine {
     }
 
     // --- Restoration ---
+
+    /// Batched restoration using CPU gather + single H2D per layer + scatter
+    /// kernel.
+    ///
+    /// Mirror of `evict_blocks_batched`: instead of `4 × N` individual
+    /// `memcpy_h2d_async` calls, issues only 4 batched H2D transfers.
+    ///
+    /// Each entry in `blocks` is `(block_idx, cpu_offset)`.  The caller
+    /// must have already verified that each block is in `CpuResident` state.
+    ///
+    /// Phases:
+    ///   1. Mark Restoring + alloc GPU block (per block, fast)
+    ///   2. For each layer×KV: CPU gather → batched H2D → scatter kernel
+    ///      (all queued on restore stream)
+    ///   3. One `cuStreamSynchronize`
+    ///   4. Finalize: mark GpuResident + free CPU slot
+    pub(crate) fn restore_blocks_batched(
+        &self,
+        pool: &KcmmPool,
+        blocks: &[(u32, usize)], // (block_idx, cpu_offset)
+    ) -> Result<()> {
+        let n = blocks.len();
+        let block_bytes = pool.block_bytes;
+        let num_layers = pool.num_layers;
+        let per_block_bytes = num_layers * 2 * block_bytes;
+        let half_count = block_bytes / std::mem::size_of::<half::f16>();
+
+        let scatter_kernel = self.scatter_kernel.as_ref().unwrap();
+        let gpu_staging = self.gpu_staging.as_ref().unwrap();
+        let device = self.device.as_ref().unwrap();
+
+        // --- Phase 1: Mark Restoring + alloc GPU blocks ---
+        let mut pending: Vec<RestoreContext> = Vec::with_capacity(n);
+        for &(block_idx, cpu_offset) in blocks {
+            // Mark as Restoring
+            if let Err(e) = pool.set_block_location(block_idx, BlockLocation::Restoring) {
+                tracing::warn!(block_idx, cpu_offset, error = %e,
+                    "KCMM: mark Restoring failed in batched restore, skipping");
+                continue;
+            }
+
+            // Allocate new GPU physical block
+            let (va_offset, sb_idx, blk_in_sb) = match pool.alloc_one_block_internal() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(block_idx, cpu_offset, error = %e,
+                        "KCMM: GPU alloc failed in batched restore, rolling back");
+                    let _ = pool.set_block_location(
+                        block_idx,
+                        BlockLocation::CpuResident(cpu_offset),
+                    );
+                    continue;
+                }
+            };
+
+            let new_handle = BlockHandle {
+                superblock_idx: sb_idx,
+                block_index: blk_in_sb,
+            };
+
+            // Update BlockInfo with new physical allocation
+            if let Err(e) = pool.update_block_physical(block_idx, va_offset, sb_idx, blk_in_sb) {
+                let _ = pool.release_block_physical(block_idx);
+                let _ = pool.set_block_location(
+                    block_idx,
+                    BlockLocation::CpuResident(cpu_offset),
+                );
+                tracing::warn!(block_idx, cpu_offset, error = %e,
+                    "KCMM: update_block_physical failed in batched restore, skipping");
+                continue;
+            }
+
+            pending.push(RestoreContext {
+                block_idx,
+                cpu_offset,
+                total_bytes: per_block_bytes,
+                new_handle,
+                va_offset,
+            });
+        }
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // --- Phase 2: CPU gather → batched H2D → scatter kernel per layer ---
+        let actual_n = pending.len();
+        let mut layer_idx: usize = 0;
+        for l in 0..num_layers {
+            for is_v in [false, true] {
+                // Step 2a: CPU gather — copy from each block's CPU slot to staging
+                for (i, ctx) in pending.iter().enumerate() {
+                    let slot_src = ctx.cpu_offset + layer_idx * block_bytes;
+                    let staging_dst = layer_idx * actual_n * block_bytes + i * block_bytes;
+                    // SAFETY: source (CPU buffer slot) and dest (CPU staging) are
+                    // valid, non-overlapping memory regions.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.cpu_buffer.add(slot_src),
+                            (self.cpu_staging.as_ptr() as *mut u8).add(staging_dst),
+                            block_bytes,
+                        );
+                    }
+                }
+
+                // Step 2b: Batched H2D — CPU staging[this layer] → GPU staging
+                let layer_byte_offset = layer_idx * actual_n * block_bytes;
+                let nbytes = actual_n * block_bytes;
+                let gpu_staging_ptr =
+                    CudaContext::device_ptr(&gpu_staging) as sys::CUdeviceptr;
+                unsafe {
+                    pool.streams.restore.memcpy_h2d_async(
+                        gpu_staging_ptr,
+                        self.cpu_staging.as_ptr().add(layer_byte_offset),
+                        nbytes,
+                    )?;
+                }
+
+                // Step 2c: Build destination pointer array for scatter kernel
+                let mut ptrs_host: Vec<u64> = Vec::with_capacity(actual_n);
+                for ctx in &pending {
+                    let gpu_va = if is_v {
+                        pool.va_v(l) + ctx.va_offset as u64
+                    } else {
+                        pool.va_k(l) + ctx.va_offset as u64
+                    };
+                    ptrs_host.push(gpu_va);
+                }
+
+                // Upload to device.
+                let mut ptrs_dev_layer = device
+                    .alloc_zeros::<u64>(actual_n)
+                    .context("alloc ptrs layer device array for restore")?;
+                device.htod_sync_copy_into(&ptrs_host, &mut ptrs_dev_layer)?;
+
+                // Launch scatter kernel: GPU staging → scattered block VAs
+                unsafe {
+                    crate::cuda::kernels::launch_kv_scatter(
+                        scatter_kernel,
+                        gpu_staging,
+                        &ptrs_dev_layer,
+                        half_count,
+                        actual_n,
+                    )
+                    .context("launch scatter_kv_layer for batched restore")?;
+                }
+
+                layer_idx += 1;
+            }
+        }
+
+        // --- Phase 3: Synchronise ---
+        if let Err(e) = pool.streams.restore.synchronize() {
+            tracing::error!(
+                pending_count = actual_n,
+                error = %e,
+                "KCMM: batched restore synchronize failed; rolling back"
+            );
+            for ctx in &pending {
+                let _ = pool.release_block_physical(ctx.block_idx);
+                let _ = pool.set_block_location(
+                    ctx.block_idx,
+                    BlockLocation::CpuResident(ctx.cpu_offset),
+                );
+            }
+            return Err(e);
+        }
+
+        // --- Phase 4: Finalize ---
+        for ctx in pending {
+            let block_idx = ctx.block_idx;
+            let new_handle = ctx.new_handle;
+            if let Err(e) = self.restore_finalize(pool, ctx) {
+                tracing::error!(
+                    block_idx,
+                    ?new_handle,
+                    error = %e,
+                    "KCMM: restore_finalize failed in batched path"
+                );
+            }
+        }
+
+        Ok(())
+    }
 
     /// Copy all K and V layers for a block from CPU to GPU.
     ///
@@ -880,6 +1362,7 @@ unsafe impl Sync for TieringEngine {}
 mod tests {
     use super::*;
     use std::io::Read;
+
     use std::fs;
 
     fn test_config() -> KcmmConfig {
@@ -890,6 +1373,7 @@ mod tests {
             tiering: true,
             eviction_policy: "lru".to_string(),
             prefetch_window: 4,
+            max_batch_blocks: 64,
         }
     }
 
@@ -903,7 +1387,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 16; // cpu_buffer_size = 16 * 16 * 2 = 512
 
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine");
         let expected_size = config.max_blocks * config.block_size * 2;
 
         // Buffer should be non-null and the expected size.
@@ -940,7 +1424,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 0;
 
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine with zero blocks");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine with zero blocks");
         assert!(engine.cpu_buffer.is_null());
         assert_eq!(engine.cpu_buffer_size, 0);
 
@@ -958,7 +1442,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 4;
 
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine");
         let expected = config.max_blocks * config.block_size * 2;
         let ptr = engine.cpu_buffer_ptr();
         assert!(!ptr.is_null());
@@ -978,7 +1462,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 8;
 
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine");
         // Just dropping should not panic or segfault.
         drop(engine);
         drop(dir);
@@ -998,7 +1482,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 4;
 
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine");
         assert_send_sync(&engine);
 
         drop(engine);
@@ -1015,7 +1499,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 32;
 
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine");
         let expected_size = config.max_blocks * config.block_size * 2;
         assert_eq!(engine.cpu_buffer_size, expected_size);
 
@@ -1031,7 +1515,7 @@ mod tests {
         let mut config = test_config();
         config.cpu_cache_path = "/nonexistent/path/should/fail/kcmm_swap".to_string();
 
-        let result = TieringEngine::new(&config, 1, 16);
+        let result = TieringEngine::new(&config, 1, 16, None);
         assert!(result.is_err(), "should fail on nonexistent directory");
     }
 
@@ -1398,7 +1882,7 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 4;
         // eviction_policy defaults to "lru"
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine");
 
         // Verify the policy works like LRU by exercising its behavior.
         let h0 = bh(0, 0);
@@ -1425,7 +1909,7 @@ mod tests {
         config.max_blocks = 4;
         config.eviction_policy = "lfu".to_string();
 
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine");
 
         // Verify LFU behavior: least-frequently accessed block evicted first.
         let h0 = bh(0, 0);
@@ -1453,7 +1937,7 @@ mod tests {
         config.max_blocks = 4;
         config.eviction_policy = "fifo".to_string();
 
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine");
 
         // Verify FIFO behavior: earliest-allocated evicted first.
         let h0 = bh(0, 0);
@@ -1481,7 +1965,7 @@ mod tests {
         config.max_blocks = 4;
         config.eviction_policy = "nonexistent".to_string();
 
-        let engine = TieringEngine::new(&config, 1, 16).expect("create engine");
+        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine");
 
         // Should behave like LRU (fallback), not crash.
         let h = bh(0, 0);
@@ -1680,6 +2164,7 @@ mod tests {
                 tiering: true,      // enable tiering
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
+                max_batch_blocks: 64,
             };
 
             let pool = KcmmPool::new(
@@ -1985,6 +2470,7 @@ mod tests {
                 tiering: true,
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
+                max_batch_blocks: 64,
             };
 
             let pool = KcmmPool::new(
@@ -2282,6 +2768,283 @@ mod tests {
 
             let result = pool.restore_evicted_block(block_idx);
             assert!(result.is_err(), "restore on Restoring block should error");
+        }
+    }
+
+    mod gather_scatter_kernels {
+        use super::*;
+        use crate::cuda::CudaContext;
+        use crate::cuda::kernels::{
+            launch_kv_gather, launch_kv_scatter,
+        };
+        use cudarc::driver::CudaSlice;
+        use half::f16;
+        use std::sync::Arc;
+
+        /// Create a CUDA context and compile the gather/scatter kernels.
+        fn setup() -> (Arc<CudaContext>, CudaFunction, CudaFunction) {
+            let ctx = Arc::new(CudaContext::new(0).expect("cuda device"));
+            let (gather, scatter) =
+                TieringEngine::compile_kv_gather_kernels(&ctx.device)
+                    .expect("compile kernels");
+            (ctx, gather, scatter)
+        }
+
+        /// Fill a GPU buffer with a known pattern and return the pattern.
+        fn fill_pattern(ctx: &CudaContext, slice: &mut CudaSlice<f16>, n: usize, seed: u16) -> Vec<f16> {
+            let pattern: Vec<f16> = (0..n)
+                .map(|i| f16::from_f32((i.wrapping_mul(seed as usize).wrapping_add(13) % 1000) as f32))
+                .collect();
+            ctx.h2d_sync(&pattern, slice).expect("h2d sync");
+            pattern
+        }
+
+        /// Read back a GPU buffer.
+        fn readback(ctx: &CudaContext, slice: &CudaSlice<f16>, n: usize) -> Vec<f16> {
+            let mut host = vec![f16::ZERO; n];
+            ctx.d2h_sync(slice, &mut host).expect("d2h sync");
+            host
+        }
+
+        #[test]
+        fn test_gather_single_block() {
+            let (ctx, gather, _scatter) = setup();
+            let half_count = 64;
+            let num_blocks = 1;
+
+            // Create 1 source buffer with a known pattern
+            let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+            let pattern = fill_pattern(&ctx, &mut src, half_count, 7);
+
+            // Build src_ptrs device array
+            let src_ptr = CudaContext::device_ptr(&src);
+            let src_ptrs_host = vec![src_ptr];
+            let mut src_ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+            ctx.h2d_sync(&src_ptrs_host, &mut src_ptrs_dev).expect("h2d ptrs");
+
+            // Allocate staging buffer
+            let mut staging = ctx.device.alloc_zeros::<f16>(half_count * num_blocks)
+                .expect("alloc staging");
+
+            // Launch gather
+            unsafe {
+                launch_kv_gather(&gather, &src_ptrs_dev, &mut staging, half_count, num_blocks)
+                    .expect("gather kernel");
+            }
+            ctx.synchronize().expect("sync");
+
+            // Read back staging and verify
+            let result = readback(&ctx, &staging, half_count * num_blocks);
+            assert_eq!(&result[..half_count], &pattern[..],
+                "gather single block: data mismatch");
+        }
+
+        #[test]
+        fn test_gather_multiple_blocks() {
+            let (ctx, gather, _scatter) = setup();
+            let half_count = 32;
+            let num_blocks = 4;
+
+            // Create N source buffers with distinct patterns
+            let mut srcs: Vec<CudaSlice<f16>> = Vec::new();
+            let mut patterns: Vec<Vec<f16>> = Vec::new();
+            let mut ptrs_host: Vec<u64> = Vec::new();
+
+            for i in 0..num_blocks {
+                let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+                let pat = fill_pattern(&ctx, &mut src, half_count, (i as u16 + 1) * 11);
+                ptrs_host.push(CudaContext::device_ptr(&src));
+                patterns.push(pat);
+                srcs.push(src);
+            }
+
+            let mut ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+            ctx.h2d_sync(&ptrs_host, &mut ptrs_dev).expect("h2d ptrs");
+
+            let mut staging = ctx.device.alloc_zeros::<f16>(half_count * num_blocks)
+                .expect("alloc staging");
+
+            unsafe {
+                launch_kv_gather(&gather, &ptrs_dev, &mut staging, half_count, num_blocks)
+                    .expect("gather kernel");
+            }
+            ctx.synchronize().expect("sync");
+
+            let result = readback(&ctx, &staging, half_count * num_blocks);
+            for i in 0..num_blocks {
+                let start = i * half_count;
+                let end = start + half_count;
+                assert_eq!(&result[start..end], &patterns[i][..],
+                    "gather block {}: data mismatch", i);
+            }
+        }
+
+        #[test]
+        fn test_scatter_single_block() {
+            let (ctx, _gather, scatter) = setup();
+            let half_count = 64;
+            let num_blocks = 1;
+
+            // Create contiguous source with a known pattern
+            let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+            let pattern = fill_pattern(&ctx, &mut src, half_count, 13);
+
+            // Create destination buffer (zeroed)
+            let mut dst = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc dst");
+            let dst_ptr = CudaContext::device_ptr(&dst);
+            let dst_ptrs_host = vec![dst_ptr];
+            let mut dst_ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+            ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev).expect("h2d ptrs");
+
+            // Launch scatter
+            unsafe {
+                launch_kv_scatter(&scatter, &src, &dst_ptrs_dev, half_count, num_blocks)
+                    .expect("scatter kernel");
+            }
+            ctx.synchronize().expect("sync");
+
+            // Read back destination and verify
+            let result = readback(&ctx, &dst, half_count);
+            assert_eq!(&result[..], &pattern[..],
+                "scatter single block: data mismatch");
+        }
+
+        #[test]
+        fn test_scatter_multiple_blocks() {
+            let (ctx, _gather, scatter) = setup();
+            let half_count = 32;
+            let num_blocks = 4;
+
+            // Create contiguous source: interleaved patterns for blocks 0,1,2,3
+            let total = half_count * num_blocks;
+            let mut src = ctx.device.alloc_zeros::<f16>(total).expect("alloc src");
+            let mut expected: Vec<Vec<f16>> = Vec::new();
+            let mut src_host: Vec<f16> = Vec::with_capacity(total);
+            for i in 0..num_blocks {
+                let pat: Vec<f16> = (0..half_count)
+                    .map(|j| f16::from_f32(((i * 100 + j) % 500) as f32))
+                    .collect();
+                src_host.extend_from_slice(&pat);
+                expected.push(pat);
+            }
+            ctx.h2d_sync(&src_host, &mut src).expect("h2d src");
+
+            // Create destination buffers (zeroed)
+            let mut dsts: Vec<CudaSlice<f16>> = Vec::new();
+            let mut dst_ptrs_host: Vec<u64> = Vec::new();
+            for _ in 0..num_blocks {
+                let dst = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc dst");
+                dst_ptrs_host.push(CudaContext::device_ptr(&dst));
+                dsts.push(dst);
+            }
+            let mut dst_ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+            ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev).expect("h2d ptrs");
+
+            unsafe {
+                launch_kv_scatter(&scatter, &src, &dst_ptrs_dev, half_count, num_blocks)
+                    .expect("scatter kernel");
+            }
+            ctx.synchronize().expect("sync");
+
+            for i in 0..num_blocks {
+                let result = readback(&ctx, &dsts[i], half_count);
+                assert_eq!(&result[..], &expected[i][..],
+                    "scatter block {}: data mismatch", i);
+            }
+        }
+
+        #[test]
+        fn test_gather_scatter_roundtrip() {
+            let (ctx, gather, scatter) = setup();
+            let half_count = 64;
+            let num_blocks = 3;
+
+            // Create source buffers with distinct patterns (the "original" data)
+            let mut srcs: Vec<CudaSlice<f16>> = Vec::new();
+            let mut original: Vec<Vec<f16>> = Vec::new();
+            let mut src_ptrs_host: Vec<u64> = Vec::new();
+            for i in 0..num_blocks {
+                let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+                let pat = fill_pattern(&ctx, &mut src, half_count, (i as u16 + 3) * 17);
+                src_ptrs_host.push(CudaContext::device_ptr(&src));
+                original.push(pat);
+                srcs.push(src);
+            }
+
+            let mut ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+
+            // ---- Gather: scattered → contiguous staging ----
+            ctx.h2d_sync(&src_ptrs_host, &mut ptrs_dev).expect("h2d gather ptrs");
+            let mut staging = ctx.device.alloc_zeros::<f16>(half_count * num_blocks)
+                .expect("alloc staging");
+            unsafe {
+                launch_kv_gather(&gather, &ptrs_dev, &mut staging, half_count, num_blocks)
+                    .expect("gather kernel");
+            }
+            ctx.synchronize().expect("sync after gather");
+
+            // ---- Scatter: contiguous staging → new scattered destinations ----
+            // Create fresh destination buffers (zeroed)
+            let mut dsts: Vec<CudaSlice<f16>> = Vec::new();
+            let mut dst_ptrs_host: Vec<u64> = Vec::new();
+            for _ in 0..num_blocks {
+                let dst = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc dst");
+                dst_ptrs_host.push(CudaContext::device_ptr(&dst));
+                dsts.push(dst);
+            }
+            let mut dst_ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+            ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev).expect("h2d scatter ptrs");
+
+            unsafe {
+                launch_kv_scatter(&scatter, &staging, &dst_ptrs_dev, half_count, num_blocks)
+                    .expect("scatter kernel");
+            }
+            ctx.synchronize().expect("sync after scatter");
+
+            // Verify roundtrip identity
+            for i in 0..num_blocks {
+                let result = readback(&ctx, &dsts[i], half_count);
+                assert_eq!(&result[..], &original[i][..],
+                    "gather-scatter roundtrip block {}: data mismatch", i);
+            }
+        }
+
+        #[test]
+        fn test_gather_edge_max_batch() {
+            let (ctx, gather, _scatter) = setup();
+            let half_count = 16; // small blocks for memory efficiency
+            let num_blocks = 64; // KcmmConfig default max batch
+
+            let mut patterns: Vec<Vec<f16>> = Vec::new();
+            let mut ptrs_host: Vec<u64> = Vec::new();
+            let mut _srcs: Vec<CudaSlice<f16>> = Vec::new();
+
+            for i in 0..num_blocks {
+                let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+                let pat = fill_pattern(&ctx, &mut src, half_count, (i as u16).wrapping_mul(3));
+                ptrs_host.push(CudaContext::device_ptr(&src));
+                patterns.push(pat);
+                _srcs.push(src);
+            }
+
+            let mut ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+            ctx.h2d_sync(&ptrs_host, &mut ptrs_dev).expect("h2d ptrs");
+
+            let mut staging = ctx.device.alloc_zeros::<f16>(half_count * num_blocks)
+                .expect("alloc staging");
+
+            unsafe {
+                launch_kv_gather(&gather, &ptrs_dev, &mut staging, half_count, num_blocks)
+                    .expect("gather kernel max batch");
+            }
+            ctx.synchronize().expect("sync");
+
+            let result = readback(&ctx, &staging, half_count * num_blocks);
+            for i in 0..num_blocks {
+                let start = i * half_count;
+                assert_eq!(&result[start..start + half_count], &patterns[i][..],
+                    "gather max batch block {}: mismatch", i);
+            }
         }
     }
 }

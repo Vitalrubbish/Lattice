@@ -200,7 +200,12 @@ impl KcmmPool {
 
         // Create tiering engine if enabled
         let tiering = if config.tiering {
-            Some(TieringEngine::new(&config, num_layers, block_bytes)?)
+            Some(TieringEngine::new(
+                &config,
+                num_layers,
+                block_bytes,
+                Some(ctx.device.clone()),
+            )?)
         } else {
             None
         };
@@ -1269,6 +1274,7 @@ mod tests {
                 tiering: false,
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
+                max_batch_blocks: 64,
             };
             let pool = KcmmPool::new(
                 ctx.clone(),
@@ -1513,6 +1519,7 @@ mod tests {
                 tiering: false,
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
+                max_batch_blocks: 64,
             };
             // max_seq_len=16384 → max_blocks_per_seq=1024. max_batch=4 → 4096 blocks.
             let pool = KcmmPool::new(

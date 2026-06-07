@@ -12,6 +12,8 @@ pub struct GpuKernels {
     pub contig_attn_decode: CudaFunction,
     pub paged_attn_decode: CudaFunction,
     pub bf16_to_f16: CudaFunction,
+    pub gather_kv: CudaFunction,
+    pub scatter_kv: CudaFunction,
 }
 
 impl GpuKernels {
@@ -39,6 +41,7 @@ impl GpuKernels {
             ("contig_attn_decode", include_str!("contig_attn_decode.cu"), &["contig_attn_decode_f16"]),
             ("paged_attn_decode", include_str!("paged_attn_decode.cu"), &["paged_attn_decode_f16"]),
             ("bf16_to_f16", include_str!("bf16_to_f16.cu"), &["bf16_to_f16"]),
+            ("kv_gather", include_str!("kv_gather.cu"), &["gather_kv_layer", "scatter_kv_layer"]),
         ];
 
         for &(name, src, func_names) in ptx_data {
@@ -64,6 +67,8 @@ impl GpuKernels {
             contig_attn_decode: get("contig_attn_decode", "contig_attn_decode_f16")?,
             paged_attn_decode: get("paged_attn_decode", "paged_attn_decode_f16")?,
             bf16_to_f16: get("bf16_to_f16", "bf16_to_f16")?,
+            gather_kv: get("kv_gather", "gather_kv_layer")?,
+            scatter_kv: get("kv_gather", "scatter_kv_layer")?,
         })
     }
 }
@@ -201,6 +206,54 @@ pub fn launch_paged_attn_decode(
             q, va_k, va_v, block_tables, seq_lens, block_offsets_f16, out,
             (batch * num_q_heads) as i32, num_q_heads as i32, kv_heads as i32, head_dim as i32, packed_bs,
         ))?;
+    }
+    Ok(())
+}
+
+/// Launch a gather kernel: copy same-layer KV data from N scattered source
+/// pointers into a contiguous staging buffer.
+///
+/// `src_ptrs` is a device-side array of `CUdeviceptr` values, each pointing
+/// to one block's KV data for a single layer.  `dst` receives the packed data:
+/// `[block_0 data][block_1 data]...[block_{N-1} data]`.
+pub fn launch_kv_gather(
+    kernel: &CudaFunction,
+    src_ptrs: &CudaSlice<u64>,
+    dst: &CudaSlice<f16>,
+    half_count: usize,
+    num_blocks: usize,
+) -> Result<()> {
+    let total = (num_blocks * half_count) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        kernel.clone().launch(
+            cfg,
+            (src_ptrs, dst, half_count as i32, num_blocks as i32),
+        )?;
+    }
+    Ok(())
+}
+
+/// Launch a scatter kernel: distribute KV data from a contiguous staging
+/// buffer to N scattered destination pointers.
+///
+/// `dst_ptrs` is a device-side array of `CUdeviceptr` values, each pointing
+/// to one block's GPU VA for a single layer.  `src` contains the packed data:
+/// `[block_0 data][block_1 data]...[block_{N-1} data]`.
+pub fn launch_kv_scatter(
+    kernel: &CudaFunction,
+    src: &CudaSlice<f16>,
+    dst_ptrs: &CudaSlice<u64>,
+    half_count: usize,
+    num_blocks: usize,
+) -> Result<()> {
+    let total = (num_blocks * half_count) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        kernel.clone().launch(
+            cfg,
+            (src, dst_ptrs, half_count as i32, num_blocks as i32),
+        )?;
     }
     Ok(())
 }
