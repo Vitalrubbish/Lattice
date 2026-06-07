@@ -234,12 +234,6 @@ pub fn launch_kv_gather(
     Ok(())
 }
 
-/// Launch a scatter kernel: distribute KV data from a contiguous staging
-/// buffer to N scattered destination pointers.
-///
-/// `dst_ptrs` is a device-side array of `CUdeviceptr` values, each pointing
-/// to one block's GPU VA for a single layer.  `src` contains the packed data:
-/// `[block_0 data][block_1 data]...[block_{N-1} data]`.
 pub fn launch_kv_scatter(
     kernel: &CudaFunction,
     src: &CudaSlice<f16>,

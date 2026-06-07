@@ -39,6 +39,11 @@ impl CudaStream {
         Ok(())
     }
 
+    /// Get the raw CUDA stream handle.
+    pub fn as_raw(&self) -> sys::CUstream {
+        self.inner
+    }
+
     /// Query whether all operations on the stream have completed.
     pub fn is_done(&self) -> bool {
         let cu_result = unsafe { sys::lib().cuStreamQuery(self.inner) };
