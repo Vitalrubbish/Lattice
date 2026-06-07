@@ -325,6 +325,23 @@ pub struct TieringEngine {
     slot_allocator: Mutex<CpuSlotAllocator>,
 }
 
+/// Per-block state carried from async-submit to finalize during batched eviction.
+struct EvictContext {
+    block_idx: u32,
+    handle: BlockHandle,
+    cpu_offset: usize,
+    total_bytes: usize,
+}
+
+/// Per-block state carried from async-submit to finalize during restoration.
+struct RestoreContext {
+    block_idx: u32,
+    cpu_offset: usize,
+    total_bytes: usize,
+    new_handle: BlockHandle,
+    va_offset: usize,
+}
+
 impl TieringEngine {
     /// Create a new tiering engine.
     ///
@@ -417,74 +434,18 @@ impl TieringEngine {
 
     // --- Eviction ---
 
-    /// Evict up to `count` blocks from GPU to CPU.
+    /// Phase 1 of single-block eviction: allocate CPU slot, mark Evicting, submit
+    /// async D2H copies.  Does **not** synchronise the stream — the caller must
+    /// synchronise before calling `evict_finalize`.
     ///
-    /// Uses the configured eviction policy to select victims from
-    /// `candidates`, then copies each victim's data for all layers
-    /// (K and V) to the CPU swap buffer and releases the GPU physical
-    /// resources.
-    ///
-    /// Returns the list of successfully evicted block handles.
-    pub fn evict_blocks(
-        &self,
-        pool: &KcmmPool,
-        candidates: &[BlockHandle],
-        count: usize,
-    ) -> Result<Vec<BlockHandle>> {
-        if candidates.is_empty() || count == 0 {
-            return Ok(Vec::new());
-        }
-        // 1. Select victims
-        let victims = self.eviction_policy.select_victims(candidates, count);
-        if victims.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // 2. Evict each victim
-        let mut evicted = Vec::with_capacity(victims.len());
-        for &victim in &victims {
-            // Find the logical block index for this BlockHandle
-            let block_idx = pool
-                .find_block_idx(victim)
-                .ok_or_else(|| anyhow::anyhow!("victim block {:?} not found in pool", victim))?;
-
-            match self.evict_single_block(pool, block_idx, victim) {
-                Ok(()) => {
-                    self.eviction_policy.on_evict(victim);
-                    evicted.push(victim);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        block_idx,
-                        ?victim,
-                        error = %e,
-                        "KCMM: evict_single_block failed, skipping"
-                    );
-                    // Continue with the next victim — partial success is
-                    // better than total failure under memory pressure.
-                }
-            }
-        }
-
-        Ok(evicted)
-    }
-
-    /// Evict a single block from GPU to CPU.
-    ///
-    /// 1. Allocates a CPU swap buffer slot.
-    /// 2. Marks the block as `Evicting` (blocks concurrent access).
-    /// 3. Copies all layers' K+V data from GPU to CPU (async, on evict stream).
-    /// 4. Synchronises the evict stream.
-    /// 5. Releases GPU physical resources.
-    /// 6. Marks the block as `CpuResident`.
-    fn evict_single_block(
+    /// On failure the block is rolled back to `GpuResident` and the CPU slot freed.
+    fn evict_submit_async(
         &self,
         pool: &KcmmPool,
         block_idx: u32,
         handle: BlockHandle,
-    ) -> Result<()> {
+    ) -> Result<EvictContext> {
         let block_bytes = pool.block_bytes;
-        // Total bytes to copy: num_layers * 2 (K+V) * block_bytes
         let total_bytes = pool.num_layers * 2 * block_bytes;
 
         // 1. Allocate CPU slot
@@ -493,10 +454,8 @@ impl TieringEngine {
         // 2. Mark as Evicting — concurrent access will see this and back off
         pool.set_block_location(block_idx, BlockLocation::Evicting)?;
 
-        // 3. Copy all layers (async)
-        let copy_result = self.evict_single_block_all_layers(pool, handle, cpu_offset);
-
-        if let Err(e) = copy_result {
+        // 3. Submit all async D2H copies (no synchronise here — caller batches it)
+        if let Err(e) = self.evict_single_block_all_layers(pool, handle, cpu_offset) {
             // Rollback: return CPU slot, restore location
             self.free_cpu_slot(cpu_offset, total_bytes);
             // Best-effort restore to GpuResident — the original VA is still valid
@@ -511,7 +470,7 @@ impl TieringEngine {
                             block_idx,
                             ?handle,
                             error = %rollback_err,
-                            "KCMM: CRITICAL — failed to rollback location after memcpy error; block stuck as Evicting"
+                            "KCMM: CRITICAL — failed to rollback location after memcpy submit error; block stuck as Evicting"
                         );
                     }
                 }
@@ -527,24 +486,162 @@ impl TieringEngine {
             return Err(e);
         }
 
-        // 4. Synchronise evict stream
-        pool.streams.evict.synchronize()?;
-
-        // 5. Release GPU physical resources (return to per-layer free lists)
-        pool.release_block_physical(block_idx)?;
-
-        // 6. Mark as CpuResident
-        pool.set_block_location(block_idx, BlockLocation::CpuResident(cpu_offset))?;
-
-        tracing::debug!(
+        Ok(EvictContext {
             block_idx,
-            ?handle,
+            handle,
             cpu_offset,
             total_bytes,
+        })
+    }
+
+    /// Phase 3 of single-block eviction: release GPU physical resources and mark
+    /// `CpuResident`.  Must only be called after `pool.streams.evict.synchronize()`
+    /// has confirmed that all D2H copies completed successfully.
+    fn evict_finalize(&self, pool: &KcmmPool, ctx: EvictContext) -> Result<()> {
+        // Release GPU physical resources (return to per-layer free lists)
+        pool.release_block_physical(ctx.block_idx)?;
+
+        // Mark as CpuResident
+        pool.set_block_location(
+            ctx.block_idx,
+            BlockLocation::CpuResident(ctx.cpu_offset),
+        )?;
+
+        tracing::debug!(
+            ctx.block_idx,
+            ?ctx.handle,
+            ctx.cpu_offset,
+            ctx.total_bytes,
             "KCMM: evicted block to CPU"
         );
 
         Ok(())
+    }
+
+    /// Evict a single block from GPU to CPU (convenience wrapper).
+    ///
+    /// For batched eviction use `evict_blocks` which amortises the CUDA
+    /// stream synchronise across all victims.
+    #[allow(dead_code)]
+    fn evict_single_block(
+        &self,
+        pool: &KcmmPool,
+        block_idx: u32,
+        handle: BlockHandle,
+    ) -> Result<()> {
+        let ctx = self.evict_submit_async(pool, block_idx, handle)?;
+        pool.streams.evict.synchronize()?;
+        self.evict_finalize(pool, ctx)
+    }
+
+    /// Evict up to `count` blocks from GPU to CPU.
+    ///
+    /// Uses the configured eviction policy to select victims from
+    /// `candidates`, then copies each victim's data for all layers
+    /// (K and V) to the CPU swap buffer and releases the GPU physical
+    /// resources.
+    ///
+    /// The eviction is performed in three phases to amortise CUDA
+    /// stream synchronisation across all blocks:
+    ///
+    ///   1. Submit all async D2H copies (no synchronise)
+    ///   2. One `cuStreamSynchronize` for the entire batch
+    ///   3. Release physical resources and update block locations
+    ///
+    /// Returns the list of successfully evicted block handles.
+    pub fn evict_blocks(
+        &self,
+        pool: &KcmmPool,
+        candidates: &[BlockHandle],
+        count: usize,
+    ) -> Result<Vec<BlockHandle>> {
+        if candidates.is_empty() || count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // 1. Select victims
+        let victims = self.eviction_policy.select_victims(candidates, count);
+        if victims.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 2. Phase 1 — Submit all async D2H copies
+        let mut pending: Vec<EvictContext> = Vec::with_capacity(victims.len());
+        for &victim in &victims {
+            let block_idx = pool.find_block_idx(victim).ok_or_else(|| {
+                anyhow::anyhow!("victim block {:?} not found in pool", victim)
+            })?;
+
+            match self.evict_submit_async(pool, block_idx, victim) {
+                Ok(ctx) => pending.push(ctx),
+                Err(e) => {
+                    tracing::warn!(
+                        block_idx,
+                        ?victim,
+                        error = %e,
+                        "KCMM: evict_submit_async failed, skipping"
+                    );
+                    // Continue — partial success is better than total failure.
+                }
+            }
+        }
+
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 3. Phase 2 — ONE synchronise for the entire batch.
+        //    If this fails, *all* pending blocks may be in an unknown state
+        //    (some D2H copies may have completed, others not).  We
+        //    conservatively roll back every pending block.
+        if let Err(e) = pool.streams.evict.synchronize() {
+            tracing::error!(
+                pending_count = pending.len(),
+                error = %e,
+                "KCMM: batch evict synchronize failed; rolling back all pending blocks"
+            );
+            for ctx in pending {
+                self.free_cpu_slot(ctx.cpu_offset, ctx.total_bytes);
+                match pool.block_va_offset(ctx.handle) {
+                    Ok(va_off) => {
+                        let _ = pool.set_block_location(
+                            ctx.block_idx,
+                            BlockLocation::GpuResident(ctx.handle, va_off as u64),
+                        );
+                    }
+                    Err(va_err) => {
+                        tracing::error!(
+                            ctx.block_idx,
+                            ?ctx.handle,
+                            error = %va_err,
+                            "KCMM: CRITICAL — failed to rollback after batch sync failure"
+                        );
+                    }
+                }
+            }
+            return Err(e);
+        }
+
+        // 4. Phase 3 — Finalize all blocks (no GPU ops, fast)
+        let mut evicted = Vec::with_capacity(pending.len());
+        for ctx in pending {
+            let handle = ctx.handle;
+            match self.evict_finalize(pool, ctx) {
+                Ok(()) => {
+                    self.eviction_policy.on_evict(handle);
+                    evicted.push(handle);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        ?handle,
+                        error = %e,
+                        "KCMM: evict_finalize failed, skipping"
+                    );
+                }
+            }
+        }
+
+        Ok(evicted)
     }
 
     /// Copy all K and V layers for a block from GPU to CPU.
@@ -637,6 +734,99 @@ impl TieringEngine {
         Ok(())
     }
 
+    // --- Restoration ---
+
+    /// Phase 1 of single-block restoration: allocate GPU physical block,
+    /// update BlockInfo, submit async H2D copies.  Does **not** synchronise
+    /// the stream — the caller must synchronise before `restore_finalize`.
+    ///
+    /// On failure the new physical allocation is released and the block
+    /// reverts to `CpuResident`.
+    fn restore_submit_async(
+        &self,
+        pool: &KcmmPool,
+        block_idx: u32,
+        cpu_offset: usize,
+    ) -> Result<RestoreContext> {
+        let block_bytes = pool.block_bytes;
+        let total_bytes = pool.num_layers * 2 * block_bytes;
+
+        // 1. Mark as Restoring — concurrent access will see this and back off
+        pool.set_block_location(block_idx, BlockLocation::Restoring)?;
+
+        // 2. Allocate new GPU physical block
+        let (va_offset, sb_idx, blk_in_sb) = pool.alloc_one_block_internal()?;
+        let new_handle = BlockHandle {
+            superblock_idx: sb_idx,
+            block_index: blk_in_sb,
+        };
+
+        // 3. Update BlockInfo with the new physical allocation
+        pool.update_block_physical(block_idx, va_offset, sb_idx, blk_in_sb)?;
+
+        // 4. H2D memcpy for all layers (async, no synchronise — caller batches it)
+        if let Err(e) = self.restore_block_all_layers(pool, cpu_offset, va_offset) {
+            // Rollback: release the new physical allocation and revert to CpuResident.
+            if let Err(phys_err) = pool.release_block_physical(block_idx) {
+                tracing::error!(
+                    block_idx,
+                    ?new_handle,
+                    error = %phys_err,
+                    "KCMM: CRITICAL — failed to release physical block during restore rollback"
+                );
+            }
+            if let Err(loc_err) = pool.set_block_location(
+                block_idx,
+                BlockLocation::CpuResident(cpu_offset),
+            ) {
+                tracing::error!(
+                    block_idx,
+                    cpu_offset,
+                    error = %loc_err,
+                    "KCMM: CRITICAL — failed to revert location during restore rollback; block stuck as Restoring"
+                );
+            }
+            return Err(e);
+        }
+
+        Ok(RestoreContext {
+            block_idx,
+            cpu_offset,
+            total_bytes,
+            new_handle,
+            va_offset,
+        })
+    }
+
+    /// Phase 3 of single-block restoration: mark `GpuResident`, free the CPU
+    /// slot, and notify the policy.  Must only be called after
+    /// `pool.streams.restore.synchronize()` confirmed that all H2D copies
+    /// completed successfully.
+    fn restore_finalize(&self, pool: &KcmmPool, ctx: RestoreContext) -> Result<()> {
+        // Mark as GpuResident
+        pool.set_block_location(
+            ctx.block_idx,
+            BlockLocation::GpuResident(ctx.new_handle, ctx.va_offset as u64),
+        )?;
+
+        // Free CPU slot — the data is now on GPU, the CPU copy is stale
+        self.free_cpu_slot(ctx.cpu_offset, ctx.total_bytes);
+
+        // Notify policy — the block was just "accessed" via restore
+        self.eviction_policy.on_access(ctx.new_handle);
+
+        tracing::debug!(
+            ctx.block_idx,
+            ?ctx.new_handle,
+            ctx.cpu_offset,
+            ctx.va_offset,
+            ctx.total_bytes,
+            "KCMM: restored block from CPU to GPU"
+        );
+
+        Ok(())
+    }
+
     /// Restore a single block from CPU back to GPU.
     ///
     /// Called by `KcmmPool::restore_evicted_block` when a `CpuResident`
@@ -662,80 +852,9 @@ impl TieringEngine {
         block_idx: u32,
         cpu_offset: usize,
     ) -> Result<()> {
-        let block_bytes = pool.block_bytes;
-        let total_bytes = pool.num_layers * 2 * block_bytes;
-
-        // 1. Mark as Restoring — concurrent access will see this and back off
-        pool.set_block_location(block_idx, BlockLocation::Restoring)?;
-
-        // 2. Allocate new GPU physical block
-        let (va_offset, sb_idx, blk_in_sb) = pool.alloc_one_block_internal()?;
-        let new_handle = BlockHandle {
-            superblock_idx: sb_idx,
-            block_index: blk_in_sb,
-        };
-
-        // 3. Update BlockInfo with the new physical allocation (va_offset,
-        //    superblock_idx, and block_index_in_sb all change because the
-        //    new physical slot may be in a different superblock).
-        pool.update_block_physical(block_idx, va_offset, sb_idx, blk_in_sb)?;
-
-        // 4. H2D memcpy for all layers (async on restore stream)
-        let copy_result =
-            self.restore_block_all_layers(pool, cpu_offset, va_offset);
-
-        if let Err(e) = copy_result {
-            // Rollback: release the new physical allocation and revert to CpuResident.
-            // Each step is best-effort with its own error log — we must attempt both
-            // even if the first fails, so the block doesn't stay stuck as Restoring.
-            if let Err(phys_err) = pool.release_block_physical(block_idx) {
-                tracing::error!(
-                    block_idx,
-                    ?new_handle,
-                    error = %phys_err,
-                    "KCMM: CRITICAL — failed to release physical block during restore rollback"
-                );
-            }
-            if let Err(loc_err) = pool.set_block_location(
-                block_idx,
-                BlockLocation::CpuResident(cpu_offset),
-            ) {
-                tracing::error!(
-                    block_idx,
-                    cpu_offset,
-                    error = %loc_err,
-                    "KCMM: CRITICAL — failed to revert location during restore rollback; block stuck as Restoring"
-                );
-            }
-            return Err(e);
-        }
-
-        // 5. Synchronise restore stream — memcpy must complete before we
-        //    consider the block available for GPU access.
+        let ctx = self.restore_submit_async(pool, block_idx, cpu_offset)?;
         pool.streams.restore.synchronize()?;
-
-        // 6. Mark as GpuResident
-        pool.set_block_location(
-            block_idx,
-            BlockLocation::GpuResident(new_handle, va_offset as u64),
-        )?;
-
-        // 7. Free CPU slot — the data is now on GPU, the CPU copy is stale
-        self.free_cpu_slot(cpu_offset, total_bytes);
-
-        // 8. Notify policy — the block was just "accessed" via restore
-        self.eviction_policy.on_access(new_handle);
-
-        tracing::debug!(
-            block_idx,
-            ?new_handle,
-            cpu_offset,
-            va_offset,
-            total_bytes,
-            "KCMM: restored block from CPU to GPU"
-        );
-
-        Ok(())
+        self.restore_finalize(pool, ctx)
     }
 }
 
