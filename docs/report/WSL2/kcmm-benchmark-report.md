@@ -226,8 +226,8 @@ Amort. (new):   1.00×     1.37×     3.01×     4.06×    (monotonic scaling)
 
 ### Verdict
 
-The batch eviction amortisation curve is now **correct and monotonically
-improving**. The warmup leak masked this in the previous run. The memcpy-
+The batch eviction amortisation curve is now **correct and monotonicallyimproving**. 
+The warmup leak masked this in the previous run. The memcpy-
 batching optimization (commit `b864c77`) works as designed.
 
 ---

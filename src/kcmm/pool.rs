@@ -701,6 +701,64 @@ impl KcmmPool {
         }
     }
 
+    /// Restore multiple evicted blocks from CPU memory back to GPU.
+    ///
+    /// This is the batch counterpart to `restore_evicted_block`.  It extracts
+    /// the CPU offset for each block, validates that all are `CpuResident`,
+    /// and delegates to the tiering engine's batched restore path.  When
+    /// batching infrastructure is available and the batch size is ≥4 blocks,
+    /// the scatter-kernel path is used; otherwise each block is restored
+    /// individually via the single-block path.
+    ///
+    /// Blocks that are already `GpuResident` are silently skipped (no-op).
+    pub fn restore_evicted_blocks(&self, block_indices: &[u32]) -> Result<()> {
+        let tiering = self
+            .tiering
+            .as_ref()
+            .ok_or_else(|| anyhow!("tiering is disabled; cannot restore evicted blocks"))?;
+
+        // Collect (block_idx, cpu_offset) pairs, skipping already-resident blocks.
+        let mut blocks: Vec<(u32, usize)> = Vec::with_capacity(block_indices.len());
+        {
+            let info = self.block_info.lock();
+            for &block_idx in block_indices {
+                let bi = info
+                    .get(block_idx as usize)
+                    .ok_or_else(|| anyhow!("block_idx {} out of bounds", block_idx))?;
+                if !bi.in_use {
+                    return Err(anyhow!("block_idx {} is not in use", block_idx));
+                }
+                match &bi.location {
+                    BlockLocation::CpuResident(offset) => {
+                        blocks.push((block_idx, *offset));
+                    }
+                    BlockLocation::GpuResident(..) => {
+                        // Already resident — skip.
+                    }
+                    BlockLocation::Evicting | BlockLocation::Restoring => {
+                        return Err(anyhow!(
+                            "block {} is in transit ({:?}); cannot restore",
+                            block_idx,
+                            bi.location
+                        ));
+                    }
+                    BlockLocation::NvmeResident(_) => {
+                        return Err(anyhow!(
+                            "block {} is NVMe-resident; NVMe restore not yet implemented",
+                            block_idx
+                        ));
+                    }
+                }
+            }
+        } // lock dropped
+
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        tiering.restore_blocks(self, &blocks)
+    }
+
     /// Compute the byte offset of a block within each layer's VA region.
     ///
     /// All K/V pools across all layers are in lockstep — the same

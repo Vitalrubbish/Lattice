@@ -1238,6 +1238,42 @@ impl TieringEngine {
         Ok(())
     }
 
+    /// Restore up to `blocks.len()` evicted blocks from CPU back to GPU.
+    ///
+    /// This is the public entry point for batch restoration.  It
+    /// automatically selects the batched path (`restore_blocks_batched`)
+    /// when the batch size justifies the scatter-kernel launch overhead
+    /// (≥4 blocks), falling back to sequential single-block restore for
+    /// smaller batches or when the batching infrastructure is unavailable.
+    ///
+    /// Each entry in `blocks` is `(block_idx, cpu_offset)`.  The caller
+    /// must have already verified that each block is in `CpuResident` state.
+    ///
+    /// Mirrors the auto-dispatch pattern of `evict_blocks`.
+    pub(crate) fn restore_blocks(
+        &self,
+        pool: &KcmmPool,
+        blocks: &[(u32, usize)],
+    ) -> Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        const MIN_BATCH_FOR_SCATTER: usize = 4;
+        if blocks.len() >= MIN_BATCH_FOR_SCATTER
+            && self.scatter_kernel.is_some()
+            && self.gpu_staging.is_some()
+        {
+            return self.restore_blocks_batched(pool, blocks);
+        }
+
+        // Fall back to sequential single-block restore.
+        for &(block_idx, cpu_offset) in blocks {
+            self.restore_block(pool, block_idx, cpu_offset)?;
+        }
+        Ok(())
+    }
+
     /// Copy all K and V layers for a block from CPU to GPU.
     ///
     /// Reads from the CPU swap buffer at `cpu_offset` and writes to each

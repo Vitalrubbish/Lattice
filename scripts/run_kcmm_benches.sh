@@ -93,6 +93,10 @@ declare -a BENCHMARKS=(
     "kcmm_bench_batch_eviction_amortization|kcmm_bench_tiering|Benchmark 2b — Batch Eviction Amortisation (batch size sweep)"
     "kcmm_bench_cumemmap_latency|kcmm_bench_tiering|Benchmark 2c — Standalone cuMemMap/cuMemUnmap Latency"
     "kcmm_bench_tiering_roundtrip_data_integrity|kcmm_bench_tiering|Benchmark 2d — Evict→Restore Data Integrity (roundtrip)"
+    "kcmm_bench_batch_restore_amortization|kcmm_bench_tiering|Benchmark 2e — Batch Restore Amortisation (batch size sweep)"
+
+    # Benchmark 3: CUDA Stream Interference
+    "kcmm_bench_stream_interference|kcmm_bench_tiering|Benchmark 3 — CUDA Stream Interference (default vs dedicated streams)"
 
     # Benchmark 4 (Step 3): cuMemMap overhead per layer
     "step3_cumemmap_overhead|step3_benchmarks|Benchmark 4 — Per-Layer cuMemMap/cuMemUnmap Overhead (22 layers)"
