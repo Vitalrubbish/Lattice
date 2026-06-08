@@ -185,6 +185,8 @@ fn kcmm_bench_batch_eviction_amortization() {
             pool.restore_evicted_block(*idx).expect("warmup restore");
         }
         // Free the warmup blocks
+        let warmup_indices: Vec<u32> = pairs.iter().map(|(idx, _)| *idx).collect();
+        pool.free_sequence(&warmup_indices);
     }
 
     // Collect per-batch averages, then compute amortisation factor.

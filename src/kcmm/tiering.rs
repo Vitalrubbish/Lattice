@@ -1086,10 +1086,13 @@ impl TieringEngine {
         }
 
         // --- Phase 2: CPU gather → batched H2D → scatter kernel per layer ---
-        // All GPU operations are submitted on the restore stream in order.
-        // One synchronize at the end (Phase 3) waits for all layers.
+        //
+        // All GPU operations (H2D staging, H2D ptrs, scatter kernel) are
+        // submitted on the default (null) stream so they are serialised in
+        // order.  This eliminates the two-stream race between the restore
+        // stream and the default stream that existed in the previous version,
+        // and matches the eviction path's single-stream pattern.
         let actual_n = pending.len();
-        let _restore_stream = pool.streams.restore.as_raw();
         let mut ptrs_keepalive: Vec<CudaSlice<u64>> = Vec::with_capacity(num_layers * 2);
         let mut layer_idx: usize = 0;
         for l in 0..num_layers {
@@ -1109,17 +1112,27 @@ impl TieringEngine {
                     }
                 }
 
-                // Step 2b: Batched H2D on restore stream — CPU staging[this layer] → GPU staging
+                // Step 2b: Batched H2D on default stream — CPU staging[this layer] → GPU staging.
+                // Submitting on the default stream ensures ordering with the ptrs
+                // H2D and scatter kernel below (all on the same stream).
                 let layer_byte_offset = layer_idx * actual_n * block_bytes;
                 let nbytes = actual_n * block_bytes;
                 let gpu_staging_ptr =
                     CudaContext::device_ptr(gpu_staging) as sys::CUdeviceptr;
-                unsafe {
-                    pool.streams.restore.memcpy_h2d_async(
+                let cu_result = unsafe {
+                    sys::lib().cuMemcpyHtoDAsync_v2(
                         gpu_staging_ptr,
-                        self.cpu_staging.as_ptr().add(layer_byte_offset),
+                        self.cpu_staging.as_ptr().add(layer_byte_offset)
+                            as *const std::ffi::c_void,
                         nbytes,
-                    )?;
+                        std::ptr::null_mut(), // default stream
+                    )
+                };
+                if cu_result != sys::CUresult::CUDA_SUCCESS {
+                    return Err(anyhow::anyhow!(
+                        "cuMemcpyHtoDAsync_v2 (staging) failed in batched restore: {:?}",
+                        cu_result,
+                    ));
                 }
 
                 // Step 2c: Build destination pointer array for scatter kernel
@@ -1133,57 +1146,65 @@ impl TieringEngine {
                     ptrs_host.push(gpu_va);
                 }
 
-                // Allocate device array and upload ptrs asynchronously on restore stream.
+                // Step 2d: Allocate device array and upload ptrs on default stream.
+                // Submitting on the default stream ensures the scatter kernel
+                // (launched on the same stream below) sees the uploaded ptrs.
                 let ptrs_dev_layer = device
                     .alloc_zeros::<u64>(actual_n)
                     .context("alloc ptrs layer device array for restore")?;
                 let nbytes_ptrs = actual_n * std::mem::size_of::<u64>();
                 let ptrs_dev_ptr = CudaContext::device_ptr(&ptrs_dev_layer) as sys::CUdeviceptr;
-                // SAFETY: ptrs_host is a valid host buffer; ptrs_dev_layer is kept alive
-                // in ptrs_keepalive until after synchronize.
-                unsafe {
-                    pool.streams.restore.memcpy_h2d_async(
+                let cu_result = unsafe {
+                    sys::lib().cuMemcpyHtoDAsync_v2(
                         ptrs_dev_ptr,
-                        ptrs_host.as_ptr() as *const u8,
+                        ptrs_host.as_ptr() as *const std::ffi::c_void,
                         nbytes_ptrs,
-                    )?;
+                        std::ptr::null_mut(), // default stream
+                    )
+                };
+                if cu_result != sys::CUresult::CUDA_SUCCESS {
+                    return Err(anyhow::anyhow!(
+                        "cuMemcpyHtoDAsync_v2 (ptrs) failed in batched restore: {:?}",
+                        cu_result,
+                    ));
                 }
 
-                // Ensure ptrs H2D completes before kernel reads the ptrs array.
-                pool.streams.restore.synchronize()?;
+                // Step 2e: Launch scatter kernel on default stream.
+                // Default-stream ordering guarantees that the H2D operations
+                // above (staging + ptrs) have completed on the GPU before the
+                // kernel begins reading gpu_staging and ptrs_dev_layer.
+                // SAFETY: all destination VAs are valid GPU addresses allocated
+                // by the pool; the kernel launch itself is a safe wrapper.
+                crate::cuda::kernels::launch_kv_scatter(
+                    scatter_kernel,
+                    gpu_staging,
+                    &ptrs_dev_layer,
+                    half_count,
+                    actual_n,
+                )?;
 
-                // Launch scatter kernel on default stream: GPU staging → scattered block VAs.
-                // SAFETY: all destination VAs are valid GPU addresses allocated by the pool.
-                unsafe {
-                    crate::cuda::kernels::launch_kv_scatter(
-                        scatter_kernel,
-                        gpu_staging,
-                        &ptrs_dev_layer,
-                        half_count,
-                        actual_n,
-                    )?;
-                }
-
-                // Synchronous H2D: GPU staging ← ... wait, restore does H2D not D2H.
-                // The H2D for staging data is already async (step 2b above).
-                // After the scatter kernel, we need a synchronize on the default stream.
-                // We rely on the Phase 3 synchronize below for the restore stream.
-                // (restore_blocks_batched is not yet wired in; this code compiles but
-                // has the same ordering issue as the pre-fix eviction path — FIXME.)
-
-                // Keep ptrs_dev_layer alive until after synchronize.
+                // Keep ptrs_dev_layer alive until after the final synchronize
+                // (scatter kernel may still be running asynchronously).
                 ptrs_keepalive.push(ptrs_dev_layer);
 
                 layer_idx += 1;
             }
         }
 
-        // --- Phase 3: Synchronise ---
-        if let Err(e) = pool.streams.restore.synchronize() {
+        // --- Phase 3: Synchronise default stream ---
+        // All GPU operations (H2D staging, H2D ptrs, scatter kernels for every
+        // layer) were submitted on the default stream.  One device synchronize
+        // waits for all of them.
+        //
+        // On failure, roll back every pending block: release the new physical
+        // allocation and revert to CpuResident.  The GPU data for these blocks
+        // may be inconsistent after a failed sync, but CPU-side state is restored
+        // to a safe, pre-restore condition.
+        if let Err(e) = device.synchronize() {
             tracing::error!(
                 pending_count = actual_n,
                 error = %e,
-                "KCMM: batched restore synchronize failed; rolling back"
+                "KCMM: batched restore default-stream synchronize failed; rolling back all pending blocks"
             );
             for ctx in &pending {
                 let _ = pool.release_block_physical(ctx.block_idx);
@@ -1192,8 +1213,13 @@ impl TieringEngine {
                     BlockLocation::CpuResident(ctx.cpu_offset),
                 );
             }
-            return Err(e);
+            return Err(anyhow::anyhow!(
+                "batched restore synchronize failed: {:#}", e
+            ));
         }
+
+        // ptrs_dev_layer arrays are no longer needed; drop them.
+        drop(ptrs_keepalive);
 
         // --- Phase 4: Finalize ---
         for ctx in pending {
