@@ -103,6 +103,10 @@ declare -a BENCHMARKS=(
 
     # Benchmark 6 (Step 3): Max Concurrent Requests
     "step3_max_concurrent_requests|step3_benchmarks|Benchmark 6 — Maximum Concurrent Requests (capacity at workload)"
+
+    # Benchmark 5 (Phase 1c): Memory Pressure — Tiering Capacity Benefit
+    "kcmm_bench_memory_pressure_single|kcmm_bench_memory_pressure|Benchmark 5a — Memory Pressure Single Config (baseline vs KCMM tiering)"
+    "kcmm_bench_memory_pressure_sweep|kcmm_bench_memory_pressure|Benchmark 5b — Memory Pressure Sweep (block size × pool capacity × prompt dist)"
 )
 
 # If filter is set, only keep matching tests

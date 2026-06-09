@@ -256,41 +256,51 @@ fn evict_coldest_blocks(
     pool: &KcmmPool,
     tiering: &TieringEngine,
     seqs: &[TrackedSeq],
-    count: usize,
+    min_count: usize,
 ) -> bool {
-    let mut candidates: Vec<(u32, BlockHandle)> = Vec::new();
+    // Always collect at least MIN_BATCH_FOR_GATHER (8) candidates so the
+    // batched eviction path (gather kernel) is used — one synchronise for
+    // all victims instead of one per victim.  This cuts synchronise calls
+    // from O(victims) to O(1) per eviction batch.
+    const TARGET_BATCH: usize = 8;
+    let target = min_count.max(TARGET_BATCH);
+
+    let t_scan = Instant::now();
+    let mut candidates: Vec<(u32, BlockHandle)> = Vec::with_capacity(target);
 
     // Select blocks from inactive (cooled) sequences first.
     for seq in seqs.iter().filter(|s| !s.is_active) {
         for &block_idx in &seq.block_indices {
             if let Some(handle) = pool.get_block_handle(block_idx) {
                 candidates.push((block_idx, handle));
-                if candidates.len() >= count {
+                if candidates.len() >= target {
                     break;
                 }
             }
         }
-        if candidates.len() >= count {
+        if candidates.len() >= target {
             break;
         }
     }
 
     // If not enough inactive, take from active sequences too.
-    if candidates.len() < count {
+    if candidates.len() < target {
         for seq in seqs.iter().filter(|s| s.is_active) {
             for &block_idx in &seq.block_indices {
                 if let Some(handle) = pool.get_block_handle(block_idx) {
                     candidates.push((block_idx, handle));
-                    if candidates.len() >= count {
+                    if candidates.len() >= target {
                         break;
                     }
                 }
             }
-            if candidates.len() >= count {
+            if candidates.len() >= target {
                 break;
             }
         }
     }
+
+    let scan_us = t_scan.elapsed().as_micros() as u64;
 
     if candidates.is_empty() {
         return false;
@@ -299,7 +309,18 @@ fn evict_coldest_blocks(
     let handles: Vec<BlockHandle> = candidates.iter().map(|(_, h)| *h).collect();
     let batch_size = handles.len();
 
-    tiering.evict_blocks(pool, &handles, batch_size).is_ok()
+    let t_evict = Instant::now();
+    let ok = tiering.evict_blocks(pool, &handles, batch_size).is_ok();
+    let evict_us = t_evict.elapsed().as_micros() as u64;
+
+    if scan_us + evict_us > 5000 {
+        println!(
+            "    [evict detail] batch={}  scan={}µs  evict={}µs  total={}µs",
+            batch_size, scan_us, evict_us, scan_us + evict_us,
+        );
+    }
+
+    ok
 }
 
 fn try_alloc_with_eviction(
@@ -340,6 +361,9 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
     let mut eviction_count = 0usize;
     let mut peak_cpu_swap: u64 = 0;
     let mut seq_counter = 0usize;
+    let mut eviction_time_us: u64 = 0;
+    let mut alloc_time_us: u64 = 0;
+    let mut cool_touch_time_us: u64 = 0;
 
     // Pre-fill: admit sequences until the pool is saturated (~80% of max_batch).
     loop {
@@ -347,6 +371,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
         let initial_blocks = (prompt_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens;
         let target_len = prompt_len + cfg.max_new_tokens;
 
+        let t_alloc = Instant::now();
         let block_table = match try_alloc_with_eviction(
             pool, tiering, &active_seqs, initial_blocks,
             &mut eviction_count, &mut peak_cpu_swap, block_bytes,
@@ -354,6 +379,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
             Some(bt) => bt,
             None => break, // Can't admit — pre-fill complete.
         };
+        alloc_time_us += t_alloc.elapsed().as_micros() as u64;
 
         total_blocks_allocated += initial_blocks;
         let seq_idx = pool.register_sequence(block_table.clone());
@@ -383,6 +409,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
     for step in 0..total_steps {
         // Periodically cool some active sequences to create eviction candidates.
         if step % 8 == 0 && step > 0 {
+            let t_cool = Instant::now();
             let cool_count = (active_seqs.len() / 4).max(1);
             let mut cooled = 0;
             for seq in active_seqs.iter_mut() {
@@ -396,6 +423,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
             for seq in active_seqs.iter_mut().filter(|s| s.is_active) {
                 pool.touch(seq.seq_idx);
             }
+            cool_touch_time_us += t_cool.elapsed().as_micros() as u64;
         }
 
         // 1. Grow active sequences.
@@ -429,11 +457,13 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
                     }
                     Err(_) => {
                         // Try eviction, then retry once.
+                        let t_evict = Instant::now();
                         if evict_coldest_blocks(pool, tiering, &still_active, 4) {
                             eviction_count += 1;
                             peak_cpu_swap = peak_cpu_swap
                                 .max((eviction_count as u64).saturating_mul(block_bytes));
                         }
+                        eviction_time_us += t_evict.elapsed().as_micros() as u64;
                         match pool.alloc_block() {
                             Ok(block_idx) => {
                                 total_blocks_allocated += 1;
@@ -509,6 +539,17 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
         }
     }
 
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    if eviction_count > 0 {
+        println!(
+            "    [kcmm timing] total={}ms  eviction={}ms  alloc={}ms  cool/touch={}ms",
+            elapsed_ms,
+            eviction_time_us / 1000,
+            alloc_time_us / 1000,
+            cool_touch_time_us / 1000,
+        );
+    }
+
     CapacityResult {
         completed,
         capped,
@@ -518,7 +559,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
         total_blocks_allocated,
         eviction_count,
         cpu_swap_peak_bytes: peak_cpu_swap,
-        elapsed_ms: t0.elapsed().as_millis() as u64,
+        elapsed_ms,
     }
 }
 
