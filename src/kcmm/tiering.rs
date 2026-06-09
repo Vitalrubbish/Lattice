@@ -667,7 +667,7 @@ impl TieringEngine {
 
         // If memcpy batching is available and the victim count justifies the
         // gather-kernel launch overhead, use the batched path.
-        const MIN_BATCH_FOR_GATHER: usize = 4;
+        const MIN_BATCH_FOR_GATHER: usize = 8;
         if victims.len() >= MIN_BATCH_FOR_GATHER
             && self.gather_kernel.is_some()
             && self.gpu_staging.is_some()
@@ -1259,7 +1259,7 @@ impl TieringEngine {
             return Ok(());
         }
 
-        const MIN_BATCH_FOR_SCATTER: usize = 4;
+        const MIN_BATCH_FOR_SCATTER: usize = 8;
         if blocks.len() >= MIN_BATCH_FOR_SCATTER
             && self.scatter_kernel.is_some()
             && self.gpu_staging.is_some()
