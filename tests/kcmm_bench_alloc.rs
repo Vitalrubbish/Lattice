@@ -17,17 +17,8 @@ use baseline_llm_os::kcmm::pool::KcmmPool;
 use std::sync::Arc;
 use std::time::Instant;
 
-// --- Helpers ---
-
-/// Compute the `p`-th percentile (0..100) over a mutable slice.
-/// **Sorts** the slice in-place for efficiency across multiple calls.
-fn percentile(data: &mut [u64], p: f64) -> u64 {
-    assert!(!data.is_empty(), "percentile: empty data");
-    assert!(p >= 0.0 && p <= 100.0, "percentile p out of range");
-    data.sort_unstable();
-    let idx = ((data.len() as f64 * p / 100.0).ceil() as usize).saturating_sub(1);
-    data[idx.min(data.len() - 1)]
-}
+mod bench_utils;
+use bench_utils::*;
 
 /// Run `num_ops` alloc(1-block) → free cycles, returning raw latency samples
 /// in nanoseconds.
@@ -211,9 +202,14 @@ fn kcmm_bench_alloc_concurrent_sequences() {
     println!("\n=== KCMM Benchmark 1c: Multi-Sequence Allocation ===");
 
     // Allocate many concurrent sequences, each with 4 blocks (simulates
-    // multi-user workload), then free all.
+    // multi-user workload), then free all.  Run multiple rounds for
+    // statistically meaningful results.
     let concurrency = 64usize;
     let blocks_per_seq = 4usize;
+    let total_blocks = concurrency * blocks_per_seq;
+    let rounds = 16;
+    let mut alloc_per_block_ns: Vec<u64> = Vec::with_capacity(rounds);
+    let mut free_per_block_ns: Vec<u64> = Vec::with_capacity(rounds);
 
     // Warmup
     for _ in 0..16 {
@@ -221,39 +217,34 @@ fn kcmm_bench_alloc_concurrent_sequences() {
         pool.free_sequence(&table);
     }
 
-    let t0 = Instant::now();
-    let mut all_tables = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        let table = pool.alloc_sequence(blocks_per_seq).expect("multi-seq alloc");
-        all_tables.push(table);
-    }
-    let alloc_elapsed = t0.elapsed();
-    let total_blocks = concurrency * blocks_per_seq;
+    for _ in 0..rounds {
+        let t0 = Instant::now();
+        let mut all_tables = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let table = pool.alloc_sequence(blocks_per_seq).expect("multi-seq alloc");
+            all_tables.push(table);
+        }
+        let total_ns = t0.elapsed().as_nanos() as u64;
+        alloc_per_block_ns.push(total_ns / total_blocks as u64);
 
-    let t0 = Instant::now();
-    for table in &all_tables {
-        pool.free_sequence(table);
+        let t0 = Instant::now();
+        for table in &all_tables {
+            pool.free_sequence(table);
+        }
+        let total_ns = t0.elapsed().as_nanos() as u64;
+        free_per_block_ns.push(total_ns / total_blocks as u64);
     }
-    let free_elapsed = t0.elapsed();
 
     println!("  concurrency:          {concurrency} sequences");
     println!("  blocks per sequence:  {blocks_per_seq}");
     println!("  total blocks:         {total_blocks}");
-    println!(
-        "  alloc total:          {:.2} µs ({:.2} ns/block)",
-        alloc_elapsed.as_micros(),
-        alloc_elapsed.as_nanos() as f64 / total_blocks as f64
-    );
-    println!(
-        "  free total:           {:.2} µs ({:.2} ns/block)",
-        free_elapsed.as_micros(),
-        free_elapsed.as_nanos() as f64 / total_blocks as f64
-    );
+    print_latency_stats("alloc_per_block", &mut alloc_per_block_ns, "ns");
+    print_latency_stats("free_per_block", &mut free_per_block_ns, "ns");
 
     // Sanity: per-block overhead should be reasonable.
     // With N layers, each logical block requires 2N physical allocations
     // (K+V per layer), plus cuMemMap.  200 µs/block is a generous upper bound.
-    let alloc_ns_per_block = alloc_elapsed.as_nanos() as f64 / total_blocks as f64;
+    let alloc_ns_per_block = mean(&alloc_per_block_ns);
     assert!(
         alloc_ns_per_block < 200_000.0,
         "alloc per block {alloc_ns_per_block:.0} ns exceeds 200 µs — suspicious"

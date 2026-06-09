@@ -178,7 +178,7 @@ fn step3_cumemmap_overhead() {
         .map(|_| vmm.reserve_address(SUPERBLOCK_SIZE).expect("reserve V"))
         .collect();
 
-    let iters = 16;
+    let iters = 64;
     
 
     // --- Per-layer mapping benchmark (mimics per-block approach) ---
