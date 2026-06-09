@@ -402,7 +402,7 @@ impl TieringEngine {
                     std::ptr::null_mut(),
                     cpu_buffer_size,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
+                    libc::MAP_SHARED | libc::MAP_POPULATE,
                     file.as_raw_fd(),
                     0,
                 )
@@ -414,6 +414,16 @@ impl TieringEngine {
                     cpu_buffer_size,
                     std::io::Error::last_os_error()
                 ));
+            }
+            // Pre-fault all pages to avoid per-page fault overhead during the
+            // CPU scatter/gather phases (which otherwise add ~4 ms per batch).
+            // MADV_WILLNEED triggers asynchronous readahead; MADV_SEQUENTIAL
+            // hints that pages will be accessed in order, improving prefetch.
+            if cpu_buffer_size > 0 {
+                unsafe {
+                    libc::madvise(ptr, cpu_buffer_size, libc::MADV_WILLNEED);
+                    libc::madvise(ptr, cpu_buffer_size, libc::MADV_SEQUENTIAL);
+                }
             }
             ptr as *mut u8
         } else {
@@ -821,12 +831,15 @@ impl TieringEngine {
         // --- Phase 2: GPU gather + batched D2H per layer ---
         // All GPU operations are submitted on the default (null) stream so they
         // execute in order.  One synchronize at the end waits for all layers.
-        // Legacy default-stream behaviour ensures implicit ordering with any
-        // pending evict-stream work.
-        //
-        // ptrs_dev arrays must live until after the final synchronize; collected
-        // here and dropped after Phase 3.
-        let mut ptrs_keepalive: Vec<CudaSlice<u64>> = Vec::with_capacity(num_layers * 2);
+        // Legacy default-stream behaviour ensures implicit ordering, which
+        // guarantees that by the time we upload ptrs for layer N+1, the gather
+        // kernel for layer N has already consumed its ptrs data.  We can
+        // therefore reuse a single device-side pointer array for all layers
+        // instead of allocating a new one each iteration (44 allocs → 1).
+        let ptrs_dev = device
+            .alloc_zeros::<u64>(self.max_batch_blocks)
+            .context("alloc ptrs device array")?;
+        let ptrs_dev_base = CudaContext::device_ptr(&ptrs_dev) as sys::CUdeviceptr;
         let mut layer_idx: usize = 0;
         for l in 0..num_layers {
             for is_v in [false, true] {
@@ -843,18 +856,14 @@ impl TieringEngine {
                     ptrs_host.push(gpu_va);
                 }
 
-                // Allocate device array for ptrs.
-                let ptrs_dev_layer = device
-                    .alloc_zeros::<u64>(actual_n)
-                    .context("alloc ptrs layer device array")?;
-
-                // Upload ptrs array on the DEFAULT stream (null = ordered with
-                // subsequent kernel launch).
+                // Upload ptrs into the reused device array on the DEFAULT stream.
+                // Default-stream ordering guarantees the previous layer's gather
+                // kernel (and D2H) have completed before this H2D begins, so
+                // overwriting the buffer is safe.
                 let nbytes_ptrs = actual_n * std::mem::size_of::<u64>();
-                let ptrs_dev_ptr = CudaContext::device_ptr(&ptrs_dev_layer) as sys::CUdeviceptr;
                 let cu_result = unsafe {
                     sys::lib().cuMemcpyHtoDAsync_v2(
-                        ptrs_dev_ptr,
+                        ptrs_dev_base,
                         ptrs_host.as_ptr() as *const std::ffi::c_void,
                         nbytes_ptrs,
                         std::ptr::null_mut(), // default stream
@@ -868,10 +877,12 @@ impl TieringEngine {
 
                 // Launch gather kernel on default stream: scattered blocks → contiguous GPU staging.
                 // SAFETY: all source VAs are valid GPU addresses allocated by the pool.
+                // ptrs_dev has max_batch_blocks elements; the kernel only reads indices
+                // 0..actual_n, so the larger allocation is fine.
                 unsafe {
                     crate::cuda::kernels::launch_kv_gather(
                         gather_kernel,
-                        &ptrs_dev_layer,
+                        &ptrs_dev,
                         gpu_staging,
                         half_count,
                         actual_n,
@@ -901,7 +912,6 @@ impl TieringEngine {
                     ));
                 }
 
-                ptrs_keepalive.push(ptrs_dev_layer);
                 layer_idx += 1;
             }
         }
@@ -911,8 +921,8 @@ impl TieringEngine {
         // on the default stream.  One synchronize waits for all layers.
         device.synchronize().context("batched evict default-stream synchronize")?;
 
-        // ptrs_dev_layer arrays are no longer needed; drop them.
-        drop(ptrs_keepalive);
+        // ptrs_dev is no longer needed; all kernel launches have completed.
+        drop(ptrs_dev);
 
         // --- Phase 4: CPU scatter — staging → per-block CPU slots ---
         // CPU staging layout: [batch_K0][batch_V0][batch_K1][batch_V1]
@@ -1092,8 +1102,15 @@ impl TieringEngine {
         // order.  This eliminates the two-stream race between the restore
         // stream and the default stream that existed in the previous version,
         // and matches the eviction path's single-stream pattern.
+        //
+        // Same pre-allocation optimisation as evict_blocks_batched: one
+        // device-side pointer array reused across all layers instead of
+        // 44 separate allocations.
         let actual_n = pending.len();
-        let mut ptrs_keepalive: Vec<CudaSlice<u64>> = Vec::with_capacity(num_layers * 2);
+        let ptrs_dev = device
+            .alloc_zeros::<u64>(self.max_batch_blocks)
+            .context("alloc ptrs device array for restore")?;
+        let ptrs_dev_base = CudaContext::device_ptr(&ptrs_dev) as sys::CUdeviceptr;
         let mut layer_idx: usize = 0;
         for l in 0..num_layers {
             for is_v in [false, true] {
@@ -1146,17 +1163,13 @@ impl TieringEngine {
                     ptrs_host.push(gpu_va);
                 }
 
-                // Step 2d: Allocate device array and upload ptrs on default stream.
-                // Submitting on the default stream ensures the scatter kernel
-                // (launched on the same stream below) sees the uploaded ptrs.
-                let ptrs_dev_layer = device
-                    .alloc_zeros::<u64>(actual_n)
-                    .context("alloc ptrs layer device array for restore")?;
+                // Step 2d: Upload ptrs into reused device array on default stream.
+                // Default-stream ordering guarantees the previous layer's scatter
+                // kernel has consumed its ptrs data before this H2D overwrites.
                 let nbytes_ptrs = actual_n * std::mem::size_of::<u64>();
-                let ptrs_dev_ptr = CudaContext::device_ptr(&ptrs_dev_layer) as sys::CUdeviceptr;
                 let cu_result = unsafe {
                     sys::lib().cuMemcpyHtoDAsync_v2(
-                        ptrs_dev_ptr,
+                        ptrs_dev_base,
                         ptrs_host.as_ptr() as *const std::ffi::c_void,
                         nbytes_ptrs,
                         std::ptr::null_mut(), // default stream
@@ -1170,22 +1183,16 @@ impl TieringEngine {
                 }
 
                 // Step 2e: Launch scatter kernel on default stream.
-                // Default-stream ordering guarantees that the H2D operations
-                // above (staging + ptrs) have completed on the GPU before the
-                // kernel begins reading gpu_staging and ptrs_dev_layer.
                 // SAFETY: all destination VAs are valid GPU addresses allocated
-                // by the pool; the kernel launch itself is a safe wrapper.
+                // by the pool.  ptrs_dev has max_batch_blocks elements; the kernel
+                // only reads indices 0..actual_n.
                 crate::cuda::kernels::launch_kv_scatter(
                     scatter_kernel,
                     gpu_staging,
-                    &ptrs_dev_layer,
+                    &ptrs_dev,
                     half_count,
                     actual_n,
                 )?;
-
-                // Keep ptrs_dev_layer alive until after the final synchronize
-                // (scatter kernel may still be running asynchronously).
-                ptrs_keepalive.push(ptrs_dev_layer);
 
                 layer_idx += 1;
             }
@@ -1218,8 +1225,8 @@ impl TieringEngine {
             ));
         }
 
-        // ptrs_dev_layer arrays are no longer needed; drop them.
-        drop(ptrs_keepalive);
+        // ptrs_dev is no longer needed; all scatter kernels have completed.
+        drop(ptrs_dev);
 
         // --- Phase 4: Finalize ---
         for ctx in pending {
