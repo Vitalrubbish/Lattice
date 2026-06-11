@@ -3,11 +3,15 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use baseline_llm_os::batch::{ContinuousScheduler, InferenceQueue, StaticScheduler, StatsHandle};
+use baseline_llm_os::batch::{CacheBackend, ContinuousScheduler, InferenceQueue, StaticScheduler, StatsHandle};
 use baseline_llm_os::cache::paged_kv::PagedKvCache;
 use baseline_llm_os::cache::KvCache;
 use baseline_llm_os::config::ModelConfig;
+#[cfg(feature = "kcmm")]
+use baseline_llm_os::config::KcmmConfig;
 use baseline_llm_os::cuda::CudaContext;
+#[cfg(feature = "kcmm")]
+use baseline_llm_os::kcmm::KcmmPool;
 use baseline_llm_os::model::{
     LlamaTransformer, LoaderKind, ModelLoader, ModelWeights, NaiveTransformer, Transformer,
 };
@@ -43,6 +47,13 @@ struct Cli {
     /// Use LlamaTransformer with real attention weights instead of NaiveTransformer.
     #[arg(long)]
     llama: bool,
+
+    /// Use KCMM pool with tiering support instead of the baseline PagedKvCache.
+    /// Only meaningful when `--continuous` is also specified.
+    /// Requires the `kcmm` feature flag.
+    #[cfg(feature = "kcmm")]
+    #[arg(long)]
+    kcmm: bool,
 }
 
 #[tokio::main]
@@ -91,22 +102,52 @@ async fn main() -> Result<()> {
     let stats_handle = StatsHandle::new();
 
     if cli.continuous {
-        let cache = PagedKvCache::new(
-            ctx.clone(),
-            cfg.clone(),
-            cli.max_batch,
-            cli.max_seq_len,
-            16,
-        )?;
+        #[cfg(feature = "kcmm")]
+        let backend = if cli.kcmm {
+            let kcmm_cfg = KcmmConfig::default();
+            let pool = KcmmPool::new(
+                ctx.clone(),
+                kcmm_cfg,
+                cfg.num_hidden_layers,
+                cfg.kv_heads(),
+                cfg.head_dim(),
+                cli.max_batch,
+                cli.max_seq_len,
+            )?;
+            tracing::info!("using KCMM pool backend (tiering={})", pool.tiering.is_some());
+            CacheBackend::Kcmm(Arc::new(pool))
+        } else {
+            let cache = PagedKvCache::new(
+                ctx.clone(),
+                cfg.clone(),
+                cli.max_batch,
+                cli.max_seq_len,
+                16,
+            )?;
+            tracing::info!("using baseline PagedKvCache backend");
+            CacheBackend::Baseline(Arc::new(cache))
+        };
+        #[cfg(not(feature = "kcmm"))]
+        let backend = {
+            let cache = PagedKvCache::new(
+                ctx.clone(),
+                cfg.clone(),
+                cli.max_batch,
+                cli.max_seq_len,
+                16,
+            )?;
+            tracing::info!("using baseline PagedKvCache backend");
+            CacheBackend::Baseline(Arc::new(cache))
+        };
         let sched = ContinuousScheduler::new(
             cfg.clone(),
             ctx.clone(),
             model.clone(),
-            cache,
             cli.max_batch,
             cli.max_seq_len,
             queue.clone(),
             stats_handle.clone(),
+            backend,
         );
         let _h = sched.spawn();
     } else {

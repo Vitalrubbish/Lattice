@@ -54,25 +54,130 @@ KCMM 解决"物理内存不够时如何决策换出"——追求的是 **容量*
 
 ## 3. 开发路线
 
-### 阶段一：Rust 引擎集成（第 1-2 周）
+### 阶段一：Rust 引擎集成（第 1-4 周）
 
 **目标：** 让 KCMM 的 tiering 在真实推理路径上端到端跑通，生成 A/B 对比数据。
 
-**具体任务：**
+**总体策略：** 通过引入 `KvCacheBackend` trait 将 `PagedKvCache` 和 `KcmmPool` 统一到同一抽象层，使 `Transformer` trait 和 `ContinuousScheduler` 同时支持两种后端。这避免了代码分叉（两套 scheduler / 两套 forward path），并使用编译时或运行时多态来切换。
 
-1. **`main.rs` 添加 KCMM 路径**
-   - 在 `--continuous` 模式下，通过 `--features kcmm` 或配置项选择 `KcmmPool` 替代 `PagedKvCache`
-   - `ContinuousScheduler` 适配：插入 `touch()`/`cool()` 调用，处理 `CpuResident` 块的自动恢复
+#### 1.1 API 补齐：让 `KcmmPool` 与 `PagedKvCache` 接口对齐（~3 天）
 
-2. **正确性验证**
-   - 固定 seed + 相同 prompt，对比 KCMM-on vs KCMM-off 的生成 token 序列
-   - 验证 tiering 触发后的 block 数据完整性（GPU↔CPU roundtrip）
+**现状：** `KcmmPool` 的公共 API 与 `PagedKvCache` 高度相似（`alloc_block`、`alloc_sequence`、`free_sequence`、`register_sequence`、`unregister_sequence`、`update_seq_len`、`va_k`/`va_v` 等），但缺失以下方法：
 
-3. **Benchmark 套件完善**
-   - 在 WSL2 上跑完整的 Benchmark 1-5 + 6（UFS 对比）
-   - 产出 KCMM-on vs KCMM-off 的相对收益数据（throughput_ratio, capacity_ratio）
+- **`get_all_block_offsets_f16()`** — 返回所有 block 的 VA 偏移（以 f16 元素为单位），供 paged attention kernel 使用
+- **`append_kv_step(layer_idx, seq_indices, positions, k_src, v_src)`** — 将 KV 投影写入分页缓存，供 `forward_step_paged` 调用
+- **`seq_metadata` → 统一为 trait 方法** — `PagedKvCache` 通过 `pub seq_metadata: Mutex<Vec<SeqMetadata>>` 暴露内部字段，`KcmmPool` 使用 `sequences: Mutex<Vec<SequenceState>>`。需要提供 trait 兼容的访问器方法（如 `with_seq_metadata()`/`seq_block_table()`/`seq_len()`）
 
-### 阶段二：C FFI API 实现（第 2-3 周）
+**具体改动：**
+- `pool.rs`: 移植 `append_kv_step` 逻辑（从 `paged_kv.rs` 复制，内部结构一致）
+- `pool.rs`: 添加 `get_all_block_offsets_f16()` 方法
+- `pool.rs`: 添加 `with_seq_metadata<R>(&self, f: impl FnOnce(&[SeqMetadata]) -> R) -> R` 风格的闭包访问器，或直接暴露 `seq_metadata()` 返回迭代器
+- 单元测试覆盖新增方法
+
+#### 1.2 定义 `KvCacheBackend` trait（~2 天）
+
+**现状：** `Transformer` trait 中 `forward_step_paged` 的签名硬编码了 `&PagedKvCache`，无法直接传入 `KcmmPool`。
+
+**方案：** 在 `src/cache/` 下新建 `backend.rs`，定义：
+
+```rust
+pub trait KvCacheBackend: Send + Sync {
+    // Block allocation
+    fn alloc_block(&self) -> Result<u32>;
+    fn alloc_sequence(&self, num_blocks: usize) -> Result<Vec<u32>>;
+    fn free_sequence(&self, block_table: &[u32]);
+    fn append_block_to_sequence(&self, seq_idx: usize, block_idx: u32);
+
+    // Sequence management
+    fn register_sequence(&self, block_table: Vec<u32>) -> usize;
+    fn unregister_sequence(&self, seq_idx: usize);
+    fn update_seq_len(&self, seq_idx: usize, len: usize);
+    fn get_seq_len(&self, seq_idx: usize) -> usize;
+    fn get_block_table(&self, seq_idx: usize) -> Option<Vec<u32>>;
+
+    // VA layout
+    fn va_k(&self, layer: usize) -> u64;
+    fn va_v(&self, layer: usize) -> u64;
+    fn get_block_va_offset(&self, block_idx: u32) -> Option<usize>;
+    fn get_all_block_offsets_f16(&self) -> Vec<u64>;
+
+    // KV write (used by forward_step_paged)
+    fn append_kv_step(&self, layer_idx: usize, seq_indices: &[usize],
+        positions: &[usize], k_src: &CudaSlice<f16>, v_src: &CudaSlice<f16>) -> Result<()>;
+
+    // Config accessors
+    fn block_size(&self) -> usize;
+    fn max_blocks_per_seq(&self) -> usize;
+
+    // Pool stats
+    fn blocks_in_use(&self) -> usize;
+    fn has_free_blocks(&self) -> bool;
+
+    // Sequence metadata access (for paged attention kernel)
+    fn with_seq_metadata<R>(&self, f: impl FnOnce(&[SeqMetadata]) -> R) -> R;
+}
+```
+
+- `PagedKvCache` 和 `KcmmPool` 均 `impl KvCacheBackend`
+- 对于 `PagedKvCache`，大部分方法已有，只需添加 `with_seq_metadata`
+- 对于 `KcmmPool`，`SequenceState` 需转换为 `SeqMetadata` 或直接在 trait 中返回 `block_table` + `seq_len` 的引用
+
+**关键决策点：** `with_seq_metadata` 的闭包方式持有锁期间暴露引用，可能导致死锁。备选方案是提供 `seq_block_table(seq_idx) -> Option<&[u32]>` 的单独访问器，避免暴露内部 Mutex。具体选择在实现时根据锁竞争模式决定。
+
+#### 1.3 修改 `Transformer` trait 支持 trait object（~1 天）
+
+- 将 `forward_step_paged` 签名从 `cache: &PagedKvCache` 改为 `cache: &dyn KvCacheBackend`
+- `NaiveTransformer` 和 `LlamaTransformer` 的实现同步修改
+- 将所有 `cache.seq_metadata.lock()` 直接访问替换为 `cache.with_seq_metadata()`
+- 将所有 `cache.block_size` / `cache.max_blocks_per_seq` 字段访问替换为 `cache.block_size()` / `cache.max_blocks_per_seq()`
+
+#### 1.4 重构 `ContinuousScheduler` 支持 KCMM（~3 天）
+
+**现状：** `ContinuousScheduler` 内部有两套 eviction 机制与 KCMM 冲突：
+- `SwapManager` — 自己的 swap-out/restore 逻辑 → 替换为 KCMM `TieringEngine`
+- `seq_last_epoch: HashMap<usize, u64>` + `select_victim()` → 替换为 KCMM `touch()`/`cool()` + `EvictionPolicy`
+
+**具体改动：**
+
+1. **`main.rs` KCMM 路径选择：**
+   - 在 `--continuous` 模式下，通过 `--kcmm` CLI flag 选择后端
+   - `kcmm` feature flag（`Cargo.toml` 已定义 `kcmm = []`）控制编译时包含 KCMM 依赖
+   - 实现 `fn create_cache_backend(…) -> Arc<dyn KvCacheBackend>` 工厂函数
+
+2. **`ContinuousScheduler` 重构：**
+   - 将 `cache: Arc<PagedKvCache>` 改为 `cache: Arc<dyn KvCacheBackend>`
+   - 将 `swap_manager: SwapManager` 替换为 `kcmm_enabled: bool` 标记
+   - 替换 `select_victim()` → 当 `kcmm_enabled` 时调用 `TieringEngine::evict_blocks()`
+     - `admit_waiting()` 中 OOM 路径：KCMM 模式走 `tiering.evict_blocks()` → `TieringEngine` 自动换出
+     - `try_restore_swapped()` 中恢复逻辑：KCMM 模式调用 `pool.restore_evicted_blocks()`
+   - 插入 `pool.touch(seq_idx)` / `pool.cool(seq_idx)` 调用
+     - `touch()`: 每次 `run_step()` 对所有 running sequence 调用
+     - `cool()`: 序列完成（`remove_completed`）时调用，标记 block 为首选受害者
+   - 处理 `CpuResident` 块自动恢复：在 `run_step()` 之前检查 block 位置，若为 `CpuResident` 则触发 restore
+
+3. **保持向后兼容：**
+   - 非 KCMM 模式使用 `PagedKvCache` + 原有 `SwapManager`（行为不变）
+   - KCMM 模式使用 `KcmmPool` + `TieringEngine`（新代码路径）
+
+#### 1.5 正确性验证（~2 天）
+
+- **GPU KV 写入正确性：** 使用 `NaiveTransformer`（zero weights）+ `KcmmPool` 后端，验证 `append_kv_step` 写入后 block 数据与 `PagedKvCache` 后端一致
+- **Token 序列等价性：** 固定 seed + 相同 prompt，对比 `PagedKvCache` vs `KcmmPool`（tiering 关闭）的生成 token 序列。当前推理引擎使用 `greedy_sample`（无随机性），zero-weight 模型下 token 序列完全确定（始终输出 token 0）
+- **Tiering 数据完整性：** 在内存压力场景下触发 eviction → restoration，验证 GPU↔CPU roundtrip 后 block 内容无损
+  - 通过写入已知 pattern → evict → restore → 读出对比
+- **Scheduler 状态机正确性：** 验证 KCMM 路径下序列生命周期（admit → touch → decode → cool → evict → restore）不丢失 block、不 double-free
+
+#### 1.6 集成 Benchmark（~2 天）
+
+- **新 Benchmark：`kcmm_engine_integration`**
+  - 在 WSL2 上使用 `NaiveTransformer` + `KcmmPool`（tiering on）跑多请求并发
+  - 对比指标：`PagedKvCache` vs `KcmmPool`（tiering off）的 throughput、延迟分布
+  - 记录 KCMM tiering 启用时的 eviction count、restore count、per-step latency overhead
+- **复用已有 Benchmark 基础设施：**
+  - Benchmark 1-5 已独立验证 KCMM 各组件的正确性；集成阶段重点是端到端数据
+  - 使用 `tests/kcmm_bench_memory_pressure.rs` 的内存压力生成模式，嵌入到集成测试中
+
+### 阶段二：C FFI API 实现（第 4-6 周）
 
 **目标：** 交付 `libkcmm.so` 作为可被外部引擎调用的独立共享库。
 
@@ -90,93 +195,30 @@ KCMM 解决"物理内存不够时如何决策换出"——追求的是 **容量*
    - 用纯 C 测试程序验证 ABI 正确性
    - 验证 `libkcmm.so` 符号导出
 
-### 阶段三：策略进阶优化（第 3-5 周）
+## 4. Bare-Metal 计划
 
-**目标：** 实现分析文档 1.6 节中标记为 P0 的优化，增强论文的创新性。
+Bare-metal 环境的完整验证与优化计划已独立为专项文档，详见：
 
-**具体任务：**
+→ **[`docs/dev/kcmm-baremetal-plan.md`](kcmm-baremetal-plan.md)**
 
-1. **分层温控 + 显式回收**（1.6.1）
-   - 为 `EvictionPolicy` 扩展温度分级：灼热（序列尾部 4 block，永不换出）/ 温（正常 LRU）/ 冷（已完成序列，首选受害者）
-   - `kcmm_cool(seq)` 直接将已完成序列的 block 标记为首选受害者——这些块永远不会再被访问
-   - 改动范围：`tiering.rs` 内 `select_victims` + `LruPolicy` 扩展
-
-2. **自适应水位线**（1.6.3）
-   - 追踪 alloc/free rate 的指数加权移动平均（EWMA）
-   - 预测 GPU 池耗尽时间，在 OOM 前提前触发换出
-   - 改动范围：`pool.rs` 纯内部逻辑
-
-3. **写入缓冲区**（1.6.4）
-   - 将小粒度换出延迟合并为批量操作
-   - 利用已有 `evict_blocks_batched` 基础设施
-   - 对 NVMe 层尤其重要（顺序写 vs 随机写吞吐量差 10×+）
-
-4. **Hint API 基础框架**（1.6.6）
-   - `ffi.rs` 已定义 `kcmm_hint_t` 枚举
-   - 实现 Rust trait 方法 + C API 存根
-   - 策略层预留扩展点（`HINT_MULTI_TURN`、`HINT_NEAR_END`、`HINT_SYSTEM_PROMPT`）
-
-### 阶段四：文档与可观测性（第 4-6 周，可并行）
-
-**目标：** 完善开发和用户文档，准备论文材料。
-
-**具体任务：**
-
-1. **bpftrace 追踪脚本**（`src/trace/kcmm_events.bt`）
-   - 追踪 USDT probe：evict 开始/完成、restore 开始/完成、prefetch 事件
-   - 用于生成论文中的时间线图
-
-2. **API 使用指南**
-   - 面向引擎集成者的 `kcmm.h` 使用文档
-   - 策略配置指南（何时选择 LRU vs LFU vs FIFO）
-
-3. **时间序列指标采样**（G3）
-   - `metrics.rs` 目前只有快照，添加环形缓冲区保留历史
-   - 支持离线分析和论文图表生成
-
-4. **开发文档更新**
-   - 补充周实现文档（`kcmm-week14-impl.md` 等）
-   - 更新 `kcmm-implementation-analysis.md` 标记实际完成状态
-
-### 阶段五：Benchmark 完善（第 6-8 周）
-
-**目标：** 产出完整的、可发表的 benchmark 数据（相对值）。
-
-**具体任务：**
-
-1. **Benchmark 6：UFS 指标对比**
-   - KCMM vs PagedKvCache 在无分层模式下的 IFR/PME/BU/RFI
-   - 在 WSL2 上用 TinyLLaMA 做小规模推理
-
-2. **Benchmark 4 增强：换出策略命中率**
-   - 增加合成模式：Zipf 分布、热冷交替
-   - 完全模拟（不需要 GPU）可得出策略命中率数据
-
-3. **Benchmark 5 增强**
-   - 增加 per-sequence latency (P50/P99 decode step time)
-   - 多次 trial（≥5）的统计显著性
-   - 预热阶段消除 CUDA 首次启动偏差
-
-## 4. Bare-Metal 恢复后优先做的事
-
-| 优先级 | 任务 | 预计耗时 |
-|--------|------|---------|
-| P0 | 在 A30 上跑 Benchmark 5（内存压力端到端）获取绝对值 | 1-2 天 |
-| P0 | 在 A30 上跑 Benchmark 2（换出/恢复延迟）获取 bare-metal p50/p99 | 半天 |
-| P1 | 评估 NVMe GDS 路径（需要 `nvidia-fs.ko`） | 3-5 天 |
-| P1 | Benchmark 8（换出策略对比，真实负载） | 2-3 天 |
-| P2 | CUDA Graph 优化（消除 44 次 API launch 开销） | 1 周 |
-| P2 | 参考 kvcached autopatch 方案做 vLLM 底层拦截 | 2-4 周 |
+该文档涵盖：
+- **基准测试复现**：`run_kcmm_benches.sh` 和 `run_kcmm_integration_bench.sh` 在 A30 上的完整运行计划
+- **换出策略对比**：LRU / LFU / FIFO 在真实负载下的命中率与延迟对比
+- **高级换出策略**：分层温控、自适应水位线、Hint API、有损换出、流式恢复等 P0/P1 优化的实现与测试方案
+- **文档与可观测性**：bpftrace 追踪脚本、API 使用指南、时间序列指标采样、开发文档
+- **Benchmark 完善**：UFS 指标对比、策略命中率增强、per-sequence latency、真实 trace 回放
 
 ## 5. 里程碑检查点
 
 ```
-Week 2:  Rust 引擎 KCMM-on 端到端跑通，token 正确性验证通过
-Week 3:  libkcmm.so 符号导出，C 测试程序通过
-Week 5:  分层温控 + 自适应水位线实现，单元测试覆盖
-Week 6:  bpftrace 脚本 + API 文档初稿
-Week 8:  完整 benchmark suite 可运行，数据可复现
+Week 1:   KcmmPool API 补齐（append_kv_step, get_all_block_offsets_f16, with_seq_metadata）
+Week 2:   KvCacheBackend trait 定义 + Transformer trait 重构完成
+Week 3:   ContinuousScheduler KCMM 适配完成，touch/cool 路径跑通
+Week 4:   正确性验证通过（token 等价性 + tiering roundtrip），集成 benchmark 数据产出
+Week 6:   (阶段二) libkcmm.so 符号导出，C 测试程序通过
 ```
+
+> **注意：** 阶段三（策略进阶优化）、阶段四（文档与可观测性）、阶段五（Benchmark 完善）已迁移至 Bare-Metal 计划 → [`docs/dev/kcmm-baremetal-plan.md`](kcmm-baremetal-plan.md)。
 
 ## 6. 论文叙述建议
 

@@ -631,6 +631,108 @@ impl PagedKvCache {
                 / (1024.0 * 1024.0),
         }
     }
+
+    // --- Accessors for KvCacheBackend trait ---
+
+    /// Tokens per block.
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    /// Maximum blocks per sequence.
+    pub fn max_blocks_per_seq(&self) -> usize {
+        self.max_blocks_per_seq
+    }
+
+    /// Bytes per block.
+    pub fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+
+    /// Number of transformer layers.
+    pub fn num_layers(&self) -> usize {
+        self.cfg.num_hidden_layers
+    }
+}
+
+// --- KvCacheBackend impl ---
+
+use super::backend::KvCacheBackend;
+
+impl KvCacheBackend for PagedKvCache {
+    fn alloc_block(&self) -> Result<u32> {
+        self.alloc_block()
+    }
+    fn alloc_sequence(&self, num_blocks: usize) -> Result<Vec<u32>> {
+        self.alloc_sequence(num_blocks)
+    }
+    fn free_sequence(&self, block_table: &[u32]) {
+        self.free_sequence(block_table)
+    }
+    fn append_block_to_sequence(&self, seq_idx: usize, block_idx: u32) {
+        self.append_block_to_sequence(seq_idx, block_idx)
+    }
+    fn register_sequence(&self, block_table: Vec<u32>) -> usize {
+        self.register_sequence(block_table)
+    }
+    fn unregister_sequence(&self, seq_idx: usize) {
+        self.unregister_sequence(seq_idx)
+    }
+    fn update_seq_len(&self, seq_idx: usize, len: usize) {
+        self.update_seq_len(seq_idx, len)
+    }
+    fn get_seq_len(&self, seq_idx: usize) -> usize {
+        self.get_seq_len(seq_idx)
+    }
+    fn get_block_table(&self, seq_idx: usize) -> Option<Vec<u32>> {
+        self.get_block_table(seq_idx)
+    }
+    fn get_block_va_offsets(&self, seq_idx: usize) -> Option<Vec<usize>> {
+        self.get_block_va_offsets(seq_idx)
+    }
+    fn get_block_va_offset(&self, block_idx: u32) -> Option<usize> {
+        self.get_block_va_offset(block_idx)
+    }
+    fn va_k(&self, layer: usize) -> u64 {
+        self.va_k(layer)
+    }
+    fn va_v(&self, layer: usize) -> u64 {
+        self.va_v(layer)
+    }
+    fn get_all_block_offsets_f16(&self) -> Vec<u64> {
+        self.get_all_block_offsets_f16()
+    }
+    fn append_kv_step(
+        &self,
+        layer_idx: usize,
+        seq_indices: &[usize],
+        positions: &[usize],
+        k_src: &CudaSlice<f16>,
+        v_src: &CudaSlice<f16>,
+    ) -> Result<()> {
+        self.append_kv_step(layer_idx, seq_indices, positions, k_src, v_src)
+    }
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+    fn max_blocks_per_seq(&self) -> usize {
+        self.max_blocks_per_seq
+    }
+    fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+    fn num_layers(&self) -> usize {
+        self.cfg.num_hidden_layers
+    }
+    fn blocks_in_use(&self) -> usize {
+        self.blocks_in_use()
+    }
+    fn has_free_blocks(&self) -> bool {
+        self.has_free_blocks()
+    }
+    fn active_sequences(&self) -> usize {
+        self.active_sequences()
+    }
 }
 
 // --- Drop ---

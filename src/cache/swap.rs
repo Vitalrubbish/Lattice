@@ -9,7 +9,7 @@ use cudarc::driver::sys;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::paged_kv::PagedKvCache;
+use super::backend::KvCacheBackend;
 
 /// KV cache data for one evicted sequence, stored on the host.
 #[derive(Debug, Clone)]
@@ -22,6 +22,19 @@ pub struct EvictedSeqData {
     pub num_blocks: usize,
     /// Sequence length at the time of eviction.
     pub seq_len: usize,
+}
+
+impl EvictedSeqData {
+    /// Create an empty placeholder for KCMM mode, where the tiering engine
+    /// manages CPU-side buffers internally and `EvictedSeqData` is unused.
+    pub fn dummy() -> Self {
+        Self {
+            k_layers: Vec::new(),
+            v_layers: Vec::new(),
+            num_blocks: 0,
+            seq_len: 0,
+        }
+    }
 }
 
 /// Manages GPU↔host swapping of KV cache blocks.
@@ -48,7 +61,7 @@ impl SwapManager {
     /// `cache.unregister_sequence()` to release the GPU blocks afterward.
     pub fn evict_sequence(
         &self,
-        cache: &PagedKvCache,
+        cache: &dyn KvCacheBackend,
         seq_idx: usize,
     ) -> Result<EvictedSeqData> {
         let va_offsets = cache
@@ -65,8 +78,8 @@ impl SwapManager {
             });
         }
 
-        let block_bytes = cache.block_bytes;
-        let num_layers = cache.cfg.num_hidden_layers;
+        let block_bytes = cache.block_bytes();
+        let num_layers = cache.num_layers();
         let total_bytes = num_blocks * block_bytes;
 
         let mut k_layers: Vec<Vec<u8>> = Vec::with_capacity(num_layers);
@@ -144,7 +157,7 @@ impl SwapManager {
     /// block table.
     pub fn restore_sequence(
         &self,
-        cache: &PagedKvCache,
+        cache: &dyn KvCacheBackend,
         data: &EvictedSeqData,
     ) -> Result<Vec<u32>> {
         if data.num_blocks == 0 {
@@ -156,8 +169,8 @@ impl SwapManager {
             .alloc_sequence(data.num_blocks)
             .map_err(|e| anyhow!("restore alloc_sequence failed: {}", e))?;
 
-        let block_bytes = cache.block_bytes;
-        let num_layers = cache.cfg.num_hidden_layers;
+        let block_bytes = cache.block_bytes();
+        let num_layers = cache.num_layers();
         let total_bytes = data.num_blocks * block_bytes;
 
         // Collect VA offsets for the newly allocated blocks

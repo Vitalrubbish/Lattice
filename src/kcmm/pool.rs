@@ -8,7 +8,9 @@
 //   - Built-in fragmentation tracking
 
 use anyhow::{anyhow, Result};
-use cudarc::driver::sys::CUdeviceptr;
+use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::sys::{self, CUdeviceptr};
+use half::f16;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
@@ -567,6 +569,23 @@ impl KcmmPool {
         offsets
     }
 
+    /// Get VA offsets for all blocks in f16-element units.
+    ///
+    /// Returns a flat Vec where index = block_idx and value = va_offset
+    /// divided by `sizeof(f16)`.  Inactive blocks yield 0.
+    /// This matches the `PagedKvCache` API consumed by the paged-attention
+    /// CUDA kernel.
+    pub fn get_all_block_offsets_f16(&self) -> Vec<u64> {
+        let info = self.block_info.lock();
+        info.iter().map(|bi| {
+            if bi.in_use {
+                (bi.va_offset / std::mem::size_of::<f16>()) as u64
+            } else {
+                0u64
+            }
+        }).collect()
+    }
+
     /// Get the block location for a block index.
     pub fn get_block_location(&self, block_idx: u32) -> Option<BlockLocation> {
         let info = self.block_info.lock();
@@ -837,6 +856,91 @@ impl KcmmPool {
         self.va_v[layer]
     }
 
+    // --- KV cache write (paged attention) ---
+
+    /// Write one step of KV data for a batch of sequences.
+    /// Convenience wrapper — copies the same source to both K and V caches.
+    pub fn append_step(
+        &self,
+        layer_idx: usize,
+        seq_indices: &[usize],
+        positions: &[usize],
+        hidden: &CudaSlice<f16>,
+    ) -> Result<()> {
+        self.append_kv_step(layer_idx, seq_indices, positions, hidden, hidden)
+    }
+
+    /// Write one step of KV data for a batch of sequences, using separate
+    /// K and V sources (post-projection, post-RoPE).  Each source is expected
+    /// to be laid out as [batch, kv_heads * head_dim] in F16.
+    ///
+    /// This is a port of `PagedKvCache::append_kv_step` that works with
+    /// `KcmmPool`'s internal `sequences` / `block_info` layout.
+    pub fn append_kv_step(
+        &self,
+        layer_idx: usize,
+        seq_indices: &[usize],
+        positions: &[usize],
+        k_src: &CudaSlice<f16>,
+        v_src: &CudaSlice<f16>,
+    ) -> Result<()> {
+        let batch = seq_indices.len();
+        let step = self.elem_per_block / self.block_size; // kv_heads * head_dim
+        let eb = std::mem::size_of::<f16>();
+        let nbytes = step * eb;
+
+        let va_k = self.va_k[layer_idx];
+        let va_v = self.va_v[layer_idx];
+        let k_base: CUdeviceptr = *k_src.device_ptr();
+        let v_base: CUdeviceptr = *v_src.device_ptr();
+        let seqs = self.sequences.lock();
+        let info = self.block_info.lock();
+
+        for b in 0..batch {
+            let seq_idx = seq_indices[b];
+            let pos = positions[b];
+            let seq = &seqs[seq_idx];
+
+            let logical_block = pos / self.block_size;
+            let offset_in_block = pos % self.block_size;
+
+            if logical_block >= seq.block_table.len() {
+                return Err(anyhow!(
+                    "logical block {} >= allocated {} for seq {}",
+                    logical_block,
+                    seq.block_table.len(),
+                    seq_idx
+                ));
+            }
+
+            let block_idx = seq.block_table[logical_block] as usize;
+            let bi = &info[block_idx];
+            let dst_off = bi.va_offset / eb + offset_in_block * step;
+            let src_off = b * step;
+
+            let dk = va_k + (dst_off * eb) as u64;
+            let dv = va_v + (dst_off * eb) as u64;
+            let sk = k_base + (src_off * eb) as u64;
+            let sv = v_base + (src_off * eb) as u64;
+
+            unsafe {
+                let r = sys::lib().cuMemcpyDtoDAsync_v2(
+                    dk, sk, nbytes, std::ptr::null_mut(),
+                );
+                if r != sys::CUresult::CUDA_SUCCESS {
+                    return Err(anyhow!("cuMemcpyDtoDAsync K: {:?}", r));
+                }
+                let r = sys::lib().cuMemcpyDtoDAsync_v2(
+                    dv, sv, nbytes, std::ptr::null_mut(),
+                );
+                if r != sys::CUresult::CUDA_SUCCESS {
+                    return Err(anyhow!("cuMemcpyDtoDAsync V: {:?}", r));
+                }
+            }
+        }
+        Ok(())
+    }
+
     // --- Statistics ---
 
     /// Number of blocks currently in use.
@@ -961,6 +1065,108 @@ impl KcmmPool {
         let free = self.free_physical_blocks();
         let ratio = free as f32 / total as f32;
         ratio < threshold
+    }
+
+    // --- Accessors for KvCacheBackend trait ---
+
+    /// Tokens per block.
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    /// Maximum blocks per sequence.
+    pub fn max_blocks_per_seq(&self) -> usize {
+        self.max_blocks_per_seq
+    }
+
+    /// Bytes per block.
+    pub fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+
+    /// Number of transformer layers.
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+}
+
+// --- KvCacheBackend impl ---
+
+use crate::cache::backend::KvCacheBackend;
+
+impl KvCacheBackend for KcmmPool {
+    fn alloc_block(&self) -> Result<u32> {
+        self.alloc_block()
+    }
+    fn alloc_sequence(&self, num_blocks: usize) -> Result<Vec<u32>> {
+        self.alloc_sequence(num_blocks)
+    }
+    fn free_sequence(&self, block_table: &[u32]) {
+        self.free_sequence(block_table)
+    }
+    fn append_block_to_sequence(&self, seq_idx: usize, block_idx: u32) {
+        self.append_block_to_sequence(seq_idx, block_idx)
+    }
+    fn register_sequence(&self, block_table: Vec<u32>) -> usize {
+        self.register_sequence(block_table)
+    }
+    fn unregister_sequence(&self, seq_idx: usize) {
+        self.unregister_sequence(seq_idx)
+    }
+    fn update_seq_len(&self, seq_idx: usize, len: usize) {
+        self.update_seq_len(seq_idx, len)
+    }
+    fn get_seq_len(&self, seq_idx: usize) -> usize {
+        self.get_seq_len(seq_idx)
+    }
+    fn get_block_table(&self, seq_idx: usize) -> Option<Vec<u32>> {
+        self.get_block_table(seq_idx)
+    }
+    fn get_block_va_offsets(&self, seq_idx: usize) -> Option<Vec<usize>> {
+        self.get_block_va_offsets(seq_idx)
+    }
+    fn get_block_va_offset(&self, block_idx: u32) -> Option<usize> {
+        self.get_block_va_offset(block_idx)
+    }
+    fn va_k(&self, layer: usize) -> u64 {
+        self.va_k(layer)
+    }
+    fn va_v(&self, layer: usize) -> u64 {
+        self.va_v(layer)
+    }
+    fn get_all_block_offsets_f16(&self) -> Vec<u64> {
+        self.get_all_block_offsets_f16()
+    }
+    fn append_kv_step(
+        &self,
+        layer_idx: usize,
+        seq_indices: &[usize],
+        positions: &[usize],
+        k_src: &CudaSlice<f16>,
+        v_src: &CudaSlice<f16>,
+    ) -> Result<()> {
+        self.append_kv_step(layer_idx, seq_indices, positions, k_src, v_src)
+    }
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+    fn max_blocks_per_seq(&self) -> usize {
+        self.max_blocks_per_seq
+    }
+    fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+    fn blocks_in_use(&self) -> usize {
+        self.blocks_in_use()
+    }
+    fn has_free_blocks(&self) -> bool {
+        self.has_free_blocks()
+    }
+    fn active_sequences(&self) -> usize {
+        self.active_sequences()
     }
 }
 
