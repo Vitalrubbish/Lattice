@@ -345,6 +345,11 @@ pub struct TieringEngine {
     device: Option<Arc<CudaDevice>>,
     /// Maximum blocks per batch (from config).
     max_batch_blocks: usize,
+    /// Pre-allocated device pointer array reused across all evict/restore
+    /// calls.  Allocated once in `new()` instead of per-call via
+    /// `alloc_zeros`, eliminating the unnecessary `cuMemAlloc_v2` +
+    /// `cuMemsetD8` overhead on the hot path.
+    ptrs_dev: Option<CudaSlice<u64>>,
 }
 
 /// Per-block state carried from async-submit to finalize during batched eviction.
@@ -440,7 +445,7 @@ impl TieringEngine {
 
         // Compile gather/scatter kernels and allocate staging buffers if a
         // device is available and batching is enabled.
-        let (gpu_staging, gather_kernel, scatter_kernel, device) =
+        let (gpu_staging, ptrs_dev, gather_kernel, scatter_kernel, device) =
             if let Some(dev) = device {
                 if max_batch_blocks > 0 {
                     let (gk, sk) = Self::compile_kv_gather_kernels(&dev)?;
@@ -448,12 +453,14 @@ impl TieringEngine {
                     let gpu_staging_elems = max_batch_blocks * half_count;
                     let gs = dev.alloc_zeros::<half::f16>(gpu_staging_elems)
                         .with_context(|| "alloc GPU staging buffer (f16) for memcpy batching")?;
-                    (Some(gs), Some(gk), Some(sk), Some(dev))
+                    let ptrs = dev.alloc_zeros::<u64>(max_batch_blocks)
+                        .with_context(|| "alloc ptrs device array for gather/scatter kernels")?;
+                    (Some(gs), Some(ptrs), Some(gk), Some(sk), Some(dev))
                 } else {
-                    (None, None, None, None)
+                    (None, None, None, None, None)
                 }
             } else {
-                (None, None, None, None)
+                (None, None, None, None, None)
             };
 
         // CPU staging buffer: holds all layers for a full batch.
@@ -478,6 +485,7 @@ impl TieringEngine {
             scatter_kernel,
             device,
             max_batch_blocks,
+            ptrs_dev,
         })
     }
 
@@ -834,12 +842,13 @@ impl TieringEngine {
         // Legacy default-stream behaviour ensures implicit ordering, which
         // guarantees that by the time we upload ptrs for layer N+1, the gather
         // kernel for layer N has already consumed its ptrs data.  We can
-        // therefore reuse a single device-side pointer array for all layers
-        // instead of allocating a new one each iteration (44 allocs → 1).
-        let ptrs_dev = device
-            .alloc_zeros::<u64>(self.max_batch_blocks)
-            .context("alloc ptrs device array")?;
-        let ptrs_dev_base = CudaContext::device_ptr(&ptrs_dev) as sys::CUdeviceptr;
+        // therefore reuse a single pre-allocated device-side pointer array for
+        // all layers instead of allocating a new one each iteration or each call
+        // (previously 44 allocs per call, now 0 — ptrs_dev is allocated once in
+        // TieringEngine::new()).
+        let ptrs_dev = self.ptrs_dev.as_ref()
+            .context("ptrs_dev not initialised")?;
+        let ptrs_dev_base = CudaContext::device_ptr(ptrs_dev) as sys::CUdeviceptr;
         let mut layer_idx: usize = 0;
         for l in 0..num_layers {
             for is_v in [false, true] {
@@ -920,9 +929,6 @@ impl TieringEngine {
         // All operations (H2D ptrs, gather kernel, D2H staging) were submitted
         // on the default stream.  One synchronize waits for all layers.
         device.synchronize().context("batched evict default-stream synchronize")?;
-
-        // ptrs_dev is no longer needed; all kernel launches have completed.
-        drop(ptrs_dev);
 
         // --- Phase 4: CPU scatter — staging → per-block CPU slots ---
         // CPU staging layout: [batch_K0][batch_V0][batch_K1][batch_V1]
@@ -1103,14 +1109,14 @@ impl TieringEngine {
         // stream and the default stream that existed in the previous version,
         // and matches the eviction path's single-stream pattern.
         //
-        // Same pre-allocation optimisation as evict_blocks_batched: one
-        // device-side pointer array reused across all layers instead of
-        // 44 separate allocations.
+        // Same pre-allocation optimisation as evict_blocks_batched: use the
+        // pre-allocated device-side pointer array from TieringEngine instead
+        // of allocating one per call.  ptrs_dev is allocated once in new()
+        // and reused across all layers and all evict/restore calls.
         let actual_n = pending.len();
-        let ptrs_dev = device
-            .alloc_zeros::<u64>(self.max_batch_blocks)
-            .context("alloc ptrs device array for restore")?;
-        let ptrs_dev_base = CudaContext::device_ptr(&ptrs_dev) as sys::CUdeviceptr;
+        let ptrs_dev = self.ptrs_dev.as_ref()
+            .context("ptrs_dev not initialised")?;
+        let ptrs_dev_base = CudaContext::device_ptr(ptrs_dev) as sys::CUdeviceptr;
         let mut layer_idx: usize = 0;
         for l in 0..num_layers {
             for is_v in [false, true] {
@@ -1224,9 +1230,6 @@ impl TieringEngine {
                 "batched restore synchronize failed: {:#}", e
             ));
         }
-
-        // ptrs_dev is no longer needed; all scatter kernels have completed.
-        drop(ptrs_dev);
 
         // --- Phase 4: Finalize ---
         for ctx in pending {
