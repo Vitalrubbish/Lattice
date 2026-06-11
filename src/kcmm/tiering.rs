@@ -453,7 +453,7 @@ impl TieringEngine {
                     let gpu_staging_elems = max_batch_blocks * half_count;
                     let gs = dev.alloc_zeros::<half::f16>(gpu_staging_elems)
                         .with_context(|| "alloc GPU staging buffer (f16) for memcpy batching")?;
-                    let ptrs = dev.alloc_zeros::<u64>(max_batch_blocks)
+                    let ptrs = dev.alloc_zeros::<u64>(max_batch_blocks * num_layers * 2)
                         .with_context(|| "alloc ptrs device array for gather/scatter kernels")?;
                     (Some(gs), Some(ptrs), Some(gk), Some(sk), Some(dev))
                 } else {
@@ -839,64 +839,73 @@ impl TieringEngine {
         // --- Phase 2: GPU gather + batched D2H per layer ---
         // All GPU operations are submitted on the default (null) stream so they
         // execute in order.  One synchronize at the end waits for all layers.
-        // Legacy default-stream behaviour ensures implicit ordering, which
-        // guarantees that by the time we upload ptrs for layer N+1, the gather
-        // kernel for layer N has already consumed its ptrs data.  We can
-        // therefore reuse a single pre-allocated device-side pointer array for
-        // all layers instead of allocating a new one each iteration or each call
-        // (previously 44 allocs per call, now 0 — ptrs_dev is allocated once in
-        // TieringEngine::new()).
+        //
+        // We pre-compute ALL layer×KV pointer arrays on the CPU side, upload
+        // them in a single batched H2D (instead of 44 separate 64-byte H2Ds),
+        // then launch one gather kernel per layer with the appropriate offset
+        // into the pre-allocated device array.  ptrs_dev is allocated once in
+        // TieringEngine::new() with enough capacity for all layers.
         let ptrs_dev = self.ptrs_dev.as_ref()
             .context("ptrs_dev not initialised")?;
-        let ptrs_dev_base = CudaContext::device_ptr(ptrs_dev) as sys::CUdeviceptr;
-        let mut layer_idx: usize = 0;
+        let ptrs_dev_base = CudaContext::device_ptr(ptrs_dev) as u64;
+        let actual_n = pending.len();
+        let layers_total = num_layers * 2;
+
+        // Pre-compute all pointer arrays on the CPU side.
+        // Layout: [L0_K_0..L0_K_{N-1}][padding][L0_V_0..][padding][L1_K_0..]...
+        // Each layer×KV slot is max_batch_blocks wide, but only first actual_n
+        // entries are filled.
+        let all_ptrs_size = layers_total * self.max_batch_blocks;
+        let mut all_ptrs: Vec<u64> = vec![0u64; all_ptrs_size];
+        let mut slot: usize = 0;
         for l in 0..num_layers {
             for is_v in [false, true] {
-                let actual_n = pending.len();
-
-                // Build host-side pointer array for this layer×KV
-                let mut ptrs_host: Vec<u64> = Vec::with_capacity(actual_n);
-                for ctx in &pending {
+                let base = slot * self.max_batch_blocks;
+                for (i, ctx) in pending.iter().enumerate() {
                     let gpu_va = if is_v {
                         pool.gpu_va_for_block(ctx.handle, l, true)?
                     } else {
                         pool.gpu_va_for_block(ctx.handle, l, false)?
                     };
-                    ptrs_host.push(gpu_va);
+                    all_ptrs[base + i] = gpu_va;
                 }
+                slot += 1;
+            }
+        }
 
-                // Upload ptrs into the reused device array on the DEFAULT stream.
-                // Default-stream ordering guarantees the previous layer's gather
-                // kernel (and D2H) have completed before this H2D begins, so
-                // overwriting the buffer is safe.
-                let nbytes_ptrs = actual_n * std::mem::size_of::<u64>();
-                let cu_result = unsafe {
-                    sys::lib().cuMemcpyHtoDAsync_v2(
-                        ptrs_dev_base,
-                        ptrs_host.as_ptr() as *const std::ffi::c_void,
-                        nbytes_ptrs,
-                        std::ptr::null_mut(), // default stream
-                    )
-                };
-                if cu_result != sys::CUresult::CUDA_SUCCESS {
-                    return Err(anyhow::anyhow!(
-                        "cuMemcpyHtoDAsync_v2 (ptrs) failed: {:?}", cu_result
-                    ));
-                }
+        // Single batched H2D for ALL layers on the default stream.
+        let nbytes_all_ptrs = all_ptrs_size * std::mem::size_of::<u64>();
+        let cu_result = unsafe {
+            sys::lib().cuMemcpyHtoDAsync_v2(
+                ptrs_dev_base as sys::CUdeviceptr,
+                all_ptrs.as_ptr() as *const std::ffi::c_void,
+                nbytes_all_ptrs,
+                std::ptr::null_mut(), // default stream
+            )
+        };
+        if cu_result != sys::CUresult::CUDA_SUCCESS {
+            return Err(anyhow::anyhow!(
+                "cuMemcpyHtoDAsync_v2 (batched ptrs) failed: {:?}", cu_result
+            ));
+        }
 
-                // Launch gather kernel on default stream: scattered blocks → contiguous GPU staging.
+        // Launch one gather kernel per layer×KV, each reading from its offset
+        // within the pre-loaded ptrs_dev.
+        let mut layer_idx: usize = 0;
+        for _l in 0..num_layers {
+            for _is_v in 0..2 {
+                // Device pointer to this layer's slot: base + layer_idx * max_batch_blocks * 8
+                let ptrs_offset = (layer_idx * self.max_batch_blocks * std::mem::size_of::<u64>()) as u64;
+
+                // Launch gather kernel on default stream.
                 // SAFETY: all source VAs are valid GPU addresses allocated by the pool.
-                // ptrs_dev has max_batch_blocks elements; the kernel only reads indices
-                // 0..actual_n, so the larger allocation is fine.
-                unsafe {
-                    crate::cuda::kernels::launch_kv_gather(
-                        gather_kernel,
-                        &ptrs_dev,
-                        gpu_staging,
-                        half_count,
-                        actual_n,
-                    )?;
-                }
+                crate::cuda::kernels::launch_kv_gather(
+                    gather_kernel,
+                    ptrs_dev_base + ptrs_offset,
+                    gpu_staging,
+                    half_count,
+                    actual_n,
+                )?;
 
                 // Batched D2H on default stream: GPU staging → CPU staging[this layer's region].
                 let layer_byte_offset = layer_idx * actual_n * block_bytes;
@@ -1109,17 +1118,54 @@ impl TieringEngine {
         // stream and the default stream that existed in the previous version,
         // and matches the eviction path's single-stream pattern.
         //
-        // Same pre-allocation optimisation as evict_blocks_batched: use the
-        // pre-allocated device-side pointer array from TieringEngine instead
-        // of allocating one per call.  ptrs_dev is allocated once in new()
-        // and reused across all layers and all evict/restore calls.
+        // As in evict_blocks_batched, all layer×KV destination pointer arrays
+        // are pre-computed on the CPU and uploaded in a single batched H2D
+        // before the per-layer loop, reducing 44 H2D calls to 1.
         let actual_n = pending.len();
+        let layers_total = num_layers * 2;
         let ptrs_dev = self.ptrs_dev.as_ref()
             .context("ptrs_dev not initialised")?;
-        let ptrs_dev_base = CudaContext::device_ptr(ptrs_dev) as sys::CUdeviceptr;
-        let mut layer_idx: usize = 0;
+        let ptrs_dev_base = CudaContext::device_ptr(ptrs_dev) as u64;
+
+        // Pre-compute all destination pointer arrays on the CPU side.
+        let all_ptrs_size = layers_total * self.max_batch_blocks;
+        let mut all_ptrs: Vec<u64> = vec![0u64; all_ptrs_size];
+        let mut slot: usize = 0;
         for l in 0..num_layers {
             for is_v in [false, true] {
+                let base = slot * self.max_batch_blocks;
+                for (i, ctx) in pending.iter().enumerate() {
+                    let gpu_va = if is_v {
+                        pool.va_v(l) + ctx.va_offset as u64
+                    } else {
+                        pool.va_k(l) + ctx.va_offset as u64
+                    };
+                    all_ptrs[base + i] = gpu_va;
+                }
+                slot += 1;
+            }
+        }
+
+        // Single batched H2D for ALL destination pointers on the default stream.
+        let nbytes_all_ptrs = all_ptrs_size * std::mem::size_of::<u64>();
+        let cu_result = unsafe {
+            sys::lib().cuMemcpyHtoDAsync_v2(
+                ptrs_dev_base as sys::CUdeviceptr,
+                all_ptrs.as_ptr() as *const std::ffi::c_void,
+                nbytes_all_ptrs,
+                std::ptr::null_mut(), // default stream
+            )
+        };
+        if cu_result != sys::CUresult::CUDA_SUCCESS {
+            return Err(anyhow::anyhow!(
+                "cuMemcpyHtoDAsync_v2 (batched ptrs) failed in batched restore: {:?}",
+                cu_result,
+            ));
+        }
+
+        let mut layer_idx: usize = 0;
+        for _l in 0..num_layers {
+            for _is_v in 0..2 {
                 // Step 2a: CPU gather — copy from each block's CPU slot to staging
                 for (i, ctx) in pending.iter().enumerate() {
                     let slot_src = ctx.cpu_offset + layer_idx * block_bytes;
@@ -1136,8 +1182,6 @@ impl TieringEngine {
                 }
 
                 // Step 2b: Batched H2D on default stream — CPU staging[this layer] → GPU staging.
-                // Submitting on the default stream ensures ordering with the ptrs
-                // H2D and scatter kernel below (all on the same stream).
                 let layer_byte_offset = layer_idx * actual_n * block_bytes;
                 let nbytes = actual_n * block_bytes;
                 let gpu_staging_ptr =
@@ -1158,44 +1202,12 @@ impl TieringEngine {
                     ));
                 }
 
-                // Step 2c: Build destination pointer array for scatter kernel
-                let mut ptrs_host: Vec<u64> = Vec::with_capacity(actual_n);
-                for ctx in &pending {
-                    let gpu_va = if is_v {
-                        pool.va_v(l) + ctx.va_offset as u64
-                    } else {
-                        pool.va_k(l) + ctx.va_offset as u64
-                    };
-                    ptrs_host.push(gpu_va);
-                }
-
-                // Step 2d: Upload ptrs into reused device array on default stream.
-                // Default-stream ordering guarantees the previous layer's scatter
-                // kernel has consumed its ptrs data before this H2D overwrites.
-                let nbytes_ptrs = actual_n * std::mem::size_of::<u64>();
-                let cu_result = unsafe {
-                    sys::lib().cuMemcpyHtoDAsync_v2(
-                        ptrs_dev_base,
-                        ptrs_host.as_ptr() as *const std::ffi::c_void,
-                        nbytes_ptrs,
-                        std::ptr::null_mut(), // default stream
-                    )
-                };
-                if cu_result != sys::CUresult::CUDA_SUCCESS {
-                    return Err(anyhow::anyhow!(
-                        "cuMemcpyHtoDAsync_v2 (ptrs) failed in batched restore: {:?}",
-                        cu_result,
-                    ));
-                }
-
-                // Step 2e: Launch scatter kernel on default stream.
-                // SAFETY: all destination VAs are valid GPU addresses allocated
-                // by the pool.  ptrs_dev has max_batch_blocks elements; the kernel
-                // only reads indices 0..actual_n.
+                // Step 2c: Launch scatter kernel with offset into pre-loaded ptrs_dev.
+                let ptrs_offset = (layer_idx * self.max_batch_blocks * std::mem::size_of::<u64>()) as u64;
                 crate::cuda::kernels::launch_kv_scatter(
                     scatter_kernel,
                     gpu_staging,
-                    &ptrs_dev,
+                    ptrs_dev_base + ptrs_offset,
                     half_count,
                     actual_n,
                 )?;
@@ -2942,7 +2954,7 @@ mod tests {
 
             // Launch gather
             unsafe {
-                launch_kv_gather(&gather, &src_ptrs_dev, &mut staging, half_count, num_blocks)
+                launch_kv_gather(&gather, CudaContext::device_ptr(&src_ptrs_dev) as u64, &mut staging, half_count, num_blocks)
                     .expect("gather kernel");
             }
             ctx.synchronize().expect("sync");
@@ -2979,7 +2991,7 @@ mod tests {
                 .expect("alloc staging");
 
             unsafe {
-                launch_kv_gather(&gather, &ptrs_dev, &mut staging, half_count, num_blocks)
+                launch_kv_gather(&gather, CudaContext::device_ptr(&ptrs_dev) as u64, &mut staging, half_count, num_blocks)
                     .expect("gather kernel");
             }
             ctx.synchronize().expect("sync");
@@ -3012,7 +3024,7 @@ mod tests {
 
             // Launch scatter
             unsafe {
-                launch_kv_scatter(&scatter, &src, &dst_ptrs_dev, half_count, num_blocks)
+                launch_kv_scatter(&scatter, &src, CudaContext::device_ptr(&dst_ptrs_dev) as u64, half_count, num_blocks)
                     .expect("scatter kernel");
             }
             ctx.synchronize().expect("sync");
@@ -3055,7 +3067,7 @@ mod tests {
             ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev).expect("h2d ptrs");
 
             unsafe {
-                launch_kv_scatter(&scatter, &src, &dst_ptrs_dev, half_count, num_blocks)
+                launch_kv_scatter(&scatter, &src, CudaContext::device_ptr(&dst_ptrs_dev) as u64, half_count, num_blocks)
                     .expect("scatter kernel");
             }
             ctx.synchronize().expect("sync");
@@ -3092,7 +3104,7 @@ mod tests {
             let mut staging = ctx.device.alloc_zeros::<f16>(half_count * num_blocks)
                 .expect("alloc staging");
             unsafe {
-                launch_kv_gather(&gather, &ptrs_dev, &mut staging, half_count, num_blocks)
+                launch_kv_gather(&gather, CudaContext::device_ptr(&ptrs_dev) as u64, &mut staging, half_count, num_blocks)
                     .expect("gather kernel");
             }
             ctx.synchronize().expect("sync after gather");
@@ -3110,7 +3122,7 @@ mod tests {
             ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev).expect("h2d scatter ptrs");
 
             unsafe {
-                launch_kv_scatter(&scatter, &staging, &dst_ptrs_dev, half_count, num_blocks)
+                launch_kv_scatter(&scatter, &staging, CudaContext::device_ptr(&dst_ptrs_dev) as u64, half_count, num_blocks)
                     .expect("scatter kernel");
             }
             ctx.synchronize().expect("sync after scatter");
@@ -3148,7 +3160,7 @@ mod tests {
                 .expect("alloc staging");
 
             unsafe {
-                launch_kv_gather(&gather, &ptrs_dev, &mut staging, half_count, num_blocks)
+                launch_kv_gather(&gather, CudaContext::device_ptr(&ptrs_dev) as u64, &mut staging, half_count, num_blocks)
                     .expect("gather kernel max batch");
             }
             ctx.synchronize().expect("sync");

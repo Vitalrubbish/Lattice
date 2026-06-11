@@ -213,12 +213,15 @@ pub fn launch_paged_attn_decode(
 /// Launch a gather kernel: copy same-layer KV data from N scattered source
 /// pointers into a contiguous staging buffer.
 ///
-/// `src_ptrs` is a device-side array of `CUdeviceptr` values, each pointing
-/// to one block's KV data for a single layer.  `dst` receives the packed data:
-/// `[block_0 data][block_1 data]...[block_{N-1} data]`.
+/// `src_ptrs` is a raw device pointer to an array of `CUdeviceptr` values,
+/// each pointing to one block's KV data for a single layer.  `dst` receives
+/// the packed data: `[block_0 data][block_1 data]...[block_{N-1} data]`.
+/// Accepting a raw `u64` pointer (instead of `&CudaSlice<u64>`) lets
+/// callers pass an offset into a larger pre-allocated pointer pool,
+/// enabling a single batched H2D for all layers.
 pub fn launch_kv_gather(
     kernel: &CudaFunction,
-    src_ptrs: &CudaSlice<u64>,
+    src_ptrs: u64,
     dst: &CudaSlice<f16>,
     half_count: usize,
     num_blocks: usize,
@@ -234,10 +237,15 @@ pub fn launch_kv_gather(
     Ok(())
 }
 
+/// Scatter same-layer KV data from a contiguous source buffer to N scattered
+/// destination pointers.  Reverse of [launch_kv_gather].
+///
+/// `dst_ptrs` is a raw device pointer to an array of `CUdeviceptr` values,
+/// each pointing to one block's destination KV slot for a single layer.
 pub fn launch_kv_scatter(
     kernel: &CudaFunction,
     src: &CudaSlice<f16>,
-    dst_ptrs: &CudaSlice<u64>,
+    dst_ptrs: u64,
     half_count: usize,
     num_blocks: usize,
 ) -> Result<()> {
