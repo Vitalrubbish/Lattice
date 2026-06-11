@@ -113,8 +113,12 @@ pub struct ContinuousScheduler {
     queue: Arc<InferenceQueue>,
     /// Unified cache backend enum (avoids downcasting).
     backend: CacheBackend,
-    /// Swap-manager — only used in Baseline mode.
+    /// Swap-manager — only used in Baseline mode when swap is enabled.
     swap_manager: Option<SwapManager>,
+    /// When true, Baseline mode will NOT use SwapManager — OOM simply
+    /// skips the request.  This is the correct baseline for KCMM comparisons
+    /// (the baseline should represent "no OS-level tiering support").
+    disable_swap: bool,
     /// Swapped-out sequences waiting for GPU memory to become available.
     swapped: Vec<SwappedRequest>,
     /// Per-sequence last-access epoch for LRU victim selection.
@@ -135,12 +139,13 @@ impl ContinuousScheduler {
         queue: Arc<InferenceQueue>,
         stats_handle: StatsHandle,
         backend: CacheBackend,
+        disable_swap: bool,
     ) -> Self {
         // bytes_per_token_elem = kv_heads × head_dim × 2 (one layer of K, f16)
         let bytes_per_token_elem = cfg.kv_heads() * cfg.head_dim() * 2;
         let tracker = RuntimeFragmentationTracker::new(bytes_per_token_elem);
 
-        let swap_manager = if backend.is_kcmm() {
+        let swap_manager = if backend.is_kcmm() || disable_swap {
             None
         } else {
             Some(SwapManager::new())
@@ -156,6 +161,7 @@ impl ContinuousScheduler {
             queue,
             backend,
             swap_manager,
+            disable_swap,
             swapped: Vec::new(),
             seq_last_epoch: HashMap::new(),
             tracker,
@@ -354,7 +360,20 @@ impl ContinuousScheduler {
                         continue;
                     }
 
-                    // Baseline path: use SwapManager
+                    // Baseline path with SwapManager disabled:
+                    // KCMM-comparison baseline — no eviction, OOM = skip request.
+                    if self.disable_swap {
+                        tracing::debug!(
+                            req_id = waiting[i].0.id,
+                            blocks_needed,
+                            running = running.len(),
+                            "baseline OOM (swap disabled): deferring request"
+                        );
+                        i += 1;
+                        continue;
+                    }
+
+                    // Baseline path with SwapManager enabled (standalone server mode).
                     if let Some(victim_idx) = self.select_victim(running) {
                         let victim = &running[victim_idx];
                         tracing::info!(
@@ -866,6 +885,7 @@ mod integration_tests {
             queue.clone(),
             stats,
             CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
         );
         let _h = sched.spawn();
 
@@ -928,6 +948,7 @@ mod integration_tests {
             queue.clone(),
             stats,
             CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
         );
         let _h = sched.spawn();
 
@@ -985,6 +1006,7 @@ mod integration_tests {
             queue.clone(),
             stats,
             CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
         );
         let _h = sched.spawn();
 
@@ -1031,6 +1053,7 @@ mod integration_tests {
 
         let mut sched = ContinuousScheduler::new(
             cfg, ctx, model, 4, 64, queue, stats, CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
         );
 
         // Create mock running requests
@@ -1118,6 +1141,7 @@ mod integration_tests {
 
         let mut sched = ContinuousScheduler::new(
             cfg, ctx, model, 4, 64, queue, stats, CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
         );
 
         let req_base = InferenceRequest {

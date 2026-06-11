@@ -148,6 +148,7 @@ async fn main() -> Result<()> {
             queue.clone(),
             stats_handle.clone(),
             backend,
+            false, // disable_swap: keep SwapManager for standalone server mode
         );
         let _h = sched.spawn();
     } else {
