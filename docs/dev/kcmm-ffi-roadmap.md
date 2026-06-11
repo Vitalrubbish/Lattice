@@ -27,7 +27,7 @@
 
 | 可以在 WSL2 做 | 不能在 WSL2 做 |
 |---------------|---------------|
-| ✅ 所有纯 Rust 代码开发 | ❌ 获得有意义的性能绝对值（GPU-PV 层 `cuMemAlloc` P99=12.96ms vs bare-metal ~10-30µs，差距 400-1000×） |
+| ✅ 所有纯 Rust 代码开发 | ❌ 获得有意义的性能绝对值（GPU-PV 层 `cuMemAlloc_v2` P99=12.96ms vs bare-metal ~10-30µs，差距 400-1000×） |
 | ✅ 正确性验证（token 精确匹配、状态机转换） | ❌ Benchmark 5/7 的性能结论 |
 | ✅ 单元测试 + 集成测试（项目已有完整 GPU 测试套件） | ❌ vLLM 端到端性能对比 |
 | ✅ C FFI 开发 + 符号导出验证 | ❌ NVMe GDS 路径（需要 `nvidia-fs.ko` + 特定硬件） |

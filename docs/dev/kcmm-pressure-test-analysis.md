@@ -156,8 +156,10 @@ for layer in 0..22 {          // 22 layers
 
 **每个迭代中，`device.alloc_zeros::<u64>(8)` 分配了一个 64 字节的 GPU 内存块用于存储指针数组。** 对于 44 个迭代，这就是 **44 次 GPU 内存分配**。
 
+> **API 说明：** `cudarc::alloc_zeros` 底层调用 CUDA Driver API 的 `cuMemAlloc_v2`（传统线性分配）。这与 KCMM 中 KV cache **超块（superblock）**使用的 `cuMemCreate`（CUDA VMM API，`src/cache/cuda_vmm.rs:101`）是不同的分配路径。本文中讨论的 44 次分配特指 eviction 过程中的小粒度指针数组分配，而非超块分配。
+
 在 WSL2 的 GPU-PV (Paravirtualization) 环境下：
-- 每次 `cuMemAlloc` 调用的开销约为 **200–300µs**（需要通过 hypercall 进入宿主机内核）
+- 每次 `cuMemAlloc_v2` 调用的开销约为 **200–300µs**（需要通过 hypercall 进入宿主机内核）
 - 44 × 250µs ≈ **11ms** → 与观测到的 ~10ms eviction 时间高度吻合
 
 此外，每个迭代还有：
@@ -171,7 +173,7 @@ for layer in 0..22 {          // 22 layers
 
 | 操作 | 每轮次数 | 单次开销 (WSL2) | 总开销 (44 轮) |
 |------|---------|----------------|---------------|
-| `cuMemAlloc` (64 bytes) | 1 | ~200–300µs | ~8.8–13.2ms |
+| `cuMemAlloc_v2` (64 bytes) | 1 | ~200–300µs | ~8.8–13.2ms |
 | `cuMemcpyHtoDAsync` (64B) | 1 | ~30–50µs | ~1.3–2.2ms |
 | Kernel launch (gather) | 1 | ~20–40µs | ~0.9–1.8ms |
 | `cuMemcpyDtoHAsync` (64KB) | 1 | ~30–50µs | ~1.3–2.2ms |
@@ -181,7 +183,7 @@ for layer in 0..22 {          // 22 layers
 
 ### 3.4 在 Bare-Metal 上的预期表现
 
-在 bare-metal Linux 上，`cuMemAlloc` 的开销通常是 **5–20µs** 而非 200–300µs。其他 CUDA API 调用的开销也会相应降低。因此：
+在 bare-metal Linux 上，`cuMemAlloc_v2` 的开销通常是 **5–20µs** 而非 200–300µs。其他 CUDA API 调用的开销也会相应降低。因此：
 
 - Bare-metal 预估每轮：**44 × (10 + 5 + 5 + 10) ≈ 1.3ms**
 - Bare-metal batch evict（8 blocks）：**~1.5ms** vs WSL2 的 ~10ms
@@ -208,7 +210,7 @@ let ptrs_dev_offset = layer_idx * max_batch_blocks;
 ```
 
 **预期收益：** 
-- 将 44 次 `cuMemAlloc` 调用减少为 0 次（首次初始化时已分配）
+- 将 44 次 `cuMemAlloc_v2` 调用减少为 0 次（首次初始化时已分配）
 - Eviction per-batch 从 ~10ms 降至 **~1–2ms**（WSL2）或 **<0.5ms**（bare-metal）
 - KCMM total 从 356ms 降至 **~80–110ms**（WSL2，约为 2.3× Baseline 而非 7.4×）
 
@@ -244,7 +246,7 @@ let ptrs_dev_offset = layer_idx * max_batch_blocks;
 
 1. **压力测试设计总体合理**，正确验证了 KCMM 的核心价值主张（容量提升 1.33×），但缺少统计显著性（单次测量）和时延维度的评估。
 
-2. **KCMM 运行慢的根因是每轮 batched eviction 的 44 次 GPU 内存分配**。每次分配只有 64 bytes，但在 WSL2 GPU-PV 环境下每次 `cuMemAlloc` 调用开销约 200–300µs，44 次合计 ~10ms，占 eviction 总时延的绝大部分。
+2. **KCMM 运行慢的根因是每轮 batched eviction 的 44 次 GPU 内存分配**。每次分配只有 64 bytes，但在 WSL2 GPU-PV 环境下每次 `cuMemAlloc_v2` 调用开销约 200–300µs，44 次合计 ~10ms，占 eviction 总时延的绝大部分。
 
 3. **修复方案明确且低风险**：预分配指针设备数组（一次性分配 2.8KB 代替 44 次 64B 分配），预计可将 eviction 时延降低 6–8×，KCMM 总时延从 7.4× Baseline 降至 ~2× Baseline。
 

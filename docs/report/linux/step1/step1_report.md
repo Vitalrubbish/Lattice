@@ -382,7 +382,7 @@ Block Layer:  submit_bio()                     [NOT traced, but active]
               DMA ──▶ aligned userspace buffer   [BYPASSES page cache]
     │
     ▼
-CUDA Driver:  cuMemAlloc → cudaMemcpy(H→D) from aligned buffer → GPU VRAM
+CUDA Driver:  cuMemAlloc_v2 → cudaMemcpy(H→D) from aligned buffer → GPU VRAM
 ```
 
 **Subsystems traversed:** VFS → Block Layer → SSD → Userspace buffer → CUDA Driver → GPU VRAM.

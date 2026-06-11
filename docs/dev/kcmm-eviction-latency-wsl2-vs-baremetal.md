@@ -9,18 +9,20 @@
 
 | 操作 | P50 | Mean | P99 | Max |
 |------|-----|------|-----|-----|
-| `cuMemAlloc(64B)` | **9.7µs** | 63.7µs | 168.3µs | 9.97ms |
-| `cuMemAlloc(64B) + cuMemset` (模拟 `alloc_zeros`) | **19.4µs** | **162.5µs** | **12.96ms** | 12.96ms |
+| `cuMemAlloc_v2(64B)` | **9.7µs** | 63.7µs | 168.3µs | 9.97ms |
+| `cuMemAlloc_v2(64B) + cuMemset` (模拟 `alloc_zeros`) | **19.4µs** | **162.5µs** | **12.96ms** | 12.96ms |
 | `cuCtxSynchronize()` (空闲) | 2.4µs | 7.5µs | 410.6µs | 410.6µs |
 | 44 × (alloc + memset + free) | — | **1.7ms** | — | 2.1ms |
 
-**关键发现：WSL2 的 `cuMemAlloc` 不是均匀地慢，而是有严重的厚尾分布。**
+**关键发现：WSL2 的 `cuMemAlloc_v2` 不是均匀地慢，而是有严重的厚尾分布。**
 
 - P50 只有 19.4µs（很快）
 - Mean 被拉到 162.5µs（被尾部的 12.96ms spike 拉高了 8.4×）
 - 单次调用 P99 = **12.96ms**，几乎等于整个 eviction batch 的耗时
 
 每批 eviction 有 44 次分配，30 批 eviction 共 1320 次分配——哪怕 P99 只有 1% 概率触发长尾，1320 次中也有很高的概率命中多次。
+
+> **API 说明：** 本文中 "`cuMemAlloc_v2`" 指 CUDA Driver API 的线性内存分配函数，对应 cudarc crate 的 `alloc_zeros` 方法。该 API 仅用于 eviction/restore 中的小粒度临时 GPU buffer（64 字节指针数组）。KCMM 中 KV cache **超块（superblock）**的分配使用 `cuMemCreate`（CUDA VMM API），详见 `src/cache/cuda_vmm.rs`。
 
 ---
 
@@ -46,9 +48,9 @@
 
 | 操作 | WSL2 P50 | Bare-Metal P50 | 改善倍数 |
 |------|---------|---------------|---------|
-| `cuMemAlloc(64B)` | 9.7µs | ~3–5µs | 2–3× |
-| `cuMemAlloc` tails | **12.96ms P99** | **~10–30µs P99** | **400–1000×** |
-| `cuMemAlloc` mean | 162.5µs | ~5–8µs | **20–30×** |
+| `cuMemAlloc_v2(64B)` | 9.7µs | ~3–5µs | 2–3× |
+| `cuMemAlloc_v2` tails | **12.96ms P99** | **~10–30µs P99** | **400–1000×** |
+| `cuMemAlloc_v2` mean | 162.5µs | ~5–8µs | **20–30×** |
 | `cuCtxSynchronize` | 2.4µs | ~1–2µs | 1.5–2× |
 | kernel launch | 20–40µs | ~5–10µs | 3–5× |
 | cuMemcpy API | 10–30µs | ~3–5µs | 3–6× |
@@ -114,7 +116,7 @@ vs Baseline:         96/48 = 2.0×
 
 **能解决大部分，但不能完全解决。**
 
-1. **Bare-metal 最大收益来自消除厚尾。** WSL2 的 `cuMemAlloc` P99 是 **12.96ms**，这是 GPU-PV 调度的 artifact。Bare-metal 的 P99 预期是 10–30µs — **400–1000× 改善**。这个改善直接使 eviction 从 10ms/batch → ~2.5ms/batch。
+1. **Bare-metal 最大收益来自消除厚尾。** WSL2 的 `cuMemAlloc_v2` P99 是 **12.96ms**，这是 GPU-PV 调度的 artifact。Bare-metal 的 P99 预期是 10–30µs — **400–1000× 改善**。这个改善直接使 eviction 从 10ms/batch → ~2.5ms/batch。
 
 2. **但结构性浪费仍然存在。** 即使在 bare-metal 上，44 次 × 8µs = 0.35ms 的分配开销也完全可以避免。预分配修复在 bare-metal 上仍能节省 ~12% 的 eviction 时间。
 

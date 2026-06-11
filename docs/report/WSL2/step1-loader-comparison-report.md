@@ -145,7 +145,7 @@ If sudo is not available or you want to skip cache drop, set `SUDO_PASS=""` — 
    - `total_ms` — wall clock
    - `read_ms` — file I/O portion
    - `parse_ms` — safetensors JSON header parsing
-   - `alloc_ms` — GPU memory allocation (`cuMemAlloc`)
+   - `alloc_ms` — GPU memory allocation (`cuMemAlloc_v2`)
    - `h2d_ms` — host-to-device memcpy
    - `cpu_user_ms` / `cpu_sys_ms` — per-thread CPU time from `getrusage`
    - `throughput` — total bytes / total time in MB/s

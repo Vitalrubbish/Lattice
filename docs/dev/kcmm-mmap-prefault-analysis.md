@@ -150,10 +150,10 @@ Together, these two optimizations address **different stages** in the batched ev
 
 | Stage | Before | After | Saving |
 |-------|--------|-------|--------|
-| GPU gather — pointer array allocation (evict) | 44 `cuMemAlloc` calls | 1 `cuMemAlloc` + reuse | ~43 driver calls |
+| GPU gather — pointer array allocation (evict) | 44 `cuMemAlloc_v2` calls | 1 `cuMemAlloc_v2` + reuse | ~43 driver calls |
 | CPU scatter — write mmap buffer (evict) | ~4 ms from page faults | ~0 ms (pre-faulted) | ~4 ms |
 | CPU gather — read mmap buffer (restore) | ~4 ms from page faults | ~0 ms (pre-faulted) | ~4 ms |
-| GPU scatter — pointer array allocation (restore) | 44 `cuMemAlloc` calls | 1 `cuMemAlloc` + reuse | ~43 driver calls |
+| GPU scatter — pointer array allocation (restore) | 44 `cuMemAlloc_v2` calls | 1 `cuMemAlloc_v2` + reuse | ~43 driver calls |
 
 ---
 
