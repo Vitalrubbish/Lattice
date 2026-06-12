@@ -19,7 +19,7 @@ WSL2 的 GPU 准虚拟化（GPU-PV）层引入显著性能失真：
 | `cuMemMap` (2 MiB) | 数百 µs | ~165 µs | 2-5× |
 | 批量逐出 per-block | 被 PV 层抖动主导 | 真实的摊销曲线 | 无法比较 |
 
-当前所有 Benchmark 数据（Benchmark 1-6）均在 WSL2 上采集，只能得出**相对结论**（KCMM on vs off 的比率），无法提供论文所需的**绝对性能数据**。
+当前所有 Benchmark 数据（Benchmark 1-6）均在 WSL2 上采集，只能得出**相对结论**（Tiering ON vs OFF 的比率），无法提供论文所需的**绝对性能数据**。
 
 ### 1.2 Bare-Metal 阶段目标
 
@@ -107,8 +107,8 @@ done
 
 | 指标 | WSL2 参考值 | Bare-Metal 预期 |
 |------|------------|----------------|
-| Throughput ratio (KCMM/Baseline) | ≥ 1.0× | ≥ 1.3× |
-| Capacity ratio (KCMM/Baseline) | ≥ 1.0× | ≥ 1.3× |
+| Throughput ratio (Tiering ON/OFF) | ≥ 1.0× | ≥ 1.3× |
+| Capacity ratio (Tiering ON/OFF) | ≥ 1.0× | ≥ 1.3× |
 | Per-step P50 overhead | 可能为负（tiering 开销 < PV 抖动） | 应有小额正值（真实 tiering 开销） |
 | Per-step P99 overhead | PV 主导 | 真实尾延迟特征 |
 | Eviction count | — | 活跃逐出次数 |

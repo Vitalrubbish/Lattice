@@ -46,6 +46,9 @@ pub trait EvictionPolicy: Send + Sync {
 
     /// Called when a block is evicted (for policy bookkeeping).
     fn on_evict(&self, block: BlockHandle);
+
+    /// Return the human-readable policy name ("lru", "lfu", or "fifo").
+    fn policy_name(&self) -> &'static str;
 }
 
 // --- Default LRU policy ---
@@ -94,6 +97,10 @@ impl EvictionPolicy for LruPolicy {
 
     fn on_evict(&self, block: BlockHandle) {
         self.access_times.lock().remove(&block);
+    }
+
+    fn policy_name(&self) -> &'static str {
+        "lru"
     }
 }
 
@@ -144,6 +151,10 @@ impl EvictionPolicy for LfuPolicy {
 
     fn on_evict(&self, block: BlockHandle) {
         self.access_counts.lock().remove(&block);
+    }
+
+    fn policy_name(&self) -> &'static str {
+        "lfu"
     }
 }
 
@@ -196,6 +207,10 @@ impl EvictionPolicy for FifoPolicy {
 
     fn on_evict(&self, block: BlockHandle) {
         self.alloc_times.lock().remove(&block);
+    }
+
+    fn policy_name(&self) -> &'static str {
+        "fifo"
     }
 }
 
@@ -323,7 +338,8 @@ pub struct TieringEngine {
     /// Whether NVMe tier is enabled.
     nvme_enabled: bool,
     /// Pluggable eviction policy (LRU, LFU, or FIFO).
-    pub(crate) eviction_policy: Box<dyn EvictionPolicy>,
+    /// Wrapped in a Mutex so it can be swapped at runtime through a shared reference.
+    pub(crate) eviction_policy: parking_lot::Mutex<Box<dyn EvictionPolicy>>,
     /// Serialises allocation/deallocation of byte ranges within the CPU buffer,
     /// preventing concurrent evict+restore operations from using overlapping regions.
     slot_allocator: Mutex<CpuSlotAllocator>,
@@ -477,7 +493,7 @@ impl TieringEngine {
             cpu_buffer_size,
             cpu_buffer_path: config.cpu_cache_path.clone(),
             nvme_enabled: false,
-            eviction_policy,
+            eviction_policy: parking_lot::Mutex::new(eviction_policy),
             slot_allocator: Mutex::new(CpuSlotAllocator::new(cpu_buffer_size)),
             gpu_staging,
             cpu_staging,
@@ -521,6 +537,35 @@ impl TieringEngine {
             .ok_or_else(|| anyhow::anyhow!("kernel not found: kv_gather::scatter_kv_layer"))?;
 
         Ok((gather, scatter))
+    }
+
+    /// Replace the current eviction policy at runtime.
+    ///
+    /// `policy` must be one of: "lru", "lfu", "fifo".
+    ///
+    /// Returns an error if the policy name is not recognised.
+    /// This method takes `&self` (not `&mut self`) — the policy is
+    /// protected by an internal `Mutex` so it can be swapped safely
+    /// from any thread through a shared reference.
+    pub fn set_policy(&self, policy: &str) -> Result<()> {
+        let new_policy: Box<dyn EvictionPolicy> = match policy {
+            "lru" => Box::new(LruPolicy::new()),
+            "lfu" => Box::new(LfuPolicy::new()),
+            "fifo" => Box::new(FifoPolicy::new()),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unknown eviction policy '{}' (expected lru, lfu, or fifo)",
+                    other
+                ));
+            }
+        };
+        *self.eviction_policy.lock() = new_policy;
+        Ok(())
+    }
+
+    /// Return the name of the currently active eviction policy.
+    pub fn current_policy_name(&self) -> String {
+        self.eviction_policy.lock().policy_name().to_string()
     }
 
     /// Get the CPU buffer base pointer.
@@ -678,7 +723,7 @@ impl TieringEngine {
         }
 
         // 1. Select victims
-        let victims = self.eviction_policy.select_victims(candidates, count);
+        let victims = self.eviction_policy.lock().select_victims(candidates, count);
         if victims.is_empty() {
             return Ok(Vec::new());
         }
@@ -756,7 +801,7 @@ impl TieringEngine {
             let handle = ctx.handle;
             match self.evict_finalize(pool, ctx) {
                 Ok(()) => {
-                    self.eviction_policy.on_evict(handle);
+                    self.eviction_policy.lock().on_evict(handle);
                     evicted.push(handle);
                 }
                 Err(e) => {
@@ -969,7 +1014,7 @@ impl TieringEngine {
             let handle = ctx.handle;
             match self.evict_finalize(pool, ctx) {
                 Ok(()) => {
-                    self.eviction_policy.on_evict(handle);
+                    self.eviction_policy.lock().on_evict(handle);
                     evicted.push(handle);
                 }
                 Err(e) => {
@@ -1421,7 +1466,7 @@ impl TieringEngine {
         self.free_cpu_slot(ctx.cpu_offset, ctx.total_bytes);
 
         // Notify policy — the block was just "accessed" via restore
-        self.eviction_policy.on_access(ctx.new_handle);
+        self.eviction_policy.lock().on_access(ctx.new_handle);
 
         tracing::debug!(
             ctx.block_idx,
@@ -2013,10 +2058,10 @@ mod tests {
         // Verify the policy works like LRU by exercising its behavior.
         let h0 = bh(0, 0);
         let h1 = bh(0, 1);
-        engine.eviction_policy.on_access(h0);
+        engine.eviction_policy.lock().on_access(h0);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        engine.eviction_policy.on_access(h1);
-        let victims = engine.eviction_policy.select_victims(&[h0, h1], 1);
+        engine.eviction_policy.lock().on_access(h1);
+        let victims = engine.eviction_policy.lock().select_victims(&[h0, h1], 1);
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0], h0, "LRU should evict oldest access (h0)");
 
@@ -2040,11 +2085,11 @@ mod tests {
         // Verify LFU behavior: least-frequently accessed block evicted first.
         let h0 = bh(0, 0);
         let h1 = bh(0, 1);
-        engine.eviction_policy.on_access(h0); // count=1
-        engine.eviction_policy.on_access(h1);
-        engine.eviction_policy.on_access(h1); // count=2
+        engine.eviction_policy.lock().on_access(h0); // count=1
+        engine.eviction_policy.lock().on_access(h1);
+        engine.eviction_policy.lock().on_access(h1); // count=2
 
-        let victims = engine.eviction_policy.select_victims(&[h0, h1], 1);
+        let victims = engine.eviction_policy.lock().select_victims(&[h0, h1], 1);
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0], h0, "LFU should evict least frequent (h0, count=1)");
 
@@ -2068,11 +2113,11 @@ mod tests {
         // Verify FIFO behavior: earliest-allocated evicted first.
         let h0 = bh(0, 0);
         let h1 = bh(0, 1);
-        engine.eviction_policy.on_allocate(h0); // first allocated
+        engine.eviction_policy.lock().on_allocate(h0); // first allocated
         std::thread::sleep(std::time::Duration::from_millis(2));
-        engine.eviction_policy.on_allocate(h1); // second allocated
+        engine.eviction_policy.lock().on_allocate(h1); // second allocated
 
-        let victims = engine.eviction_policy.select_victims(&[h0, h1], 1);
+        let victims = engine.eviction_policy.lock().select_victims(&[h0, h1], 1);
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0], h0, "FIFO should evict earliest allocated (h0)");
 
@@ -2095,8 +2140,8 @@ mod tests {
 
         // Should behave like LRU (fallback), not crash.
         let h = bh(0, 0);
-        engine.eviction_policy.on_access(h);
-        let victims = engine.eviction_policy.select_victims(&[h], 1);
+        engine.eviction_policy.lock().on_access(h);
+        let victims = engine.eviction_policy.lock().select_victims(&[h], 1);
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0], h);
 
@@ -2505,9 +2550,9 @@ mod tests {
             let h2 = pool.get_block_handle(table[2]).expect("get handle");
 
             // Register with LRU policy (on_allocate)
-            tiering.eviction_policy.on_allocate(h0);
-            tiering.eviction_policy.on_allocate(h1);
-            tiering.eviction_policy.on_allocate(h2);
+            tiering.eviction_policy.lock().on_allocate(h0);
+            tiering.eviction_policy.lock().on_allocate(h1);
+            tiering.eviction_policy.lock().on_allocate(h2);
 
             // Evict h0 (oldest) — should be removed from policy tracking
             let evicted = tiering
@@ -2518,7 +2563,7 @@ mod tests {
             assert_eq!(evicted[0], h0);
 
             // h0 should no longer be tracked by policy (on_evict called)
-            let remaining = tiering.eviction_policy.select_victims(&[h0, h1, h2], 2);
+            let remaining = tiering.eviction_policy.lock().select_victims(&[h0, h1, h2], 2);
             // h0 should be skipped (no tracking) — only h1, h2 selected
             assert_eq!(remaining.len(), 2);
             assert!(!remaining.contains(&h0));
@@ -2793,7 +2838,7 @@ mod tests {
                 .expect("evict");
 
             // After eviction, the old handle should NOT be tracked by LRU
-            let victims = tiering.eviction_policy.select_victims(&[handle], 1);
+            let victims = tiering.eviction_policy.lock().select_victims(&[handle], 1);
             assert!(victims.is_empty(),
                 "evicted block's old handle should not be tracked by policy");
 
@@ -2802,7 +2847,7 @@ mod tests {
 
             // The new handle should be tracked by policy (on_access)
             let new_handle = pool.get_block_handle(block_idx).expect("get new handle");
-            let victims = tiering.eviction_policy.select_victims(&[new_handle], 1);
+            let victims = tiering.eviction_policy.lock().select_victims(&[new_handle], 1);
             assert_eq!(victims.len(), 1,
                 "restored block's new handle should be tracked by policy");
             assert_eq!(victims[0], new_handle);

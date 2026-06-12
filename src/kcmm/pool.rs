@@ -49,17 +49,17 @@ pub enum BlockLocation {
 // --- Per-block tracking ---
 
 #[derive(Debug, Clone)]
-struct BlockInfo {
+pub(crate) struct BlockInfo {
     /// Byte offset within the per-layer K/V VA region for this block.
-    va_offset: usize,
+    pub(crate) va_offset: usize,
     /// Superblock index (same across all pools in lockstep).
-    superblock_idx: u32,
+    pub(crate) superblock_idx: u32,
     /// Block index within the superblock.
-    block_index_in_sb: u32,
+    pub(crate) block_index_in_sb: u32,
     /// Whether this block is currently assigned to a sequence.
-    in_use: bool,
+    pub(crate) in_use: bool,
     /// Where the block's data resides.
-    location: BlockLocation,
+    pub(crate) location: BlockLocation,
 }
 
 // --- Sequence state ---
@@ -118,9 +118,9 @@ pub struct KcmmPool {
     /// CUDA VMM handle for GPU physical memory management.
     vmm: CudaVmm,
     /// K-cache VA regions (one per layer).
-    va_k: Vec<u64>,
+    pub(crate) va_k: Vec<u64>,
     /// V-cache VA regions (one per layer).
-    va_v: Vec<u64>,
+    pub(crate) va_v: Vec<u64>,
 
     /// Per-layer K physical pools.
     pub(crate) k_pools: Vec<LayerKvPool>,
@@ -128,11 +128,11 @@ pub struct KcmmPool {
     pub(crate) v_pools: Vec<LayerKvPool>,
 
     /// Block-level tracking: block_idx → BlockInfo.
-    block_info: Mutex<Vec<BlockInfo>>,
+    pub(crate) block_info: Mutex<Vec<BlockInfo>>,
     /// Recycled block indices.
-    free_block_indices: Mutex<Vec<u32>>,
+    pub(crate) free_block_indices: Mutex<Vec<u32>>,
     /// Per-sequence metadata.
-    sequences: Mutex<Vec<SequenceState>>,
+    pub(crate) sequences: Mutex<Vec<SequenceState>>,
 
     /// Optional tiering engine for GPU↔CPU↔NVMe migration.
     /// `None` when tiering is disabled in config.
@@ -389,7 +389,7 @@ impl KcmmPool {
         // Register with the eviction policy so the tiering engine
         // knows about this block for victim selection.
         if let Some(ref tiering) = self.tiering {
-            tiering.eviction_policy.on_allocate(block_handle);
+            tiering.eviction_policy.lock().on_allocate(block_handle);
         }
 
         idx
