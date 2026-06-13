@@ -1,6 +1,6 @@
 # Run integration benchmarks to compare eviction policies
 
-Status: todo
+Status: done
 Type: AFK
 
 ## What to build
