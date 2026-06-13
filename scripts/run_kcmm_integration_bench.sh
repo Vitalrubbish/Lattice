@@ -2,7 +2,7 @@
 # ==============================================================================
 # scripts/run_kcmm_integration_bench.sh — KCMM §1.6 Engine Integration Benchmark
 #
-# Exercises NaiveTransformer + KvCacheBackend through a simulated
+# Exercises LlamaTransformer + KvCacheBackend through a simulated
 # continuous-batching workload, comparing PagedKvCache (baseline) against
 # KcmmPool (tiering ON).  Measures throughput, per-step latency distribution,
 # eviction/restore counts, and capacity ratio.
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [--release|--debug] [--single|--sweep] [--filter <substring>]"
             echo ""
             echo "KCMM §1.6 Engine Integration Benchmark"
-            echo "  NaiveTransformer + KcmmPool continuous batching workload"
+            echo "  LlamaTransformer + KcmmPool continuous batching workload"
             echo ""
             echo "Options:"
             echo "  --release   Build with optimisations (slower compile, faster runtime)"

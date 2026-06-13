@@ -107,6 +107,10 @@ declare -a BENCHMARKS=(
     # Benchmark 5 (Phase 1c): Memory Pressure — Tiering Capacity Benefit
     "kcmm_bench_memory_pressure_single|kcmm_bench_memory_pressure|Benchmark 5a — Memory Pressure Single Config (baseline vs KCMM tiering)"
     "kcmm_bench_memory_pressure_sweep|kcmm_bench_memory_pressure|Benchmark 5b — Memory Pressure Sweep (block size × pool capacity × prompt dist)"
+
+    # Benchmark §1.6: Engine Integration — LlamaTransformer + KcmmPool continuous batching
+    "kcmm_engine_integration_single|kcmm_bench_engine_integration|Benchmark §1.6a — Engine Integration Single Config (throughput, P50/P99, thrashing)"
+    "kcmm_engine_integration_sweep|kcmm_bench_engine_integration|Benchmark §1.6b — Engine Integration Sweep (4 configs, OFF vs ON)"
 )
 
 # If filter is set, only keep matching tests
