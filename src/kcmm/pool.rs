@@ -2362,4 +2362,25 @@ mod tests {
             pool.free_sequence(&table2[1..]);
         }
     }
+
+    // --- SequencePriority tests ---
+
+    #[test]
+    fn test_sequence_priority_ordering() {
+        // Verify the priority tier ordering
+        assert!(SequencePriority::Evictable < SequencePriority::Low);
+        assert!(SequencePriority::Low < SequencePriority::Normal);
+        assert!(SequencePriority::Normal < SequencePriority::High);
+    }
+
+    #[test]
+    fn test_sequence_priority_default_is_normal() {
+        assert_eq!(SequencePriority::default(), SequencePriority::Normal);
+    }
+
+    #[test]
+    fn test_sequence_state_default_priority() {
+        let state = SequenceState::new(vec![0, 1, 2]);
+        assert_eq!(state.priority, SequencePriority::Normal);
+    }
 }

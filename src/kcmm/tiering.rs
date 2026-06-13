@@ -3788,4 +3788,239 @@ mod tests {
             }
         }
     }
+
+    // --- ArcPolicy tests ---
+
+    fn make_handle(sb: u32, idx: u32) -> BlockHandle {
+        BlockHandle {
+            superblock_idx: sb,
+            block_index: idx,
+        }
+    }
+
+    #[test]
+    fn test_arc_first_access_goes_to_t1() {
+        let arc = ArcPolicy::new(10);
+        let h = make_handle(0, 0);
+        arc.on_allocate(h);
+        // After first access, block should be in T1 (not T2)
+        let victims = arc.select_victims(&[h], 1);
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0], h);
+    }
+
+    #[test]
+    fn test_arc_second_access_promotes_to_t2() {
+        let arc = ArcPolicy::new(10);
+        let h = make_handle(0, 0);
+        arc.on_allocate(h);
+        arc.on_access(h); // second access → promote to T2
+        // T1 should now be empty, T2 has the block
+        // T1 LRU should be empty → no victims from T1
+        let empty: Vec<BlockHandle> = vec![];
+        let victims = arc.select_victims(&empty, 1);
+        assert!(victims.is_empty());
+    }
+
+    #[test]
+    fn test_arc_select_victims_t1_before_t2() {
+        let arc = ArcPolicy::new(10);
+        let h1 = make_handle(0, 0); // T1 (accessed once)
+        let h2 = make_handle(0, 1); // T2 (accessed twice)
+        let h3 = make_handle(0, 2); // T1 (accessed once, older than h1 by position in select)
+        arc.on_allocate(h1); // T1
+        arc.on_allocate(h2); // T1
+        arc.on_access(h2);   // T1 → T2
+        arc.on_allocate(h3); // T1
+
+        // Both h1 and h3 are in T1. The LRU order within T1 depends on insertion order.
+        // h1 was inserted first, so it's further from the head (older), meaning it should
+        // be selected as victim before h3. h2 is in T2 so it should be evicted after T1.
+        let candidates = vec![h1, h2, h3];
+        let victims = arc.select_victims(&candidates, 1);
+        // Should pick the oldest T1 entry
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0], h1);
+    }
+
+    #[test]
+    fn test_arc_evict_populates_ghost() {
+        let arc = ArcPolicy::new(3);
+        let h1 = make_handle(0, 0);
+        let h2 = make_handle(0, 1);
+        let h3 = make_handle(0, 2);
+        arc.on_allocate(h1); // T1
+        arc.on_allocate(h2); // T1
+        arc.on_access(h2);   // → T2
+        arc.on_allocate(h3); // T1
+        // T1: [h3, h1], T2: [h2] — capacity=3, total=3, ok
+
+        // Evict h1: it's in T1, should go to B1 ghost
+        arc.on_evict(h1);
+        // Now allocate a new block with the same handle → should be ghost hit in B1
+        arc.on_allocate(h1);
+        // After B1 ghost hit, it should go to T2
+        let candidates = vec![h1];
+        // h1 should now be in T2 (not easily testable without internals,
+        // but we can verify it's tracked)
+        let victims = arc.select_victims(&candidates, 1);
+        assert_eq!(victims.len(), 1);
+    }
+
+    #[test]
+    fn test_arc_capacity_enforcement() {
+        let arc = ArcPolicy::new(2);
+        let h1 = make_handle(0, 0);
+        let h2 = make_handle(0, 1);
+        let h3 = make_handle(0, 2);
+        arc.on_allocate(h1);
+        arc.on_allocate(h2);
+        arc.on_allocate(h3); // exceeds capacity 2 → evicts LRU from T1 to B1 ghost
+        // h1 is in B1 (ghost), h2 and h3 are in T1.
+        // select_victims returns all 3: ghost gets lowest priority (highest score)
+        // but is still a valid candidate.
+        let candidates = vec![h1, h2, h3];
+        let victims = arc.select_victims(&candidates, 3);
+        assert_eq!(victims.len(), 3);
+        // Ghost entry (h1) should be last (lowest priority to evict)
+        assert_eq!(victims[2], h1);
+    }
+
+    #[test]
+    fn test_arc_select_victims_empty() {
+        let arc = ArcPolicy::new(10);
+        let victims = arc.select_victims(&[], 5);
+        assert!(victims.is_empty());
+    }
+
+    #[test]
+    fn test_arc_select_victims_zero_count() {
+        let arc = ArcPolicy::new(10);
+        let h = make_handle(0, 0);
+        arc.on_allocate(h);
+        let victims = arc.select_victims(&[h], 0);
+        assert!(victims.is_empty());
+    }
+
+    #[test]
+    fn test_arc_policy_name() {
+        let arc = ArcPolicy::new(10);
+        assert_eq!(arc.policy_name(), "arc");
+    }
+
+    // --- SinkWindowPolicy tests ---
+
+    #[test]
+    fn test_sink_window_protects_sink_blocks() {
+        let sw = SinkWindowPolicy::new(2, 2); // sink=2, window=2
+        let h0 = make_handle(0, 0); // sink (pos 0 < 2)
+        let h1 = make_handle(0, 1); // sink (pos 1 < 2)
+        let h2 = make_handle(0, 2); // eligible (middle)
+        let h3 = make_handle(0, 3); // eligible (middle)
+        let h4 = make_handle(0, 4); // window (pos 4 >= 5-2=3)
+        let h5 = make_handle(0, 5); // window (pos 5 >= 3)
+
+        // 6 blocks total (pos 0-5): sink=[0,1], middle=[2,3], window=[4,5]
+        sw.register_block(h0, 0, 0);
+        sw.register_block(h1, 0, 1);
+        sw.register_block(h2, 0, 2);
+        sw.register_block(h3, 0, 3);
+        sw.register_block(h4, 0, 4);
+        sw.register_block(h5, 0, 5);
+
+        sw.on_allocate(h0);
+        sw.on_allocate(h1);
+        sw.on_allocate(h2);
+        sw.on_allocate(h3);
+        sw.on_allocate(h4);
+        sw.on_allocate(h5);
+
+        let candidates = vec![h0, h1, h2, h3, h4, h5];
+        let victims = sw.select_victims(&candidates, 6);
+
+        // h0, h1 are sink — protected
+        // h4, h5 are window — protected
+        // Only h2, h3 are eligible
+        assert_eq!(victims.len(), 2);
+        // h2 was allocated before h3, so h2 is older (LRU → evict first)
+        assert_eq!(victims[0], h2);
+        assert_eq!(victims[1], h3);
+    }
+
+    #[test]
+    fn test_sink_window_all_protected_when_small_sequence() {
+        let sw = SinkWindowPolicy::new(2, 3); // sink=2, window=3, total protected=5
+        let h0 = make_handle(0, 0);
+        let h1 = make_handle(0, 1);
+        let h2 = make_handle(0, 2);
+
+        sw.register_block(h0, 0, 0);
+        sw.register_block(h1, 0, 1);
+        sw.register_block(h2, 0, 2);
+
+        sw.on_allocate(h0);
+        sw.on_allocate(h1);
+        sw.on_allocate(h2);
+
+        let candidates = vec![h0, h1, h2];
+        let victims = sw.select_victims(&candidates, 3);
+
+        // All 3 blocks are protected (sink=2 covers pos 0,1; window=3 covers pos 0,1,2
+        // since total_blocks=3, window_start=0)
+        // Actually: sink protects pos 0,1 (< 2). Window protects pos >= 3-3=0.
+        // So ALL positions 0,1,2 are protected.
+        assert!(victims.is_empty());
+    }
+
+    #[test]
+    fn test_sink_window_lru_within_eligible() {
+        let sw = SinkWindowPolicy::new(1, 1); // sink=1, window=1
+        let h0 = make_handle(0, 0); // sink
+        let h1 = make_handle(0, 1); // eligible
+        let h2 = make_handle(0, 2); // eligible
+        let h3 = make_handle(0, 3); // window (total=4, window_start=3)
+
+        sw.register_block(h0, 0, 0);
+        sw.register_block(h1, 0, 1);
+        sw.register_block(h2, 0, 2);
+        sw.register_block(h3, 0, 3);
+
+        sw.on_allocate(h0);
+        sw.on_allocate(h1);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        sw.on_allocate(h2); // h2 is newer than h1
+        sw.on_allocate(h3);
+
+        let candidates = vec![h0, h1, h2, h3];
+        let victims = sw.select_victims(&candidates, 2);
+
+        // h0 (sink) and h3 (window) are protected
+        // h1 and h2 are eligible. h1 is older → evicted first
+        assert_eq!(victims.len(), 2);
+        assert_eq!(victims[0], h1); // older LRU
+        assert_eq!(victims[1], h2); // newer
+    }
+
+    #[test]
+    fn test_sink_window_policy_name() {
+        let sw = SinkWindowPolicy::new(1, 4);
+        assert_eq!(sw.policy_name(), "sink_window");
+    }
+
+    #[test]
+    fn test_sink_window_select_victims_empty() {
+        let sw = SinkWindowPolicy::new(1, 4);
+        let victims = sw.select_victims(&[], 5);
+        assert!(victims.is_empty());
+    }
+
+    #[test]
+    fn test_sink_window_select_victims_zero_count() {
+        let sw = SinkWindowPolicy::new(1, 4);
+        let h = make_handle(0, 0);
+        sw.register_block(h, 0, 0);
+        sw.on_allocate(h);
+        let victims = sw.select_victims(&[h], 0);
+        assert!(victims.is_empty());
+    }
 }

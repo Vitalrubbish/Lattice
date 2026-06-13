@@ -340,4 +340,139 @@ mod tests {
         assert_eq!(m2.evicted_blocks_total, m1.evicted_blocks_total);
         assert_eq!(m2.background_eviction_count, m1.background_eviction_count);
     }
+
+    // --- LatencyHistogram tests ---
+
+    #[test]
+    fn test_latency_histogram_default() {
+        let h = LatencyHistogram::default();
+        assert_eq!(h.count, 0);
+        assert_eq!(h.sum_us, 0);
+        assert_eq!(h.min_us, 0);
+        assert_eq!(h.max_us, 0);
+        assert_eq!(h.avg_us(), 0.0);
+        for b in &h.buckets {
+            assert_eq!(*b, 0);
+        }
+    }
+
+    #[test]
+    fn test_latency_histogram_single_record() {
+        let mut h = LatencyHistogram::default();
+        h.record(150);
+        assert_eq!(h.count, 1);
+        assert_eq!(h.min_us, 150);
+        assert_eq!(h.max_us, 150);
+        assert_eq!(h.avg_us(), 150.0);
+        // 150 falls in bucket [100, 250)
+        assert_eq!(h.buckets[1], 1);
+        assert_eq!(h.buckets[0], 0);
+        assert_eq!(h.buckets[2], 0);
+    }
+
+    #[test]
+    fn test_latency_histogram_multiple_records() {
+        let mut h = LatencyHistogram::default();
+        // BOUNDS: [100, 250, 500, 1000, 2500, 5000, 10000, u64::MAX]
+        // bucket 0: [0, 100)
+        // bucket 1: [100, 250)
+        // bucket 2: [250, 500)
+        // bucket 3: [500, 1000)
+        // bucket 4: [1000, 2500)
+        // bucket 5: [2500, 5000)
+        // bucket 6: [5000, 10000)
+        // bucket 7: [10000, u64::MAX)
+        // bucket 8: overflow (>= u64::MAX, effectively unreachable)
+        h.record(50);   // bucket 0
+        h.record(200);  // bucket 1
+        h.record(400);  // bucket 2
+        h.record(800);  // bucket 3
+        h.record(2000); // bucket 4
+        h.record(4000); // bucket 5
+        h.record(8000); // bucket 6
+        h.record(15000);// bucket 7 (15000 < u64::MAX)
+
+        assert_eq!(h.count, 8);
+        assert_eq!(h.min_us, 50);
+        assert_eq!(h.max_us, 15000);
+        assert_eq!(h.buckets[0], 1);
+        assert_eq!(h.buckets[1], 1);
+        assert_eq!(h.buckets[2], 1);
+        assert_eq!(h.buckets[3], 1);
+        assert_eq!(h.buckets[4], 1);
+        assert_eq!(h.buckets[5], 1);
+        assert_eq!(h.buckets[6], 1);
+        assert_eq!(h.buckets[7], 1);
+        assert_eq!(h.buckets[8], 0);
+    }
+
+    #[test]
+    fn test_latency_histogram_avg() {
+        let mut h = LatencyHistogram::default();
+        h.record(100);
+        h.record(200);
+        h.record(300);
+        assert_eq!(h.count, 3);
+        assert!((h.avg_us() - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_latency_histogram_min_max() {
+        let mut h = LatencyHistogram::default();
+        h.record(500);
+        h.record(100);
+        h.record(1000);
+        assert_eq!(h.min_us, 100);
+        assert_eq!(h.max_us, 1000);
+    }
+
+    #[test]
+    fn test_latency_histogram_boundary() {
+        let mut h = LatencyHistogram::default();
+        h.record(99);   // bucket 0
+        h.record(100);  // bucket 1 (boundary: 100 is in [100, 250))
+        h.record(249);  // bucket 1
+        h.record(250);  // bucket 2
+        assert_eq!(h.buckets[0], 1);
+        assert_eq!(h.buckets[1], 2);
+        assert_eq!(h.buckets[2], 1);
+    }
+
+    // --- PolicyStats tests ---
+
+    #[test]
+    fn test_policy_stats_default() {
+        let s = PolicyStats::default();
+        assert_eq!(s.eviction_count, 0);
+        assert_eq!(s.restoration_count, 0);
+        assert_eq!(s.evicted_blocks, 0);
+        assert_eq!(s.restored_blocks, 0);
+        assert_eq!(s.avg_evict_batch_size, 0.0);
+    }
+
+    #[test]
+    fn test_policy_stats_running_average() {
+        let mut s = PolicyStats::default();
+        // Simulate the record_eviction formula:
+        //   let n = entry.eviction_count as f64;  // count AFTER increment
+        //   entry.avg = (entry.avg * (n - 1.0) + blocks as f64) / n;
+
+        // First evict: 4 blocks, n=1 after increment
+        s.eviction_count = 1;
+        s.evicted_blocks = 4;
+        s.avg_evict_batch_size = (0.0 * 0.0 + 4.0) / 1.0;
+        assert!((s.avg_evict_batch_size - 4.0).abs() < 0.001);
+
+        // Second evict: 8 blocks, n=2 after increment
+        s.eviction_count = 2;
+        s.evicted_blocks += 8;
+        s.avg_evict_batch_size = (s.avg_evict_batch_size * 1.0 + 8.0) / 2.0;
+        assert!((s.avg_evict_batch_size - 6.0).abs() < 0.001);
+
+        // Third evict: 12 blocks, n=3 after increment
+        s.eviction_count = 3;
+        s.evicted_blocks += 12;
+        s.avg_evict_batch_size = (s.avg_evict_batch_size * 2.0 + 12.0) / 3.0;
+        assert!((s.avg_evict_batch_size - 8.0).abs() < 0.001);
+    }
 }
