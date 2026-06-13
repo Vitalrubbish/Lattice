@@ -112,7 +112,6 @@ fn run_baseline_workload(cache: &PagedKvCache, cfg: &WorkloadConfig) -> Capacity
     let mut completed = 0usize;
     let mut capped = 0usize;
     let mut rejected = 0usize;
-    let mut peak_concurrent = 0usize;
     let mut total_blocks_allocated = 0usize;
     let mut seq_counter = 0usize;
 
@@ -145,7 +144,7 @@ fn run_baseline_workload(cache: &PagedKvCache, cfg: &WorkloadConfig) -> Capacity
         }
     }
 
-    peak_concurrent = active_seqs.len();
+    let mut peak_concurrent = active_seqs.len();
 
     // Dynamic phase: decode growth + new arrivals.
     let total_steps = cfg.max_new_tokens * 3; // Long enough for arrivals + completions.
@@ -198,8 +197,7 @@ fn run_baseline_workload(cache: &PagedKvCache, cfg: &WorkloadConfig) -> Capacity
             next_arrival_at = step + cfg.arrival_interval;
 
             let prompt_len = cfg.prompt_lens[seq_counter % cfg.prompt_lens.len()];
-            let initial_blocks =
-                (prompt_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens;
+            let initial_blocks = (prompt_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens;
             let target_len = prompt_len + cfg.max_new_tokens;
 
             match cache.alloc_sequence(initial_blocks) {
@@ -316,7 +314,10 @@ fn evict_coldest_blocks(
     if scan_us + evict_us > 5000 {
         println!(
             "    [evict detail] batch={}  scan={}µs  evict={}µs  total={}µs",
-            batch_size, scan_us, evict_us, scan_us + evict_us,
+            batch_size,
+            scan_us,
+            evict_us,
+            scan_us + evict_us,
         );
     }
 
@@ -355,7 +356,6 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
     let mut completed = 0usize;
     let mut capped = 0usize;
     let mut rejected = 0usize;
-    let mut peak_concurrent = 0usize;
     let mut peak_blocks = 0usize;
     let mut total_blocks_allocated = 0usize;
     let mut eviction_count = 0usize;
@@ -373,8 +373,13 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
 
         let t_alloc = Instant::now();
         let block_table = match try_alloc_with_eviction(
-            pool, tiering, &active_seqs, initial_blocks,
-            &mut eviction_count, &mut peak_cpu_swap, block_bytes,
+            pool,
+            tiering,
+            &active_seqs,
+            initial_blocks,
+            &mut eviction_count,
+            &mut peak_cpu_swap,
+            block_bytes,
         ) {
             Some(bt) => bt,
             None => break, // Can't admit — pre-fill complete.
@@ -400,7 +405,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
         }
     }
 
-    peak_concurrent = active_seqs.len();
+    let mut peak_concurrent = active_seqs.len();
 
     // Dynamic phase.
     let total_steps = cfg.max_new_tokens * 3;
@@ -495,8 +500,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
             next_arrival_at = step + cfg.arrival_interval;
 
             let prompt_len = cfg.prompt_lens[seq_counter % cfg.prompt_lens.len()];
-            let initial_blocks =
-                (prompt_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens;
+            let initial_blocks = (prompt_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens;
             let target_len = prompt_len + cfg.max_new_tokens;
 
             match pool.alloc_sequence(initial_blocks) {
@@ -607,7 +611,8 @@ fn run_capacity_comparison(cfg: &WorkloadConfig) -> (CapacityResult, CapacityRes
 
     let kcmm_config = KcmmConfig {
         block_size: cfg.block_size_tokens,
-        max_blocks: cfg.max_batch * ((cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens),
+        max_blocks: cfg.max_batch
+            * ((cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens),
         cpu_cache_path: cpu_path,
         tiering: true,
         eviction_policy: "lru".to_string(),
@@ -631,6 +636,22 @@ fn run_capacity_comparison(cfg: &WorkloadConfig) -> (CapacityResult, CapacityRes
     (baseline_result, kcmm_result)
 }
 
+fn completed_count_ratio(baseline: &CapacityResult, kcmm: &CapacityResult) -> f64 {
+    if baseline.completed > 0 {
+        kcmm.completed as f64 / baseline.completed as f64
+    } else {
+        f64::NAN
+    }
+}
+
+fn completed_per_second(result: &CapacityResult) -> f64 {
+    if result.elapsed_ms > 0 {
+        result.completed as f64 * 1000.0 / result.elapsed_ms as f64
+    } else {
+        f64::NAN
+    }
+}
+
 // --- Single config ---
 
 #[test]
@@ -650,7 +671,7 @@ fn kcmm_bench_memory_pressure_single() {
         prompt_lens: vec![128, 256],
         max_new_tokens: 384, // long decode → sequences stay active longer
         max_batch: 16,
-        max_seq_len: 640, // 256 + 384
+        max_seq_len: 640,   // 256 + 384
         total_arrivals: 32, // 2× max_batch → guaranteed churn
         arrival_interval: 12,
     };
@@ -671,11 +692,9 @@ fn kcmm_bench_memory_pressure_single() {
 
     let (baseline, kcmm) = run_capacity_comparison(&cfg);
 
-    let throughput_ratio = if baseline.completed > 0 {
-        kcmm.completed as f64 / baseline.completed as f64
-    } else {
-        f64::NAN
-    };
+    let completion_ratio = completed_count_ratio(&baseline, &kcmm);
+    let baseline_completed_per_sec = completed_per_second(&baseline);
+    let kcmm_completed_per_sec = completed_per_second(&kcmm);
 
     println!("\n  --- Results ---");
     println!("  Baseline (PagedKvCache, no tiering):");
@@ -687,7 +706,10 @@ fn kcmm_bench_memory_pressure_single() {
         baseline.peak_concurrent,
         baseline.total_blocks_allocated,
     );
-    println!("    elapsed={}ms", baseline.elapsed_ms);
+    println!(
+        "    elapsed={}ms, elapsed_throughput={:.2} completed/s",
+        baseline.elapsed_ms, baseline_completed_per_sec,
+    );
 
     println!("  KCMM (KcmmPool, tiering ON):");
     println!(
@@ -702,31 +724,50 @@ fn kcmm_bench_memory_pressure_single() {
         "    evictions={}, cpu_swap_peak={} B, peak_blocks={}",
         kcmm.eviction_count, kcmm.cpu_swap_peak_bytes, kcmm.peak_blocks,
     );
-    println!("    elapsed={}ms", kcmm.elapsed_ms);
+    println!(
+        "    elapsed={}ms, elapsed_throughput={:.2} completed/s",
+        kcmm.elapsed_ms, kcmm_completed_per_sec,
+    );
 
     println!(
-        "\n  throughput_ratio = KCMM / Baseline = {} / {} = {:.2}×",
-        kcmm.completed, baseline.completed, throughput_ratio,
+        "\n  completion_ratio = KCMM / Baseline = {} / {} = {:.2}×",
+        kcmm.completed, baseline.completed, completion_ratio,
+    );
+    println!(
+        "  elapsed_throughput is reported separately: baseline={:.2} completed/s, kcmm={:.2} completed/s",
+        baseline_completed_per_sec, kcmm_completed_per_sec,
     );
 
     // Primary metric: completed sequences ratio.
-    if throughput_ratio >= 1.3 {
-        println!("  ✅ PASS: throughput_ratio ≥ 1.3×");
-    } else if throughput_ratio >= 1.0 {
-        println!("  ⚡ Marginal: throughput_ratio {:.2}× (below 1.3× target)", throughput_ratio);
+    if completion_ratio >= 1.3 {
+        println!("  ✅ PASS: completion_ratio ≥ 1.3×");
+    } else if completion_ratio >= 1.0 {
+        println!(
+            "  ⚡ Marginal: completion_ratio {:.2}× (below 1.3× target)",
+            completion_ratio
+        );
     } else {
         println!("  ❌ FAIL: KCMM completed fewer sequences than baseline");
     }
 
     // Secondary metrics.
     if kcmm.rejected < baseline.rejected {
-        println!("  ✅ KCMM rejected fewer arrivals ({}/{})", kcmm.rejected, baseline.rejected);
+        println!(
+            "  ✅ KCMM rejected fewer arrivals ({}/{})",
+            kcmm.rejected, baseline.rejected
+        );
     }
     if kcmm.peak_concurrent > baseline.peak_concurrent {
-        println!("  ✅ KCMM supported higher peak concurrency ({}/{})", kcmm.peak_concurrent, baseline.peak_concurrent);
+        println!(
+            "  ✅ KCMM supported higher peak concurrency ({}/{})",
+            kcmm.peak_concurrent, baseline.peak_concurrent
+        );
     }
     if kcmm.eviction_count > 0 {
-        println!("  ℹ️  Evictions triggered: {} (tiering is active)", kcmm.eviction_count);
+        println!(
+            "  ℹ️  Evictions triggered: {} (tiering is active)",
+            kcmm.eviction_count
+        );
     } else {
         println!("  ⚠️  No evictions triggered — workload may not be creating memory pressure");
     }
@@ -785,10 +826,22 @@ fn kcmm_bench_memory_pressure_sweep() {
 
     println!();
     println!(
-        "  {:<50} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "Config", "Base", "KCMM", "Ratio", "RejB", "RejK", "CappedB", "CappedK", "Evict"
+        "  {:<50} {:>8} {:>8} {:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}",
+        "Config",
+        "BaseDone",
+        "KcmmDone",
+        "CompRatio",
+        "RejB",
+        "RejK",
+        "CappedB",
+        "CappedK",
+        "Evict",
+        "BaseMs",
+        "KcmmMs",
+        "ThrB/s",
+        "ThrK/s"
     );
-    println!("  {}", "-".repeat(122));
+    println!("  {}", "-".repeat(164));
 
     let mut max_ratio = 0.0f64;
     let mut best_label = String::new();
@@ -796,11 +849,9 @@ fn kcmm_bench_memory_pressure_sweep() {
     for cfg in &configs {
         let (baseline, kcmm) = run_capacity_comparison(cfg);
 
-        let ratio = if baseline.completed > 0 {
-            kcmm.completed as f64 / baseline.completed as f64
-        } else {
-            f64::NAN
-        };
+        let ratio = completed_count_ratio(&baseline, &kcmm);
+        let baseline_completed_per_sec = completed_per_second(&baseline);
+        let kcmm_completed_per_sec = completed_per_second(&kcmm);
 
         let status = if ratio >= 1.3 {
             "✅"
@@ -811,7 +862,7 @@ fn kcmm_bench_memory_pressure_sweep() {
         };
 
         println!(
-            "  {:<50} {:>8} {:>8} {:>8.2}× {:>8} {:>8} {:>8} {:>8} {:>8} {:<4}",
+            "  {:<50} {:>8} {:>8} {:>10.2}× {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9.2} {:>9.2} {:<4}",
             cfg.label(),
             baseline.completed,
             kcmm.completed,
@@ -821,6 +872,10 @@ fn kcmm_bench_memory_pressure_sweep() {
             baseline.capped,
             kcmm.capped,
             kcmm.eviction_count,
+            baseline.elapsed_ms,
+            kcmm.elapsed_ms,
+            baseline_completed_per_sec,
+            kcmm_completed_per_sec,
             status,
         );
 
@@ -830,7 +885,7 @@ fn kcmm_bench_memory_pressure_sweep() {
         }
     }
 
-    println!("\n  Best throughput_ratio: {max_ratio:.2}×  ({best_label})");
+    println!("\n  Best completion_ratio: {max_ratio:.2}×  ({best_label})");
 
     let any_pass = max_ratio >= 1.3;
 

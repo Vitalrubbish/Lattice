@@ -52,10 +52,10 @@ fn make_tiering_pool(
         ctx.clone(),
         config,
         num_layers, // num_layers
-        4,           // kv_heads
-        64,          // head_dim
-        256,         // max_batch
-        256,         // max_seq_len
+        4,          // kv_heads
+        64,         // head_dim
+        256,        // max_batch
+        256,        // max_seq_len
     )
     .expect("create KcmmPool with tiering");
 
@@ -159,10 +159,10 @@ fn kcmm_bench_batch_eviction_amortization() {
     let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
 
     let num_layers = 2;
-    let block_size = 128; // 64 KiB blocks
-    // Use a large pool so superblock creation never triggers during the
-    // measurement loop — 4096 blocks is enough for 5 warmup rounds × 64 blocks
-    // + 30 measurement rounds × 64 blocks worst case, all within capacity.
+    // 64 KiB blocks. Use a large pool so superblock creation never triggers
+    // during the measurement loop: 4096 blocks is enough for 5 warmup rounds
+    // x 64 blocks + 30 measurement rounds x 64 blocks worst case.
+    let block_size = 128;
     let (pool, _dir) = make_tiering_pool(&ctx, block_size, 4096, num_layers);
     let tiering = pool.tiering.as_ref().expect("tiering enabled");
     let block_bytes = pool.block_bytes;
@@ -170,9 +170,7 @@ fn kcmm_bench_batch_eviction_amortization() {
     let batch_sizes: &[usize] = &[1, 4, 16, 64];
 
     println!("\n=== KCMM Benchmark 2b: Batch Eviction Amortisation ===");
-    println!(
-        "block_bytes={block_bytes}, num_layers={num_layers}, rounds=30"
-    );
+    println!("block_bytes={block_bytes}, num_layers={num_layers}, rounds=30");
 
     // Warmup: multiple full cycles to stabilise CUDA driver caches, lazy
     // superblock allocations, and gather-kernel JIT compilation.  We use
@@ -181,13 +179,17 @@ fn kcmm_bench_batch_eviction_amortization() {
         let pairs = alloc_blocks(&pool, 64);
         let handles: Vec<BlockHandle> = pairs.iter().map(|(_, h)| *h).collect();
         let indices: Vec<u32> = pairs.iter().map(|(idx, _)| *idx).collect();
-        tiering.evict_blocks(&pool, &handles, 64).expect("warmup evict");
-        pool.restore_evicted_blocks(&indices).expect("warmup restore");
+        tiering
+            .evict_blocks(&pool, &handles, 64)
+            .expect("warmup evict");
+        pool.restore_evicted_blocks(&indices)
+            .expect("warmup restore");
         pool.free_sequence(&indices);
     }
 
-    // Collect per-batch averages, then compute amortisation factor.
-    let mut batch_results: Vec<(usize, u64)> = Vec::new();
+    // Collect per-batch per-block P50 and mean latencies so amortisation
+    // factors can distinguish median behaviour from outlier-sensitive mean.
+    let mut batch_results: Vec<(usize, u64, f64)> = Vec::new();
 
     for &batch_size in batch_sizes {
         let rounds = 30;
@@ -200,7 +202,8 @@ fn kcmm_bench_batch_eviction_amortization() {
             let handles: Vec<BlockHandle> = pairs.iter().map(|(_, h)| *h).collect();
             let indices: Vec<u32> = pairs.iter().map(|(idx, _)| *idx).collect();
             let _ = tiering.evict_blocks(&pool, &handles, batch_size);
-            pool.restore_evicted_blocks(&indices).expect("prewarm restore");
+            pool.restore_evicted_blocks(&indices)
+                .expect("prewarm restore");
             pool.free_sequence(&indices);
         }
 
@@ -226,32 +229,35 @@ fn kcmm_bench_batch_eviction_amortization() {
             pool.free_sequence(&indices);
         }
 
-        // Use median to filter out outlier jitter (e.g. WSL2 paravirtualisation).
-        let avg = percentile(&mut per_block_latencies, 50.0);
-        batch_results.push((batch_size, avg));
+        let mut per_block_latencies_for_p50 = per_block_latencies.clone();
+        let p50_ns = percentile(&mut per_block_latencies_for_p50, 50.0);
+        let mean_ns = mean(&per_block_latencies);
+        batch_results.push((batch_size, p50_ns, mean_ns));
 
         // Convert ns → µs for display.
-        let mut per_block_us: Vec<u64> =
-            per_block_latencies.iter().map(|&x| x / 1000).collect();
+        let mut per_block_us: Vec<u64> = per_block_latencies.iter().map(|&x| x / 1000).collect();
         print_latency_stats(
-            &format!("evict_batch={batch_size}"),
+            &format!("evict_batch={batch_size}_per_block"),
             &mut per_block_us,
             "µs",
         );
     }
 
-    // Compute amortisation factor: baseline (batch_size=1) / per_block_avg.
+    // Compute amortisation factors: baseline (batch_size=1) / per-block latency.
     // > 1.0 means improvement from batching.
-    let baseline = if let Some(&(_, avg)) = batch_results.first() {
-        avg
-    } else {
-        return;
-    };
+    let (baseline_p50_ns, baseline_mean_ns) =
+        if let Some(&(_, p50_ns, mean_ns)) = batch_results.first() {
+            (p50_ns, mean_ns)
+        } else {
+            return;
+        };
 
-    println!("\n  Amortisation factors (vs batch=1):");
-    for &(batch_size, avg) in &batch_results {
-        let factor = baseline as f64 / avg as f64;
-        println!("    batch={batch_size:>3}:  {factor:.2}×");
+    println!("\n  Amortisation factors (vs batch=1 per-block latency):");
+    println!("    batch    P50 factor    mean factor");
+    for &(batch_size, p50_ns, mean_ns) in &batch_results {
+        let p50_factor = baseline_p50_ns as f64 / p50_ns as f64;
+        let mean_factor = baseline_mean_ns / mean_ns;
+        println!("    {batch_size:>5}    {p50_factor:>9.2}×    {mean_factor:>10.2}×");
     }
 
     println!("=== End Batch Eviction ===\n");
@@ -272,17 +278,18 @@ fn kcmm_bench_batch_restore_amortization() {
     let batch_sizes: &[usize] = &[1, 4, 16, 64];
 
     println!("\n=== KCMM Benchmark 2e: Batch Restore Amortisation ===");
-    println!(
-        "block_bytes={block_bytes}, num_layers={num_layers}, rounds=30"
-    );
+    println!("block_bytes={block_bytes}, num_layers={num_layers}, rounds=30");
 
     // Warmup: allocate, evict, restore, free
     {
         let pairs = alloc_blocks(&pool, 64);
         let handles: Vec<BlockHandle> = pairs.iter().map(|(_, h)| *h).collect();
         let indices: Vec<u32> = pairs.iter().map(|(idx, _)| *idx).collect();
-        tiering.evict_blocks(&pool, &handles, 64).expect("warmup evict");
-        pool.restore_evicted_blocks(&indices).expect("warmup restore");
+        tiering
+            .evict_blocks(&pool, &handles, 64)
+            .expect("warmup evict");
+        pool.restore_evicted_blocks(&indices)
+            .expect("warmup restore");
         pool.free_sequence(&indices);
     }
 
@@ -305,7 +312,8 @@ fn kcmm_bench_batch_restore_amortization() {
 
             // Time restore
             let t0 = Instant::now();
-            pool.restore_evicted_blocks(&indices).expect("batch restore");
+            pool.restore_evicted_blocks(&indices)
+                .expect("batch restore");
             let total_ns = t0.elapsed().as_nanos() as u64;
 
             per_block_latencies.push(total_ns / batch_size as u64);
@@ -318,8 +326,7 @@ fn kcmm_bench_batch_restore_amortization() {
         batch_results.push((batch_size, avg));
 
         // Convert ns → µs for display.
-        let mut per_block_us: Vec<u64> =
-            per_block_latencies.iter().map(|&x| x / 1000).collect();
+        let mut per_block_us: Vec<u64> = per_block_latencies.iter().map(|&x| x / 1000).collect();
         print_latency_stats(
             &format!("restore_batch={batch_size}"),
             &mut per_block_us,
@@ -393,21 +400,14 @@ fn kcmm_bench_cumemmap_latency() {
         // Convert ns → µs for display.
         let mut map_us: Vec<u64> = map_lat.iter().map(|&x| x / 1000).collect();
         let mut unmap_us: Vec<u64> = unmap_lat.iter().map(|&x| x / 1000).collect();
-        print_latency_stats(
-            &format!("cumemmap_{size}B_map"),
-            &mut map_us,
-            "µs",
-        );
-        print_latency_stats(
-            &format!("cumemmap_{size}B_unmap"),
-            &mut unmap_us,
-            "µs",
-        );
+        print_latency_stats(&format!("cumemmap_{size}B_map"), &mut map_us, "µs");
+        print_latency_stats(&format!("cumemmap_{size}B_unmap"), &mut unmap_us, "µs");
 
         vmm.release_physical(phys).expect("release phys");
     }
 
-    vmm.free_address(va_region, 2 * 1024 * 1024).expect("free VA");
+    vmm.free_address(va_region, 2 * 1024 * 1024)
+        .expect("free VA");
 
     println!("=== End cuMemMap ===\n");
 }
@@ -425,73 +425,137 @@ fn kcmm_bench_tiering_roundtrip_data_integrity() {
     let block_bytes = pool.block_bytes;
 
     let num_blocks = 16;
-    println!("\n=== KCMM Benchmark 2d: Roundtrip Data Integrity ({num_blocks} blocks) ===");
+    let cache_paths_per_block = num_layers * 2;
+    let total_cache_paths = num_blocks * cache_paths_per_block;
+    println!(
+        "\n=== KCMM Benchmark 2d: Roundtrip Data Integrity ({num_blocks} blocks, {num_layers} layers, K+V) ==="
+    );
 
-    // Allocate blocks and write patterns to layer-0 K cache
-    let mut block_data: Vec<(u32, BlockHandle, Vec<u8>)> = Vec::with_capacity(num_blocks);
+    struct CachePayload {
+        layer: usize,
+        is_v: bool,
+        expected: Vec<u8>,
+    }
+
+    struct BlockPayloads {
+        block_idx: u32,
+        handle: BlockHandle,
+        cache_payloads: Vec<CachePayload>,
+    }
+
+    fn roundtrip_pattern(block_idx: u32, layer: usize, is_v: bool, block_bytes: usize) -> Vec<u8> {
+        let cache_marker = if is_v { 0xa5_u64 } else { 0x5a_u64 };
+        let mut pattern: Vec<u8> = (0..block_bytes)
+            .map(|byte_idx| {
+                let mixed = (byte_idx as u64).wrapping_mul(31)
+                    ^ (block_idx as u64).wrapping_mul(0x9e37)
+                    ^ (layer as u64).wrapping_mul(0x10001)
+                    ^ cache_marker;
+                (mixed ^ (mixed >> 8) ^ (mixed >> 16) ^ (mixed >> 24)) as u8
+            })
+            .collect();
+
+        if block_bytes >= 8 {
+            pattern[0] = if is_v { b'V' } else { b'K' };
+            pattern[1] = layer as u8;
+            pattern[2..6].copy_from_slice(&block_idx.to_le_bytes());
+            pattern[6] = (block_bytes & 0xff) as u8;
+            pattern[7] = ((block_bytes >> 8) & 0xff) as u8;
+        }
+
+        pattern
+    }
+
+    // Allocate blocks and write distinguishable patterns to every layer's K and V cache.
+    let mut block_data: Vec<BlockPayloads> = Vec::with_capacity(num_blocks);
 
     for _ in 0..num_blocks {
         let block_idx = pool.alloc_block().expect("alloc block");
         let handle = pool.get_block_handle(block_idx).expect("get handle");
+        let mut cache_payloads = Vec::with_capacity(cache_paths_per_block);
 
-        // Write a unique pattern to the block's layer-0 K cache
-        let num_elements = block_bytes / 2; // f16
-        let pattern: Vec<u16> = (0..num_elements)
-            .map(|i| ((i as u64) ^ (block_idx as u64)) as u16)
-            .collect();
-        let gpu_va = pool
-            .gpu_va_for_block(handle, 0, false)
-            .expect("gpu va");
+        for layer in 0..num_layers {
+            for is_v in [false, true] {
+                let pattern = roundtrip_pattern(block_idx, layer, is_v, block_bytes);
+                let gpu_va = pool.gpu_va_for_block(handle, layer, is_v).expect("gpu va");
 
-        unsafe {
-            pool.streams
-                .evict
-                .memcpy_h2d_async(gpu_va, pattern.as_ptr() as *const u8, block_bytes)
-                .expect("h2d async");
+                unsafe {
+                    pool.streams
+                        .evict
+                        .memcpy_h2d_async(gpu_va, pattern.as_ptr(), block_bytes)
+                        .expect("h2d async");
+                }
+
+                cache_payloads.push(CachePayload {
+                    layer,
+                    is_v,
+                    expected: pattern,
+                });
+            }
         }
-        pool.streams.evict.synchronize().expect("sync");
 
-        let pattern_bytes: Vec<u8> = unsafe {
-            std::slice::from_raw_parts(pattern.as_ptr() as *const u8, block_bytes)
-        }.to_vec();
-
-        block_data.push((block_idx, handle, pattern_bytes));
+        block_data.push(BlockPayloads {
+            block_idx,
+            handle,
+            cache_payloads,
+        });
     }
+    pool.streams.evict.synchronize().expect("sync writes");
 
     // Evict all, then restore all, then verify
-    let handles: Vec<BlockHandle> = block_data.iter().map(|(_, h, _)| *h).collect();
+    let handles: Vec<BlockHandle> = block_data.iter().map(|b| b.handle).collect();
+    let indices: Vec<u32> = block_data.iter().map(|b| b.block_idx).collect();
 
     let t0 = Instant::now();
-    tiering.evict_blocks(&pool, &handles, num_blocks).expect("evict all");
+    tiering
+        .evict_blocks(&pool, &handles, num_blocks)
+        .expect("evict all");
     let evict_total_us = t0.elapsed().as_micros();
 
     let t0 = Instant::now();
-    for (idx, _, _) in &block_data {
-        pool.restore_evicted_block(*idx).expect("restore");
-    }
+    pool.restore_evicted_blocks(&indices).expect("restore all");
     let restore_total_us = t0.elapsed().as_micros();
 
     // Verify data integrity after roundtrip
-    let mut ok = 0;
-    for (idx, _, expected) in &block_data {
-        let new_handle = pool.get_block_handle(*idx).expect("get new handle");
-        let gpu_va = pool
-            .gpu_va_for_block(new_handle, 0, false)
-            .expect("gpu va");
+    let mut ok_cache_paths = 0;
+    for block in &block_data {
+        let new_handle = pool
+            .get_block_handle(block.block_idx)
+            .expect("get new handle");
 
-        let mut readback = vec![0u8; block_bytes];
-        unsafe {
-            pool.streams
-                .restore
-                .memcpy_d2h_async(readback.as_mut_ptr(), gpu_va, block_bytes)
-                .expect("d2h async");
-        }
-        pool.streams.restore.synchronize().expect("sync");
+        for expected in &block.cache_payloads {
+            let gpu_va = pool
+                .gpu_va_for_block(new_handle, expected.layer, expected.is_v)
+                .expect("gpu va");
 
-        if &readback == expected {
-            ok += 1;
-        } else {
-            println!("  WARNING: block {idx} data mismatch after roundtrip");
+            let mut readback = vec![0u8; block_bytes];
+            unsafe {
+                pool.streams
+                    .restore
+                    .memcpy_d2h_async(readback.as_mut_ptr(), gpu_va, block_bytes)
+                    .expect("d2h async");
+            }
+            pool.streams.restore.synchronize().expect("sync readback");
+
+            if readback == expected.expected {
+                ok_cache_paths += 1;
+            } else {
+                let mismatch_at = readback
+                    .iter()
+                    .zip(&expected.expected)
+                    .position(|(actual, expected)| actual != expected)
+                    .unwrap_or(0);
+                let cache_name = if expected.is_v { "V" } else { "K" };
+                println!(
+                    "  WARNING: block {} layer {} {}-cache mismatch at byte {}: expected 0x{:02x}, got 0x{:02x}",
+                    block.block_idx,
+                    expected.layer,
+                    cache_name,
+                    mismatch_at,
+                    expected.expected[mismatch_at],
+                    readback[mismatch_at]
+                );
+            }
         }
     }
 
@@ -503,11 +567,14 @@ fn kcmm_bench_tiering_roundtrip_data_integrity() {
         "  restore {num_blocks} blocks: {restore_total_us} µs ({:.1} µs/block)",
         restore_total_us as f64 / num_blocks as f64
     );
-    println!("  data integrity: {ok}/{num_blocks} blocks OK");
+    println!(
+        "  coverage: {num_blocks} blocks × {num_layers} layers × K+V = {total_cache_paths} cache payloads"
+    );
+    println!("  data integrity: {ok_cache_paths}/{total_cache_paths} cache payloads OK");
 
     assert_eq!(
-        ok, num_blocks,
-        "all blocks must retain data integrity through evict→restore roundtrip"
+        ok_cache_paths, total_cache_paths,
+        "all layer K/V cache payloads must retain data integrity through evict→restore roundtrip"
     );
 
     println!("=== End Roundtrip Integrity ===\n");
@@ -531,8 +598,14 @@ fn kcmm_bench_stream_interference() {
     // Two independent GPU buffers:
     //   gpu_inf: target of H2D on the default (inference) stream
     //   gpu_evict: source of D2H on the dedicated evict stream
-    let gpu_inf = ctx.device.alloc_zeros::<f16>(buf_elems).expect("alloc inf buf");
-    let gpu_evict = ctx.device.alloc_zeros::<f16>(buf_elems).expect("alloc evict buf");
+    let gpu_inf = ctx
+        .device
+        .alloc_zeros::<f16>(buf_elems)
+        .expect("alloc inf buf");
+    let gpu_evict = ctx
+        .device
+        .alloc_zeros::<f16>(buf_elems)
+        .expect("alloc evict buf");
     let cpu_inf = vec![0u8; buf_bytes];
     let mut cpu_evict = vec![0u8; buf_bytes];
 
@@ -549,10 +622,7 @@ fn kcmm_bench_stream_interference() {
     let warmup_iters = 12;
 
     println!("\n=== KCMM Benchmark 3: CUDA Stream Interference ===");
-    println!(
-        "GPU buffer: {} MiB, {} iterations",
-        buf_mib, iters
-    );
+    println!("GPU buffer: {} MiB, {} iterations", buf_mib, iters);
 
     // --- Baseline: H2D memcpy on default stream only (no KCMM activity) ---
     let mut baseline_lat: Vec<u64> = Vec::with_capacity(iters);
@@ -642,7 +712,10 @@ fn kcmm_bench_stream_interference() {
     let mut interference_us: Vec<u64> = interference_lat.iter().map(|&x| x / 1000).collect();
     print_latency_stats("stream_baseline", &mut baseline_us, "µs");
     print_latency_stats("stream_interference", &mut interference_us, "µs");
-    println!("  Overhead: p50={:+.2}%  p99={:+.2}%", overhead_p50, overhead_p99);
+    println!(
+        "  Overhead: p50={:+.2}%  p99={:+.2}%",
+        overhead_p50, overhead_p99
+    );
 
     // Success criterion from the implementation plan: inference kernel
     // interference < 1% on bare-metal.  On WSL2 / laptop GPUs the

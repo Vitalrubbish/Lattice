@@ -422,25 +422,66 @@ impl KcmmPool {
         let mut info = self.block_info.lock();
         let num_layers = self.num_layers;
         let mut recycled = Vec::new();
+        let mut gpu_handles = Vec::new();
+        let mut cpu_offsets = Vec::new();
 
         for &block_idx in block_table {
             let bi = &mut info[block_idx as usize];
             if !bi.in_use {
                 continue;
             }
-            bi.in_use = false;
 
-            let handle = BlockHandle {
-                superblock_idx: bi.superblock_idx,
-                block_index: bi.block_index_in_sb,
-            };
+            match &bi.location {
+                BlockLocation::GpuResident(handle, _) => {
+                    bi.in_use = false;
+                    gpu_handles.push(*handle);
+                    recycled.push(block_idx);
+                }
+                BlockLocation::CpuResident(cpu_offset) => {
+                    bi.in_use = false;
+                    cpu_offsets.push(*cpu_offset);
+                    recycled.push(block_idx);
+                }
+                BlockLocation::NvmeResident(_) => {
+                    bi.in_use = false;
+                    tracing::warn!(
+                        block_idx,
+                        "KCMM: freeing NvmeResident block without NVMe cleanup support"
+                    );
+                    recycled.push(block_idx);
+                }
+                BlockLocation::Evicting | BlockLocation::Restoring => {
+                    tracing::warn!(
+                        block_idx,
+                        ?bi.location,
+                        "KCMM: freeing block while migration is in flight; physical cleanup skipped"
+                    );
+                }
+            }
+        }
+        drop(info);
+
+        for handle in gpu_handles {
             for l in 0..num_layers {
                 self.k_pools[l].allocator.free(handle);
                 self.v_pools[l].allocator.free(handle);
             }
-            recycled.push(block_idx);
         }
-        drop(info);
+
+        if !cpu_offsets.is_empty() {
+            if let Some(ref tiering) = self.tiering {
+                let cpu_slot_bytes = self.num_layers * 2 * self.block_bytes;
+                for cpu_offset in cpu_offsets {
+                    tiering.free_cpu_slot(cpu_offset, cpu_slot_bytes);
+                }
+            } else {
+                tracing::warn!(
+                    count = cpu_offsets.len(),
+                    "KCMM: freeing CpuResident blocks with tiering disabled; CPU slots not released"
+                );
+            }
+        }
+
         self.free_block_indices.lock().extend(recycled);
     }
 
@@ -1553,6 +1594,32 @@ mod tests {
             (ctx, pool)
         }
 
+        fn make_pool_with_tiering() -> (Arc<CudaContext>, KcmmPool, tempfile::TempDir) {
+            let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path = dir.path().join("kcmm_pool_swap_test");
+            let config = KcmmConfig {
+                block_size: 16,
+                max_blocks: 256,
+                cpu_cache_path: path.to_str().expect("valid UTF-8 path").to_string(),
+                tiering: true,
+                eviction_policy: "lru".to_string(),
+                prefetch_window: 4,
+                max_batch_blocks: 64,
+            };
+            let pool = KcmmPool::new(
+                ctx.clone(),
+                config,
+                2,  // num_layers, kept small for test speed
+                4,  // kv_heads
+                64, // head_dim
+                4,  // max_batch
+                64, // max_seq_len
+            )
+            .expect("create KcmmPool with tiering");
+            (ctx, pool, dir)
+        }
+
         #[test]
         fn test_pool_construction() {
             let (_, pool) = make_pool();
@@ -1731,6 +1798,51 @@ mod tests {
 
             pool.free_sequence(&t2);
             assert_eq!(pool.blocks_in_use(), 0);
+        }
+
+        #[test]
+        fn test_free_sequence_after_eviction_releases_cpu_slot_without_double_free() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+            let total_per_block = pool.num_layers * 2 * pool.block_bytes;
+
+            let table = pool.alloc_sequence(2).expect("alloc sequence");
+            let total_physical = pool.total_physical_blocks();
+            let handles: Vec<BlockHandle> = table
+                .iter()
+                .map(|&idx| pool.get_block_handle(idx).expect("get handle"))
+                .collect();
+
+            tiering
+                .evict_blocks(&pool, &[handles[0]], 1)
+                .expect("evict one block");
+            assert!(matches!(
+                pool.get_block_location(table[0])
+                    .expect("get evicted location"),
+                BlockLocation::CpuResident(0)
+            ));
+            assert_eq!(
+                pool.free_physical_blocks(),
+                total_physical - 1,
+                "one GPU-resident sequence block should still occupy physical memory"
+            );
+
+            pool.free_sequence(&table);
+
+            assert_eq!(pool.blocks_in_use(), 0);
+            assert_eq!(
+                pool.free_physical_blocks(),
+                total_physical,
+                "freeing a CpuResident block must not return its old GPU handle twice"
+            );
+
+            let recycled_cpu_offset = tiering
+                .alloc_cpu_slot(total_per_block)
+                .expect("alloc CPU slot after sequence free");
+            assert_eq!(
+                recycled_cpu_offset, 0,
+                "freeing a CpuResident block should release its CPU swap slot"
+            );
         }
 
         #[test]

@@ -21,7 +21,8 @@ use baseline_llm_os::kcmm::pool::KcmmPool;
 use baseline_llm_os::model::weights::{ModelWeights, RawTensor};
 use baseline_llm_os::model::{LlamaTransformer, Transformer};
 use half::f16;
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,8 +41,17 @@ const KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 64;
 const HIDDEN_SIZE: usize = 1024;
 const VOCAB_SIZE: usize = 1000;
-const NUM_ATTN_HEADS: usize = 16;   // 1024 / 16 = 64 = HEAD_DIM
+const NUM_ATTN_HEADS: usize = 16; // 1024 / 16 = 64 = HEAD_DIM
 const INTERMEDIATE_SIZE: usize = 2048;
+
+/// Fixed model seed so Tiering OFF and ON use identical weights in every pair.
+const MODEL_WEIGHT_SEED: u64 = 0x5EED_1A77_1CE5;
+
+/// Tiering ON admission retries evict cold blocks before rejecting an arrival.
+const ADMISSION_EVICTION_RETRY_LIMIT: usize = 4;
+
+/// Above this, tiering is considered to be thrashing rather than adding capacity.
+const THRASHING_EVICTIONS_PER_FULL_COMPLETION: f64 = 3.0;
 
 // --- Workload config ---
 
@@ -105,8 +115,14 @@ struct StepTiming {
 
 #[derive(Debug, Clone)]
 struct IntegrationResult {
-    /// Total completed requests.
-    completed: usize,
+    /// Requests that reached their target length.
+    completed_full: usize,
+    /// Requests stopped early because their block table could not grow.
+    capped: usize,
+    /// Dynamic arrivals rejected at admission.
+    rejected: usize,
+    /// Requests still active when the fixed simulation window ended.
+    leftover_at_end: usize,
     /// Total generated tokens (decode only).
     total_decode_tokens: usize,
     /// Total completed prompt tokens.
@@ -200,7 +216,7 @@ fn upload_tensor(
 /// giving realistic GPU compute behaviour (no zero-skipping, genuine
 /// memory-access patterns) without requiring an external safetensors file.
 fn generate_random_weights(ctx: &Arc<CudaContext>, cfg: &ModelConfig) -> ModelWeights {
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(MODEL_WEIGHT_SEED);
     let mut weights = ModelWeights::empty(cfg);
     let h = cfg.hidden_size;
     let kvd = cfg.kv_heads() * cfg.head_dim();
@@ -241,21 +257,105 @@ fn generate_random_weights(ctx: &Arc<CudaContext>, cfg: &ModelConfig) -> ModelWe
     }
 
     // Embedding & head
-    push_2d(&mut rng, ctx, &mut weights, "model.embed_tokens.weight", vec![vocab, h], h, vocab);
+    push_2d(
+        &mut rng,
+        ctx,
+        &mut weights,
+        "model.embed_tokens.weight",
+        vec![vocab, h],
+        h,
+        vocab,
+    );
     push_norm(&mut rng, ctx, &mut weights, "model.norm.weight", h);
-    push_2d(&mut rng, ctx, &mut weights, "lm_head.weight", vec![vocab, h], h, vocab);
+    push_2d(
+        &mut rng,
+        ctx,
+        &mut weights,
+        "lm_head.weight",
+        vec![vocab, h],
+        h,
+        vocab,
+    );
 
     // Per-layer weights
     for l in 0..n_layers {
-        push_norm(&mut rng, ctx, &mut weights, &format!("model.layers.{l}.input_layernorm.weight"), h);
-        push_2d(&mut rng, ctx, &mut weights, &format!("model.layers.{l}.self_attn.q_proj.weight"), vec![h, h], h, h);
-        push_2d(&mut rng, ctx, &mut weights, &format!("model.layers.{l}.self_attn.k_proj.weight"), vec![kvd, h], h, kvd);
-        push_2d(&mut rng, ctx, &mut weights, &format!("model.layers.{l}.self_attn.v_proj.weight"), vec![kvd, h], h, kvd);
-        push_2d(&mut rng, ctx, &mut weights, &format!("model.layers.{l}.self_attn.o_proj.weight"), vec![h, h], h, h);
-        push_norm(&mut rng, ctx, &mut weights, &format!("model.layers.{l}.post_attention_layernorm.weight"), h);
-        push_2d(&mut rng, ctx, &mut weights, &format!("model.layers.{l}.mlp.gate_proj.weight"), vec![im, h], h, im);
-        push_2d(&mut rng, ctx, &mut weights, &format!("model.layers.{l}.mlp.up_proj.weight"), vec![im, h], h, im);
-        push_2d(&mut rng, ctx, &mut weights, &format!("model.layers.{l}.mlp.down_proj.weight"), vec![h, im], im, h);
+        push_norm(
+            &mut rng,
+            ctx,
+            &mut weights,
+            &format!("model.layers.{l}.input_layernorm.weight"),
+            h,
+        );
+        push_2d(
+            &mut rng,
+            ctx,
+            &mut weights,
+            &format!("model.layers.{l}.self_attn.q_proj.weight"),
+            vec![h, h],
+            h,
+            h,
+        );
+        push_2d(
+            &mut rng,
+            ctx,
+            &mut weights,
+            &format!("model.layers.{l}.self_attn.k_proj.weight"),
+            vec![kvd, h],
+            h,
+            kvd,
+        );
+        push_2d(
+            &mut rng,
+            ctx,
+            &mut weights,
+            &format!("model.layers.{l}.self_attn.v_proj.weight"),
+            vec![kvd, h],
+            h,
+            kvd,
+        );
+        push_2d(
+            &mut rng,
+            ctx,
+            &mut weights,
+            &format!("model.layers.{l}.self_attn.o_proj.weight"),
+            vec![h, h],
+            h,
+            h,
+        );
+        push_norm(
+            &mut rng,
+            ctx,
+            &mut weights,
+            &format!("model.layers.{l}.post_attention_layernorm.weight"),
+            h,
+        );
+        push_2d(
+            &mut rng,
+            ctx,
+            &mut weights,
+            &format!("model.layers.{l}.mlp.gate_proj.weight"),
+            vec![im, h],
+            h,
+            im,
+        );
+        push_2d(
+            &mut rng,
+            ctx,
+            &mut weights,
+            &format!("model.layers.{l}.mlp.up_proj.weight"),
+            vec![im, h],
+            h,
+            im,
+        );
+        push_2d(
+            &mut rng,
+            ctx,
+            &mut weights,
+            &format!("model.layers.{l}.mlp.down_proj.weight"),
+            vec![h, im],
+            im,
+            h,
+        );
     }
 
     weights
@@ -270,11 +370,7 @@ fn generate_random_weights(ctx: &Arc<CudaContext>, cfg: &ModelConfig) -> ModelWe
 /// Prefers blocks from inactive (cooled) sequences first, then falls back
 /// to active sequences.  Receives the full sequence list so eviction has
 /// complete visibility into all candidates.
-fn evict_coldest_blocks(
-    pool: &KcmmPool,
-    all_seqs: &[SimRequest],
-    min_count: usize,
-) -> usize {
+fn evict_coldest_blocks(pool: &KcmmPool, all_seqs: &[SimRequest], min_count: usize) -> usize {
     const TARGET_BATCH: usize = 8;
     let target = min_count.max(TARGET_BATCH);
 
@@ -328,6 +424,51 @@ fn evict_coldest_blocks(
     }
 }
 
+/// Allocate the block table for a newly arriving request.
+///
+/// Dynamic Tiering ON admissions get a bounded eviction retry so rejection is
+/// measured after applying the policy under test. Tiering OFF and prefill
+/// admissions fail directly.
+fn allocate_admission_blocks(
+    cache: &dyn KvCacheBackend,
+    pool: &KcmmPool,
+    eviction_candidates: &[SimRequest],
+    blocks_needed: usize,
+    eviction_count: &mut usize,
+    allow_admission_eviction: bool,
+) -> Option<Vec<u32>> {
+    let mut block_table = Vec::with_capacity(blocks_needed);
+    let mut eviction_rounds = 0usize;
+
+    while block_table.len() < blocks_needed {
+        match cache.alloc_block() {
+            Ok(block_idx) => block_table.push(block_idx),
+            Err(_) => {
+                let can_retry_with_eviction = allow_admission_eviction
+                    && pool.tiering.is_some()
+                    && eviction_rounds < ADMISSION_EVICTION_RETRY_LIMIT;
+
+                if can_retry_with_eviction {
+                    eviction_rounds += 1;
+                    let remaining = blocks_needed.saturating_sub(block_table.len());
+                    let evicted = evict_coldest_blocks(pool, eviction_candidates, remaining.max(4));
+                    if evicted > 0 {
+                        *eviction_count += evicted;
+                        continue;
+                    }
+                }
+
+                if !block_table.is_empty() {
+                    cache.free_sequence(&block_table);
+                }
+                return None;
+            }
+        }
+    }
+
+    Some(block_table)
+}
+
 // ============================================================================
 // Workload runner — generic over backends
 // ============================================================================
@@ -342,7 +483,9 @@ fn run_integration_workload(
     let h = HIDDEN_SIZE;
 
     let mut active: Vec<SimRequest> = Vec::new();
-    let mut completed = 0usize;
+    let mut completed_full = 0usize;
+    let mut capped = 0usize;
+    let mut rejected = 0usize;
     let mut total_decode_tokens = 0usize;
     let mut total_prompt_tokens = 0usize;
     let mut seq_counter = 0usize;
@@ -370,15 +513,22 @@ fn run_integration_workload(
             let mut w_positions: Vec<usize> = Vec::with_capacity(batch_size);
             let mut ok = true;
             for _ in 0..batch_size {
-                match cache.alloc_sequence(warmup_blocks) {
-                    Ok(bt) => {
+                match allocate_admission_blocks(
+                    cache,
+                    pool,
+                    &active,
+                    warmup_blocks,
+                    &mut eviction_count,
+                    false,
+                ) {
+                    Some(bt) => {
                         let idx = cache.register_sequence(bt);
                         cache.update_seq_len(idx, min_prompt);
                         pool.touch(idx);
                         w_indices.push(idx);
                         w_positions.push(0);
                     }
-                    Err(_) => {
+                    None => {
                         ok = false;
                         break;
                     }
@@ -387,9 +537,6 @@ fn run_integration_workload(
             if !ok || w_indices.is_empty() {
                 // Clean up partial batch and skip this size.
                 for &idx in &w_indices {
-                    if let Some(bt) = cache.get_block_table(idx) {
-                        cache.free_sequence(&bt);
-                    }
                     cache.unregister_sequence(idx);
                 }
                 continue;
@@ -417,9 +564,6 @@ fn run_integration_workload(
             // Clean up temporary sequences.
             for &idx in &w_indices {
                 cache.update_seq_len(idx, 0);
-                if let Some(bt) = cache.get_block_table(idx) {
-                    cache.free_sequence(&bt);
-                }
                 cache.unregister_sequence(idx);
             }
         }
@@ -449,9 +593,16 @@ fn run_integration_workload(
             break;
         }
 
-        let block_table = match cache.alloc_sequence(blocks_needed) {
-            Ok(bt) => bt,
-            Err(_) => break, // Pool full.
+        let block_table = match allocate_admission_blocks(
+            cache,
+            pool,
+            &active,
+            blocks_needed,
+            &mut eviction_count,
+            false,
+        ) {
+            Some(bt) => bt,
+            None => break, // Pool full.
         };
 
         let seq_idx = cache.register_sequence(block_table.clone());
@@ -572,11 +723,8 @@ fn run_integration_workload(
             }
 
             if !can_continue {
-                if let Some(bt) = cache.get_block_table(seq.seq_idx) {
-                    cache.free_sequence(&bt);
-                }
                 cache.unregister_sequence(seq.seq_idx);
-                completed += 1;
+                capped += 1;
                 continue;
             }
 
@@ -596,12 +744,9 @@ fn run_integration_workload(
 
             // Check completion.
             if seq.position >= seq.target_len {
-                if let Some(bt) = cache.get_block_table(seq.seq_idx) {
-                    cache.free_sequence(&bt);
-                }
                 pool.cool(seq.seq_idx);
                 cache.unregister_sequence(seq.seq_idx);
-                completed += 1;
+                completed_full += 1;
                 continue;
             }
 
@@ -627,13 +772,7 @@ fn run_integration_workload(
             // Dummy token ids — KV-cache benchmarking does not depend on token identity.
             let token_ids = vec![0u32; batch];
             let _logits = model
-                .forward_step_paged(
-                    &mut hidden,
-                    cache,
-                    &seq_indices,
-                    &token_ids,
-                    &positions,
-                )
+                .forward_step_paged(&mut hidden, cache, &seq_indices, &token_ids, &positions)
                 .expect("forward_step_paged");
 
             let step_us = t_step.elapsed().as_micros() as u64;
@@ -661,12 +800,21 @@ fn run_integration_workload(
         if step >= next_arrival_at && seq_counter < cfg.total_requests {
             next_arrival_at = step + cfg.arrival_interval;
 
-            let prompt_len = cfg.prompt_lens[seq_counter % cfg.prompt_lens.len()];
+            let request_idx = seq_counter;
+            let prompt_len = cfg.prompt_lens[request_idx % cfg.prompt_lens.len()];
             let blocks_needed = (prompt_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens;
             let target_len = prompt_len + cfg.max_new_tokens;
 
-            match cache.alloc_sequence(blocks_needed) {
-                Ok(block_table) => {
+            let all_for_admission: Vec<SimRequest> = active.iter().cloned().collect();
+            match allocate_admission_blocks(
+                cache,
+                pool,
+                &all_for_admission,
+                blocks_needed,
+                &mut eviction_count,
+                true,
+            ) {
+                Some(block_table) => {
                     let seq_idx = cache.register_sequence(block_table.clone());
                     cache.update_seq_len(seq_idx, prompt_len);
                     pool.touch(seq_idx);
@@ -680,12 +828,12 @@ fn run_integration_workload(
                         prompt_pos: 0,
                         is_active: true,
                     });
-                    seq_counter += 1;
                 }
-                Err(_) => {
-                    // Rejected — can't admit.
+                None => {
+                    rejected += 1;
                 }
             }
+            seq_counter += 1;
         }
 
         peak_concurrent = peak_concurrent.max(active.len());
@@ -697,11 +845,11 @@ fn run_integration_workload(
 
     eprintln!(); // finish progress line
 
+    let leftover_at_end = active.len();
+
     // Clean up remaining sequences.
     for seq in &active {
-        if let Some(bt) = cache.get_block_table(seq.seq_idx) {
-            cache.free_sequence(&bt);
-        }
+        cache.unregister_sequence(seq.seq_idx);
     }
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -713,7 +861,10 @@ fn run_integration_workload(
     };
 
     IntegrationResult {
-        completed,
+        completed_full,
+        capped,
+        rejected,
+        leftover_at_end,
         total_decode_tokens,
         total_prompt_tokens,
         elapsed_ms,
@@ -779,8 +930,8 @@ fn run_comparison(cfg: &WorkloadConfig) -> (IntegrationResult, IntegrationResult
         .expect("valid UTF-8 path")
         .to_string();
 
-    let max_blocks = cfg.max_batch
-        * ((cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens);
+    let max_blocks =
+        cfg.max_batch * ((cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens);
 
     let off_config = KcmmConfig {
         block_size: cfg.block_size_tokens,
@@ -815,13 +966,7 @@ fn run_comparison(cfg: &WorkloadConfig) -> (IntegrationResult, IntegrationResult
         let off_model = build_random_transformer(&ctx, &model_cfg);
 
         println!("  Running Tiering OFF...");
-        run_integration_workload(
-            &ctx,
-            &off_model,
-            &off_pool,
-            cfg,
-            &off_pool,
-        )
+        run_integration_workload(&ctx, &off_model, &off_pool, cfg, &off_pool)
     }; // off_pool, off_model, _ballast dropped — GPU memory released.
 
     // --- Tiering ON ---
@@ -840,13 +985,7 @@ fn run_comparison(cfg: &WorkloadConfig) -> (IntegrationResult, IntegrationResult
         let on_model = build_random_transformer(&ctx, &model_cfg);
 
         println!("  Running Tiering ON...");
-        run_integration_workload(
-            &ctx,
-            &on_model,
-            &on_pool,
-            cfg,
-            &on_pool,
-        )
+        run_integration_workload(&ctx, &on_model, &on_pool, cfg, &on_pool)
     };
 
     (off_result, on_result)
@@ -868,8 +1007,8 @@ fn run_comparison_on_first(cfg: &WorkloadConfig) -> (IntegrationResult, Integrat
         .expect("valid UTF-8 path")
         .to_string();
 
-    let max_blocks = cfg.max_batch
-        * ((cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens);
+    let max_blocks =
+        cfg.max_batch * ((cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens);
 
     let off_config = KcmmConfig {
         block_size: cfg.block_size_tokens,
@@ -902,13 +1041,7 @@ fn run_comparison_on_first(cfg: &WorkloadConfig) -> (IntegrationResult, Integrat
         let on_model = build_random_transformer(&ctx, &model_cfg);
 
         println!("  Running Tiering ON...");
-        run_integration_workload(
-            &ctx,
-            &on_model,
-            &on_pool,
-            cfg,
-            &on_pool,
-        )
+        run_integration_workload(&ctx, &on_model, &on_pool, cfg, &on_pool)
     }; // on_pool, on_model dropped.
 
     // --- Tiering OFF second (scoped) ---
@@ -928,13 +1061,7 @@ fn run_comparison_on_first(cfg: &WorkloadConfig) -> (IntegrationResult, Integrat
         let off_model = build_random_transformer(&ctx, &model_cfg);
 
         println!("  Running Tiering OFF...");
-        run_integration_workload(
-            &ctx,
-            &off_model,
-            &off_pool,
-            cfg,
-            &off_pool,
-        )
+        run_integration_workload(&ctx, &off_model, &off_pool, cfg, &off_pool)
     };
 
     (off_result, on_result)
@@ -960,7 +1087,10 @@ fn run_comparison_repeated(
         on_results.push(on);
     }
 
-    (aggregate_results(&off_results), aggregate_results(&on_results))
+    (
+        aggregate_results(&off_results),
+        aggregate_results(&on_results),
+    )
 }
 
 /// Aggregate multiple IntegrationResults by averaging scalar fields and
@@ -973,7 +1103,10 @@ fn aggregate_results(results: &[IntegrationResult]) -> IntegrationResult {
         return results[0].clone();
     }
 
-    let completed = results.iter().map(|r| r.completed).sum::<usize>() / results.len();
+    let completed_full = results.iter().map(|r| r.completed_full).sum::<usize>() / results.len();
+    let capped = results.iter().map(|r| r.capped).sum::<usize>() / results.len();
+    let rejected = results.iter().map(|r| r.rejected).sum::<usize>() / results.len();
+    let leftover_at_end = results.iter().map(|r| r.leftover_at_end).sum::<usize>() / results.len();
     let total_decode_tokens =
         results.iter().map(|r| r.total_decode_tokens).sum::<usize>() / results.len();
     let total_prompt_tokens =
@@ -997,7 +1130,10 @@ fn aggregate_results(results: &[IntegrationResult]) -> IntegrationResult {
     }
 
     IntegrationResult {
-        completed,
+        completed_full,
+        capped,
+        rejected,
+        leftover_at_end,
         total_decode_tokens,
         total_prompt_tokens,
         elapsed_ms,
@@ -1024,6 +1160,44 @@ fn compute_latency_percentiles(timings: &[StepTiming]) -> (u64, u64, u64, u64) {
     (p50, p90, p95, p99)
 }
 
+fn completion_ratio(on: usize, off: usize) -> f64 {
+    if off > 0 {
+        on as f64 / off as f64
+    } else if on > 0 {
+        f64::INFINITY
+    } else {
+        f64::NAN
+    }
+}
+
+fn evictions_per_full_completion(result: &IntegrationResult) -> f64 {
+    if result.completed_full > 0 {
+        result.eviction_count as f64 / result.completed_full as f64
+    } else if result.eviction_count > 0 {
+        f64::INFINITY
+    } else {
+        0.0
+    }
+}
+
+fn is_thrashing(result: &IntegrationResult) -> bool {
+    evictions_per_full_completion(result) > THRASHING_EVICTIONS_PER_FULL_COMPLETION
+}
+
+fn integration_status(cap_ratio: f64, tp_ratio: f64, on: &IntegrationResult) -> &'static str {
+    if is_thrashing(on) {
+        "THRASH"
+    } else if cap_ratio >= 1.3 {
+        "PASS"
+    } else if cap_ratio >= 1.0 {
+        "MARG-CAP"
+    } else if tp_ratio >= 1.0 {
+        "TP-ONLY"
+    } else {
+        "FAIL"
+    }
+}
+
 // ============================================================================
 // Test: single configuration
 // ============================================================================
@@ -1036,7 +1210,13 @@ fn kcmm_engine_integration_single() {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!(
-        "Model: random Xavier-init (L={NUM_LAYERS}, kv_heads={KV_HEADS}, head_dim={HEAD_DIM}, hidden={HIDDEN_SIZE})"
+        "Model: deterministic Xavier-init seed=0x{MODEL_WEIGHT_SEED:016X} (identical OFF/ON weights; L={NUM_LAYERS}, kv_heads={KV_HEADS}, head_dim={HEAD_DIM}, hidden={HIDDEN_SIZE})"
+    );
+    println!(
+        "Admission: Tiering ON retries up to {ADMISSION_EVICTION_RETRY_LIMIT} cold-block eviction rounds before rejecting; Tiering OFF rejects directly."
+    );
+    println!(
+        "Thrashing metric: evictions/full-completion > {THRASHING_EVICTIONS_PER_FULL_COMPLETION:.1} is THRASH."
     );
 
     // Workload config: tight memory, sustained concurrency.
@@ -1057,8 +1237,7 @@ fn kcmm_engine_integration_single() {
         arrival_interval: 12,
     };
 
-    let max_blocks_per_seq =
-        (cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens;
+    let max_blocks_per_seq = (cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens;
     let max_blocks_total = cfg.max_batch * max_blocks_per_seq;
     let gpu_budget_mb = (max_blocks_total * cfg.block_bytes()) as f64 / (1024.0 * 1024.0);
 
@@ -1077,6 +1256,8 @@ fn kcmm_engine_integration_single() {
     // systematic first-run bias while keeping test duration reasonable.
     const RUNS: usize = 2;
     let (off, on) = run_comparison_repeated(&cfg, RUNS);
+    let off_epfc = evictions_per_full_completion(&off);
+    let on_epfc = evictions_per_full_completion(&on);
 
     // --- Print results ---
     println!();
@@ -1086,8 +1267,20 @@ fn kcmm_engine_integration_single() {
     println!("  │  Metric             │  Tiering OFF    │  Tiering ON         │");
     println!("  ├─────────────────────┼─────────────────┼─────────────────────┤");
     println!(
-        "  │  Completed          │  {:>13}  │  {:>17}  │",
-        off.completed, on.completed
+        "  │  Full completions   │  {:>13}  │  {:>17}  │",
+        off.completed_full, on.completed_full
+    );
+    println!(
+        "  │  Capped             │  {:>13}  │  {:>17}  │",
+        off.capped, on.capped
+    );
+    println!(
+        "  │  Rejected           │  {:>13}  │  {:>17}  │",
+        off.rejected, on.rejected
+    );
+    println!(
+        "  │  Leftover at end    │  {:>13}  │  {:>17}  │",
+        off.leftover_at_end, on.leftover_at_end
     );
     println!(
         "  │  Total tokens       │  {:>13}  │  {:>17}  │",
@@ -1115,10 +1308,22 @@ fn kcmm_engine_integration_single() {
     let (on_p50, on_p90, on_p95, on_p99) = compute_latency_percentiles(&on.step_timings);
 
     println!("  ├─────────────────────┼─────────────────┼─────────────────────┤");
-    println!("  │  Step P50 (µs)      │  {:>13}  │  {:>17}  │", off_p50, on_p50);
-    println!("  │  Step P90 (µs)      │  {:>13}  │  {:>17}  │", off_p90, on_p90);
-    println!("  │  Step P95 (µs)      │  {:>13}  │  {:>17}  │", off_p95, on_p95);
-    println!("  │  Step P99 (µs)      │  {:>13}  │  {:>17}  │", off_p99, on_p99);
+    println!(
+        "  │  Step P50 (µs)      │  {:>13}  │  {:>17}  │",
+        off_p50, on_p50
+    );
+    println!(
+        "  │  Step P90 (µs)      │  {:>13}  │  {:>17}  │",
+        off_p90, on_p90
+    );
+    println!(
+        "  │  Step P95 (µs)      │  {:>13}  │  {:>17}  │",
+        off_p95, on_p95
+    );
+    println!(
+        "  │  Step P99 (µs)      │  {:>13}  │  {:>17}  │",
+        off_p99, on_p99
+    );
     println!("  ├─────────────────────┼─────────────────┼─────────────────────┤");
     println!(
         "  │  Evictions          │  {:>13}  │  {:>17}  │",
@@ -1127,6 +1332,10 @@ fn kcmm_engine_integration_single() {
     println!(
         "  │  Restores           │  {:>13}  │  {:>17}  │",
         off.restore_count, on.restore_count,
+    );
+    println!(
+        "  │  Evict/full compl   │  {:>13.1}  │  {:>17.1}  │",
+        off_epfc, on_epfc,
     );
     println!(
         "  │  Peak GPU blocks    │  {:>13}  │  {:>17}  │",
@@ -1144,20 +1353,24 @@ fn kcmm_engine_integration_single() {
     } else {
         f64::NAN
     };
-    println!(
-        "  Throughput ratio:   Tiering ON/OFF = {:.2}×",
-        tp_ratio
-    );
+    println!("  Throughput ratio:   Tiering ON/OFF = {:.2}×", tp_ratio);
 
-    // Capacity ratio (completed requests)
-    let cap_ratio = if off.completed > 0 {
-        on.completed as f64 / off.completed as f64
-    } else {
-        f64::NAN
-    };
+    // Capacity ratio is based on full completions only; capped requests do not count.
+    let cap_ratio = completion_ratio(on.completed_full, off.completed_full);
     println!(
-        "  Capacity ratio:     Tiering ON/OFF = {:.2}×  ({} vs {} completed)",
-        cap_ratio, on.completed, off.completed,
+        "  Capacity ratio:     Tiering ON/OFF = {:.2}×  ({} vs {} full completions)",
+        cap_ratio, on.completed_full, off.completed_full,
+    );
+    println!(
+        "  Outcomes:           OFF full/capped/rejected/leftover = {}/{}/{}/{}; ON = {}/{}/{}/{}",
+        off.completed_full,
+        off.capped,
+        off.rejected,
+        off.leftover_at_end,
+        on.completed_full,
+        on.capped,
+        on.rejected,
+        on.leftover_at_end,
     );
 
     // Per-step latency overhead
@@ -1165,14 +1378,18 @@ fn kcmm_engine_integration_single() {
         let overhead = (on_p50 as f64 / off_p50 as f64) - 1.0;
         println!(
             "  Per-step overhead:  P50: {:.1}%  ({} µs vs {} µs)",
-            overhead * 100.0, on_p50, off_p50,
+            overhead * 100.0,
+            on_p50,
+            off_p50,
         );
     }
     if on_p99 > 0 && off_p99 > 0 {
         let overhead99 = (on_p99 as f64 / off_p99 as f64) - 1.0;
         println!(
             "                      P99: {:.1}%  ({} µs vs {} µs)",
-            overhead99 * 100.0, on_p99, off_p99,
+            overhead99 * 100.0,
+            on_p99,
+            off_p99,
         );
     }
 
@@ -1180,13 +1397,19 @@ fn kcmm_engine_integration_single() {
     let off_avg_batch: f64 = if off.step_timings.is_empty() {
         0.0
     } else {
-        off.step_timings.iter().map(|t| t.batch_size as f64).sum::<f64>()
+        off.step_timings
+            .iter()
+            .map(|t| t.batch_size as f64)
+            .sum::<f64>()
             / off.step_timings.len() as f64
     };
     let on_avg_batch: f64 = if on.step_timings.is_empty() {
         0.0
     } else {
-        on.step_timings.iter().map(|t| t.batch_size as f64).sum::<f64>()
+        on.step_timings
+            .iter()
+            .map(|t| t.batch_size as f64)
+            .sum::<f64>()
             / on.step_timings.len() as f64
     };
     println!(
@@ -1200,16 +1423,11 @@ fn kcmm_engine_integration_single() {
             "  ✅ Tiering active: {} evictions, {} restores",
             on.eviction_count, on.restore_count,
         );
-        // Thrashing detection: excessive evictions per completion indicate
-        // blocks cycling GPU↔CPU so often that tiering overhead dominates.
-        if on.completed > 0 {
-            let epc = on.eviction_count as f64 / on.completed as f64;
-            if epc > 3.0 {
-                println!(
-                    "  ⚠️  Thrashing: {:.1} evictions/completion ({} evictions, {} completed)",
-                    epc, on.eviction_count, on.completed,
-                );
-            }
+        if is_thrashing(&on) {
+            println!(
+                "  ⚠️  THRASH: {:.1} evictions/full-completion exceeds {:.1}",
+                on_epfc, THRASHING_EVICTIONS_PER_FULL_COMPLETION,
+            );
         }
     } else {
         println!("  ⚠️  No evictions triggered — workload may need more pressure");
@@ -1217,21 +1435,36 @@ fn kcmm_engine_integration_single() {
 
     // --- Pass/Fail ---
     println!();
-    if cap_ratio >= 1.3 {
-        println!("  ✅ PASS: Tiering capacity ratio {:.2}× ≥ 1.3×", cap_ratio);
-    } else if cap_ratio >= 1.0 {
-        println!("  ⚡ Marginal: Tiering shows improvement ({}×) but below 1.3× target", cap_ratio);
-    } else {
-        println!("  ❌ Tiering ON completed fewer requests than Tiering OFF");
+    match integration_status(cap_ratio, tp_ratio, &on) {
+        "THRASH" => println!(
+            "  ⚠️  THRASH: {:.1} evictions/full-completion exceeds {:.1}",
+            on_epfc, THRASHING_EVICTIONS_PER_FULL_COMPLETION,
+        ),
+        "PASS" => println!("  ✅ PASS: Tiering capacity ratio {:.2}× ≥ 1.3×", cap_ratio),
+        "MARG-CAP" => println!(
+            "  ⚡ MARG-CAP: full-completion capacity improved {:.2}× but below 1.3× target",
+            cap_ratio,
+        ),
+        "TP-ONLY" => println!(
+            "  ⚡ TP-ONLY: throughput improved {:.2}× without full-completion capacity gain",
+            tp_ratio,
+        ),
+        _ => println!("  ❌ FAIL: Tiering ON produced fewer full completions than Tiering OFF"),
     }
 
     // Per-step latency should be reasonable — warn if tiering adds >50% overhead
     if off_p50 > 0 {
         let overhead = (on_p50 as f64 / off_p50 as f64) - 1.0;
         if overhead > 0.5 && on.eviction_count > 0 {
-            println!("  ⚠️  Tiering adds significant per-step latency overhead ({:.1}%)", overhead * 100.0);
+            println!(
+                "  ⚠️  Tiering adds significant per-step latency overhead ({:.1}%)",
+                overhead * 100.0
+            );
         } else if on.eviction_count > 0 {
-            println!("  ✅ Tiering latency overhead is acceptable ({:.1}%)", overhead * 100.0);
+            println!(
+                "  ✅ Tiering latency overhead is acceptable ({:.1}%)",
+                overhead * 100.0
+            );
         }
     }
 }
@@ -1245,6 +1478,16 @@ fn kcmm_engine_integration_sweep() {
     println!("\n╔══════════════════════════════════════════════════════════════╗");
     println!("║  KCMM §1.6 — Engine Integration Benchmark Sweep             ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!(
+        "Model: deterministic Xavier-init seed=0x{MODEL_WEIGHT_SEED:016X}; OFF/ON weights are identical per comparison."
+    );
+    println!(
+        "Admission: Tiering ON retries up to {ADMISSION_EVICTION_RETRY_LIMIT} cold-block eviction rounds before rejecting."
+    );
+    println!(
+        "Thrashing metric: evictions/full-completion > {THRASHING_EVICTIONS_PER_FULL_COMPLETION:.1} is THRASH."
+    );
     println!();
 
     let configs = vec![
@@ -1291,10 +1534,10 @@ fn kcmm_engine_integration_sweep() {
     ];
 
     println!(
-        "  {:<52} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7}",
-        "Config", "TierOFF", "TierON", "TpRatio", "CapRat", "Evict", "Restore"
+        "  {:<52} {:>13} {:>13} {:>7} {:>7} {:>8} {:>7} {:>8}",
+        "Config", "OFF F/C/R/L", "ON F/C/R/L", "TpRatio", "CapRat", "Ev/Full", "Evict", "Status"
     );
-    println!("  {}", "-".repeat(105));
+    println!("  {}", "-".repeat(130));
 
     let mut best_tp = 0.0f64;
     let mut best_label = String::new();
@@ -1307,44 +1550,29 @@ fn kcmm_engine_integration_sweep() {
         } else {
             f64::NAN
         };
-        let cap_ratio = if off.completed > 0 {
-            on.completed as f64 / off.completed as f64
-        } else {
-            f64::NAN
-        };
-
-        let status = if cap_ratio >= 1.3 {
-            "✅"
-        } else if cap_ratio >= 1.0 {
-            "⚡"
-        } else {
-            "❌"
-        };
-
-        println!(
-            "  {:<52} {:>8} {:>8} {:>6.2}× {:>6.2}× {:>7} {:>7} {:<4}",
-            cfg.label(),
-            off.completed,
-            on.completed,
-            tp_ratio,
-            cap_ratio,
-            on.eviction_count,
-            on.restore_count,
-            status,
+        let cap_ratio = completion_ratio(on.completed_full, off.completed_full);
+        let on_epfc = evictions_per_full_completion(&on);
+        let status = integration_status(cap_ratio, tp_ratio, &on);
+        let off_outcomes = format!(
+            "{}/{}/{}/{}",
+            off.completed_full, off.capped, off.rejected, off.leftover_at_end,
+        );
+        let on_outcomes = format!(
+            "{}/{}/{}/{}",
+            on.completed_full, on.capped, on.rejected, on.leftover_at_end,
         );
 
-        // Detect thrashing: excessive evictions per completion suggest blocks
-        // are cycling between GPU↔CPU so frequently that tiering overhead
-        // exceeds the capacity benefit.
-        if on.completed > 0 {
-            let epc = on.eviction_count as f64 / on.completed as f64;
-            if epc > 3.0 {
-                println!(
-                    "  ⚠️  Thrashing: {:.1} evictions/completion ({} evictions, {} completed)",
-                    epc, on.eviction_count, on.completed,
-                );
-            }
-        }
+        println!(
+            "  {:<52} {:>13} {:>13} {:>6.2}× {:>6.2}× {:>8.1} {:>7} {:>8}",
+            cfg.label(),
+            off_outcomes,
+            on_outcomes,
+            tp_ratio,
+            cap_ratio,
+            on_epfc,
+            on.eviction_count,
+            status,
+        );
 
         if tp_ratio > best_tp && tp_ratio.is_finite() {
             best_tp = tp_ratio;
