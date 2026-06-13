@@ -93,7 +93,9 @@ if ! command -v nvcc &>/dev/null; then
         "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
     dpkg -i /tmp/cuda-keyring.deb
     apt-get update -y
-    # Note: CUDA 13.0 + driver 580 requires dkms >= 3.1.8, allow held package changes
+    # CUDA 13.0 + driver 580 requires dkms >= 3.1.8; upgrade from CUDA repo first
+    echo "   Upgrading dkms from CUDA repo..."
+    apt-get install -y --no-install-recommends --allow-change-held-packages dkms
     apt-get install -y --no-install-recommends --allow-change-held-packages \
         "cuda-toolkit-${CUDA_VERSION/./-}" \
         "nvidia-driver-${NV_DRIVER_VERSION}" \
@@ -115,7 +117,7 @@ export CUDA_HOME=/usr/local/cuda-${CUDA_VERSION}
 EOF
 fi
 export PATH="/usr/local/cuda-${CUDA_VERSION}/bin:$PATH"
-export LD_LIBRARY_PATH="/usr/local/cuda-${CUDA_VERSION}/lib64:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda-${CUDA_VERSION}/lib64:${LD_LIBRARY_PATH:-}"
 export CUDA_HOME="/usr/local/cuda-${CUDA_VERSION}"
 
 # ── 3. Rust ──
@@ -163,66 +165,11 @@ if ! conda env list 2>/dev/null | grep -q "^vllm-bench "; then
 fi
 conda activate vllm-bench
 
-echo ">>> [6/9] Installing vLLM (this may take 10-15 minutes)..."
-# vLLM 0.22+ with FlashInfer for A30 sm_80
-pip install --no-cache-dir vllm 2>&1 | tail -5
-
-# Verify vLLM installation
-python3 -c "import vllm; print('vLLM version:', vllm.__version__)"
-
-# ── 6. FlashInfer configuration for A30 ──
+# SKIPPED: vLLM, FlashInfer, and TinyLlama installation (Step 6-8)
 echo ""
-echo ">>> [7/9] Configuring FlashInfer for A30 (sm_80)..."
-SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
-CCCL_FILE="$SITE_PACKAGES/flashinfer/compilation_context.py"
-
-if [ -f "$CCCL_FILE" ]; then
-    # Apply CCCL compatibility patch if needed
-    if ! grep -q "CCCL_DISABLE_CTK_COMPATIBILITY_CHECK" "$CCCL_FILE" 2>/dev/null; then
-        echo "   Applying CCCL compatibility patch..."
-        sed -i 's/COMMON_NVCC_FLAGS = \[/COMMON_NVCC_FLAGS = ["-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",/' "$CCCL_FILE"
-    else
-        echo "   CCCL patch already applied."
-    fi
-else
-    echo "   WARNING: FlashInfer compilation_context.py not found."
-    echo "   FlashInfer may not be installed. Check vLLM installation."
-fi
-
-# Pre-compile FlashInfer kernels for A30
-export FLASHINFER_CUDA_ARCH_LIST="8.0"
-export CUDA_HOME="/usr/local/cuda-${CUDA_VERSION}"
-
-echo "   Triggering FlashInfer JIT pre-compilation for sm_80..."
-python3 -c "
-import flashinfer
-print(f'FlashInfer version: {flashinfer.__version__}')
-print('FlashInfer OK — kernels will JIT-compile on first inference call')
-" 2>&1 || echo "   WARNING: FlashInfer import check failed (may be OK on first vLLM run)"
-
-# ── 7. Download TinyLlama model ──
-echo ""
-echo ">>> [8/9] Downloading TinyLlama model..."
-pip install --no-cache-dir huggingface_hub 2>&1 | tail -3
-
-mkdir -p "$MODEL_DIR"
-if [ ! -f "$MODEL_DIR/tinyllama/model.safetensors" ]; then
-    # Use 'hf download' (huggingface-cli is deprecated)
-    hf download TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-        --local-dir "$MODEL_DIR/tinyllama" 2>&1 | tail -5
-    echo "   Model downloaded to $MODEL_DIR/tinyllama"
-else
-    echo "   Model already exists at $MODEL_DIR/tinyllama, skipping."
-fi
-
-# Verify model
-if [ -f "$MODEL_DIR/tinyllama/model.safetensors" ]; then
-    MODEL_SIZE=$(du -h "$MODEL_DIR/tinyllama/model.safetensors" | cut -f1)
-    echo "   Model size: $MODEL_SIZE"
-else
-    echo "   ERROR: Model download failed — model.safetensors missing."
-    exit 1
-fi
+echo ">>> [6/9] SKIPPED: vLLM installation"
+echo ">>> [7/9] SKIPPED: FlashInfer configuration"
+echo ">>> [8/9] SKIPPED: TinyLlama model download"
 
 # ── Verification ──
 echo ""
@@ -240,24 +187,16 @@ echo "  [ ] 3. CUDA: nvcc --version"
 echo "         Expected: 'release ${CUDA_VERSION}'"
 echo "  [ ] 4. Rust: cargo --version"
 echo "         Expected: 'cargo 1.78.0'"
-echo "  [ ] 5. vLLM env: conda activate vllm-bench && python3 -c 'import vllm; print(vllm.__version__)'"
-echo "         Expected: '0.22.0' or newer"
-echo "  [ ] 6. FlashInfer: FLASHINFER_CUDA_ARCH_LIST=8.0 python3 -c 'import flashinfer'"
-echo "         Expected: no errors"
-echo "  [ ] 7. Model: ls $MODEL_DIR/tinyllama/model.safetensors"
-echo "         Expected: file exists (~2.1 GB)"
+echo "  [ ] 5. Conda env: conda activate vllm-bench"
+echo "         (vLLM/FlashInfer/TinyLlama installation skipped per user request)"
 echo ""
 
 echo "======================================================================"
 echo " Quick Start After Reboot:"
 echo "======================================================================"
 echo ""
-echo "  # Run full comparison (baseline + vLLM):"
-echo "  cd $REPO_DIR"
-echo "  bash scripts/step3_test_baremetal.sh compare"
-echo ""
-echo "  # Or run individual modes:"
-echo "  bash scripts/step3_test_baremetal.sh baseline"
-echo "  bash scripts/step3_test_baremetal.sh vllm"
+echo "  # To install vLLM later:"
+echo "  conda activate vllm-bench"
+echo "  pip install vllm"
 echo ""
 echo "======================================================================"

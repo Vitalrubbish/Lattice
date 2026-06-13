@@ -785,10 +785,10 @@ fn kcmm_bench_memory_pressure_sweep() {
 
     println!();
     println!(
-        "  {:<50} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "Config", "Base", "KCMM", "Ratio", "RejB", "RejK", "Evict"
+        "  {:<50} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "Config", "Base", "KCMM", "Ratio", "RejB", "RejK", "CappedB", "CappedK", "Evict"
     );
-    println!("  {}", "-".repeat(100));
+    println!("  {}", "-".repeat(122));
 
     let mut max_ratio = 0.0f64;
     let mut best_label = String::new();
@@ -811,13 +811,15 @@ fn kcmm_bench_memory_pressure_sweep() {
         };
 
         println!(
-            "  {:<50} {:>8} {:>8} {:>8.2}× {:>8} {:>8} {:>8} {:<4}",
+            "  {:<50} {:>8} {:>8} {:>8.2}× {:>8} {:>8} {:>8} {:>8} {:>8} {:<4}",
             cfg.label(),
             baseline.completed,
             kcmm.completed,
             ratio,
             baseline.rejected,
             kcmm.rejected,
+            baseline.capped,
+            kcmm.capped,
             kcmm.eviction_count,
             status,
         );

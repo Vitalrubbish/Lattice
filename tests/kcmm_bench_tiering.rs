@@ -160,7 +160,10 @@ fn kcmm_bench_batch_eviction_amortization() {
 
     let num_layers = 2;
     let block_size = 128; // 64 KiB blocks
-    let (pool, _dir) = make_tiering_pool(&ctx, block_size, 512, num_layers);
+    // Use a large pool so superblock creation never triggers during the
+    // measurement loop — 4096 blocks is enough for 5 warmup rounds × 64 blocks
+    // + 30 measurement rounds × 64 blocks worst case, all within capacity.
+    let (pool, _dir) = make_tiering_pool(&ctx, block_size, 4096, num_layers);
     let tiering = pool.tiering.as_ref().expect("tiering enabled");
     let block_bytes = pool.block_bytes;
 
@@ -171,17 +174,16 @@ fn kcmm_bench_batch_eviction_amortization() {
         "block_bytes={block_bytes}, num_layers={num_layers}, rounds=30"
     );
 
-    // Warmup: one full cycle
-    {
+    // Warmup: multiple full cycles to stabilise CUDA driver caches, lazy
+    // superblock allocations, and gather-kernel JIT compilation.  We use
+    // batched restore (restore_evicted_blocks) to warm that path as well.
+    for _ in 0..5 {
         let pairs = alloc_blocks(&pool, 64);
         let handles: Vec<BlockHandle> = pairs.iter().map(|(_, h)| *h).collect();
+        let indices: Vec<u32> = pairs.iter().map(|(idx, _)| *idx).collect();
         tiering.evict_blocks(&pool, &handles, 64).expect("warmup evict");
-        for (idx, _) in &pairs {
-            pool.restore_evicted_block(*idx).expect("warmup restore");
-        }
-        // Free the warmup blocks
-        let warmup_indices: Vec<u32> = pairs.iter().map(|(idx, _)| *idx).collect();
-        pool.free_sequence(&warmup_indices);
+        pool.restore_evicted_blocks(&indices).expect("warmup restore");
+        pool.free_sequence(&indices);
     }
 
     // Collect per-batch averages, then compute amortisation factor.
@@ -190,6 +192,17 @@ fn kcmm_bench_batch_eviction_amortization() {
     for &batch_size in batch_sizes {
         let rounds = 30;
         let mut per_block_latencies: Vec<u64> = Vec::with_capacity(rounds);
+
+        // Per-batch-size pre-warmup: stabilise the gather-kernel path for
+        // this specific batch size before we start measuring.
+        for _ in 0..5 {
+            let pairs = alloc_blocks(&pool, batch_size);
+            let handles: Vec<BlockHandle> = pairs.iter().map(|(_, h)| *h).collect();
+            let indices: Vec<u32> = pairs.iter().map(|(idx, _)| *idx).collect();
+            let _ = tiering.evict_blocks(&pool, &handles, batch_size);
+            pool.restore_evicted_blocks(&indices).expect("prewarm restore");
+            pool.free_sequence(&indices);
+        }
 
         for _ in 0..rounds {
             let pairs = alloc_blocks(&pool, batch_size);
@@ -213,7 +226,8 @@ fn kcmm_bench_batch_eviction_amortization() {
             pool.free_sequence(&indices);
         }
 
-        let avg = mean(&per_block_latencies) as u64;
+        // Use median to filter out outlier jitter (e.g. WSL2 paravirtualisation).
+        let avg = percentile(&mut per_block_latencies, 50.0);
         batch_results.push((batch_size, avg));
 
         // Convert ns → µs for display.

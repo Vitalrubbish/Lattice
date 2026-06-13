@@ -1200,6 +1200,17 @@ fn kcmm_engine_integration_single() {
             "  ✅ Tiering active: {} evictions, {} restores",
             on.eviction_count, on.restore_count,
         );
+        // Thrashing detection: excessive evictions per completion indicate
+        // blocks cycling GPU↔CPU so often that tiering overhead dominates.
+        if on.completed > 0 {
+            let epc = on.eviction_count as f64 / on.completed as f64;
+            if epc > 3.0 {
+                println!(
+                    "  ⚠️  Thrashing: {:.1} evictions/completion ({} evictions, {} completed)",
+                    epc, on.eviction_count, on.completed,
+                );
+            }
+        }
     } else {
         println!("  ⚠️  No evictions triggered — workload may need more pressure");
     }
@@ -1321,6 +1332,19 @@ fn kcmm_engine_integration_sweep() {
             on.restore_count,
             status,
         );
+
+        // Detect thrashing: excessive evictions per completion suggest blocks
+        // are cycling between GPU↔CPU so frequently that tiering overhead
+        // exceeds the capacity benefit.
+        if on.completed > 0 {
+            let epc = on.eviction_count as f64 / on.completed as f64;
+            if epc > 3.0 {
+                println!(
+                    "  ⚠️  Thrashing: {:.1} evictions/completion ({} evictions, {} completed)",
+                    epc, on.eviction_count, on.completed,
+                );
+            }
+        }
 
         if tp_ratio > best_tp && tp_ratio.is_finite() {
             best_tp = tp_ratio;
