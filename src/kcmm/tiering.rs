@@ -214,6 +214,329 @@ impl EvictionPolicy for FifoPolicy {
     }
 }
 
+// --- ARC (Adaptive Replacement Cache) policy ---
+
+/// ARC (Adaptive Replacement Cache) eviction policy.
+///
+/// Maintains four LRU lists:
+///   - T1: blocks accessed exactly once (recency)
+///   - T2: blocks accessed more than once (frequency)
+///   - B1: ghost list — metadata for recently evicted T1 blocks
+///   - B2: ghost list — metadata for recently evicted T2 blocks
+///
+/// A target size `p` balances T1 vs T2 capacity.  Ghost-list hits
+/// adjust `p`:
+///   - B1 hit → increase T1 capacity (recency matters more)
+///   - B2 hit → increase T2 capacity (frequency matters more)
+///
+/// This provides scan resistance: a sequential scan fills T1 and
+/// pushes blocks into B1, but won't evict the T2 frequent set.
+pub struct ArcPolicy {
+    /// T1: recent (accessed once), ordered by recency (head = MRU, tail = LRU).
+    t1: Mutex<Vec<BlockHandle>>,
+    /// T2: frequent (accessed ≥2 times), ordered by recency.
+    t2: Mutex<Vec<BlockHandle>>,
+    /// B1: ghost of evicted T1 entries.  Stores only BlockHandle.
+    b1: Mutex<Vec<BlockHandle>>,
+    /// B2: ghost of evicted T2 entries.  Stores only BlockHandle.
+    b2: Mutex<Vec<BlockHandle>>,
+    /// Target size for T1 (adaptive).  T2 size = total_capacity - p.
+    p: Mutex<usize>,
+    /// Total capacity (max physical blocks in the pool).
+    capacity: usize,
+}
+
+impl ArcPolicy {
+    /// Create a new ARC policy with the given total capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            t1: Mutex::new(Vec::new()),
+            t2: Mutex::new(Vec::new()),
+            b1: Mutex::new(Vec::new()),
+            b2: Mutex::new(Vec::new()),
+            p: Mutex::new(0), // start balanced
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Total number of blocks tracked in T1 + T2.
+    fn total_tracked(&self) -> usize {
+        self.t1.lock().len() + self.t2.lock().len()
+    }
+
+    /// Replace one victim: evict from T1 (if |T1| > p) or T2.
+    /// Returns the evicted handle, or None if both lists are empty.
+    fn replace(&self) -> Option<BlockHandle> {
+        let t1_len = self.t1.lock().len();
+        let p = *self.p.lock();
+
+        if t1_len > 0 && (t1_len > p || self.t2.lock().is_empty()) {
+            // Evict LRU from T1 → move to B1
+            let victim = self.t1.lock().pop().unwrap(); // pop from tail = LRU
+            let mut b1 = self.b1.lock();
+            b1.push(victim);
+            // Keep ghost list bounded
+            while b1.len() > self.capacity {
+                b1.remove(0);
+            }
+            Some(victim)
+        } else if !self.t2.lock().is_empty() {
+            // Evict LRU from T2 → move to B2
+            let victim = self.t2.lock().pop().unwrap();
+            let mut b2 = self.b2.lock();
+            b2.push(victim);
+            while b2.len() > self.capacity {
+                b2.remove(0);
+            }
+            Some(victim)
+        } else {
+            None
+        }
+    }
+}
+
+impl EvictionPolicy for ArcPolicy {
+    fn on_allocate(&self, block: BlockHandle) {
+        // Check if block is in B1 (recent ghost hit) or B2 (frequent ghost hit).
+        let in_b1 = {
+            let mut b1 = self.b1.lock();
+            b1.iter().position(|h| *h == block).map(|i| {
+                b1.remove(i);
+            }).is_some()
+        };
+        let in_b2 = {
+            let mut b2 = self.b2.lock();
+            b2.iter().position(|h| *h == block).map(|i| {
+                b2.remove(i);
+            }).is_some()
+        };
+
+        if in_b1 {
+            // Ghost hit in B1: increase T1 capacity.
+            let delta = (self.b2.lock().len().max(1) / self.b1.lock().len().max(1)).max(1);
+            let mut p = self.p.lock();
+            *p = (*p + delta).min(self.capacity);
+            // Move to T2 (now accessed again, so it's frequent)
+            self.t2.lock().insert(0, block);
+        } else if in_b2 {
+            // Ghost hit in B2: increase T2 capacity.
+            let delta = (self.b1.lock().len().max(1) / self.b2.lock().len().max(1)).max(1);
+            let mut p = self.p.lock();
+            *p = (*p).saturating_sub(delta);
+            // Move to T2
+            self.t2.lock().insert(0, block);
+        } else {
+            // First-time access: insert into T1.
+            self.t1.lock().insert(0, block);
+        }
+
+        // If total > capacity, evict
+        while self.total_tracked() > self.capacity {
+            self.replace();
+        }
+    }
+
+    fn select_victims(&self, candidates: &[BlockHandle], count: usize) -> Vec<BlockHandle> {
+        if candidates.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        // ARC prioritizes evicting from T1 (recent, one-hit-wonders) over T2 (frequent).
+        // Within each tier, LRU order applies.
+        // For candidates not in T1/T2, they are placed at the end (lowest priority to keep).
+
+        let t1 = self.t1.lock();
+        let t2 = self.t2.lock();
+
+        // Score each candidate: 0 = T1 LRU, 1 = T1 mid, ... |T1| = T2 LRU, ...
+        // Lower score = evict first.
+        let mut scored: Vec<(BlockHandle, usize)> = candidates
+            .iter()
+            .map(|h| {
+                // Find position in T1 (reverse order: tail = LRU = 0)
+                let t1_pos = t1.iter().rev().position(|x| *x == *h);
+                let t2_pos = t2.iter().rev().position(|x| *x == *h);
+                let score = match (t1_pos, t2_pos) {
+                    (Some(p), _) => p,              // T1: 0..|T1|-1
+                    (_, Some(p)) => t1.len() + p,   // T2: after T1
+                    _ => t1.len() + t2.len() + 1,   // Unknown: lowest priority
+                };
+                (*h, score)
+            })
+            .collect();
+
+        drop(t1);
+        drop(t2);
+
+        // Sort by score ascending (lowest = evict first)
+        scored.sort_by_key(|(_, s)| *s);
+        scored.truncate(count);
+        scored.into_iter().map(|(h, _)| h).collect()
+    }
+
+    fn on_access(&self, block: BlockHandle) {
+        // Check if block is in T1 → promote to T2 (now accessed ≥2 times).
+        let mut t1 = self.t1.lock();
+        if let Some(pos) = t1.iter().position(|h| *h == block) {
+            t1.remove(pos);
+            drop(t1);
+            self.t2.lock().insert(0, block);
+            return;
+        }
+        drop(t1);
+
+        // If in T2, move to MRU position.
+        let mut t2 = self.t2.lock();
+        if let Some(pos) = t2.iter().position(|h| *h == block) {
+            t2.remove(pos);
+            t2.insert(0, block);
+        }
+    }
+
+    fn on_evict(&self, block: BlockHandle) {
+        // Remove from whatever list it was in.
+        // T1 removal → add to B1 ghost; T2 removal → add to B2 ghost.
+        let mut t1 = self.t1.lock();
+        if let Some(pos) = t1.iter().position(|h| *h == block) {
+            t1.remove(pos);
+            let mut b1 = self.b1.lock();
+            if !b1.contains(&block) {
+                b1.push(block);
+                while b1.len() > self.capacity {
+                    b1.remove(0);
+                }
+            }
+            return;
+        }
+        drop(t1);
+
+        let mut t2 = self.t2.lock();
+        if let Some(pos) = t2.iter().position(|h| *h == block) {
+            t2.remove(pos);
+            let mut b2 = self.b2.lock();
+            if !b2.contains(&block) {
+                b2.push(block);
+                while b2.len() > self.capacity {
+                    b2.remove(0);
+                }
+            }
+        }
+    }
+
+    fn policy_name(&self) -> &'static str {
+        "arc"
+    }
+}
+
+// --- Attention-sink + window eviction policy ---
+
+/// Sink-window eviction policy.
+///
+/// Protects two regions of each sequence from eviction:
+///   - **Attention sink** (first `S` blocks): heavily attended by all
+///     subsequent tokens; evicting them causes catastrophic quality loss.
+///   - **Recent window** (last `W` blocks): required for the next decode
+///     step; evicting them would immediately stall generation.
+///
+/// Only blocks in the middle region are eligible for eviction, selected
+/// by LRU ordering among eligible candidates.
+///
+/// Block position metadata is stored in the policy's per-block map,
+/// populated by `on_allocate_with_position`.
+pub struct SinkWindowPolicy {
+    /// BlockHandle → (seq_idx, block_position_in_sequence).
+    block_positions: Mutex<HashMap<BlockHandle, (usize, usize)>>,
+    /// BlockHandle → last access timestamp (for LRU within eligible region).
+    access_times: Mutex<HashMap<BlockHandle, Instant>>,
+    /// Number of sink blocks to protect.
+    sink_blocks: usize,
+    /// Number of window blocks to protect.
+    window_blocks: usize,
+}
+
+impl SinkWindowPolicy {
+    /// Create a new sink-window policy.
+    pub fn new(sink_blocks: usize, window_blocks: usize) -> Self {
+        Self {
+            block_positions: Mutex::new(HashMap::new()),
+            access_times: Mutex::new(HashMap::new()),
+            sink_blocks,
+            window_blocks,
+        }
+    }
+
+    /// Register a block with its position in the sequence.
+    /// Called by `KcmmPool::install_block` when the block position is known.
+    pub fn register_block(&self, block: BlockHandle, seq_idx: usize, pos_in_seq: usize) {
+        self.block_positions.lock().insert(block, (seq_idx, pos_in_seq));
+    }
+
+    /// Check if a block is in the protected sink or window region.
+    fn is_protected(&self, positions: &HashMap<BlockHandle, (usize, usize)>, seq_blocks: &HashMap<usize, usize>, handle: &BlockHandle) -> bool {
+        if let Some(&(seq_idx, pos_in_seq)) = positions.get(handle) {
+            // Sink protection: first `sink_blocks` blocks
+            if pos_in_seq < self.sink_blocks {
+                return true;
+            }
+            // Window protection: last `window_blocks` blocks
+            if let Some(&total_blocks) = seq_blocks.get(&seq_idx) {
+                if pos_in_seq >= total_blocks.saturating_sub(self.window_blocks) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+impl EvictionPolicy for SinkWindowPolicy {
+    fn on_allocate(&self, block: BlockHandle) {
+        self.access_times.lock().insert(block, Instant::now());
+    }
+
+    fn select_victims(&self, candidates: &[BlockHandle], count: usize) -> Vec<BlockHandle> {
+        if candidates.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let positions = self.block_positions.lock();
+        let times = self.access_times.lock();
+
+        // Build a quick lookup: seq_idx → total_blocks (max position seen)
+        let mut seq_blocks: HashMap<usize, usize> = HashMap::new();
+        for (_h, &(seq_idx, pos)) in positions.iter() {
+            let entry = seq_blocks.entry(seq_idx).or_insert(0);
+            *entry = (*entry).max(pos + 1);
+        }
+
+        // Filter out protected blocks, sort remaining by LRU
+        let mut eligible: Vec<(BlockHandle, Instant)> = candidates
+            .iter()
+            .filter(|h| !self.is_protected(&positions, &seq_blocks, h))
+            .filter_map(|h| times.get(h).map(|t| (*h, *t)))
+            .collect();
+
+        drop(positions);
+        drop(times);
+
+        // Sort by timestamp ascending (oldest first = LRU)
+        eligible.sort_by_key(|(_, t)| *t);
+        eligible.truncate(count);
+        eligible.into_iter().map(|(h, _)| h).collect()
+    }
+
+    fn on_access(&self, block: BlockHandle) {
+        self.access_times.lock().insert(block, Instant::now());
+    }
+
+    fn on_evict(&self, block: BlockHandle) {
+        self.access_times.lock().remove(&block);
+        // Keep position info in case the block is later re-allocated (ghost-like).
+    }
+
+    fn policy_name(&self) -> &'static str {
+        "sink_window"
+    }
+}
+
 // --- CPU slot allocator ---
 
 /// Manages allocation of byte ranges within the CPU swap buffer.
@@ -452,6 +775,11 @@ impl TieringEngine {
         let eviction_policy: Box<dyn EvictionPolicy> = match config.eviction_policy.as_str() {
             "lfu" => Box::new(LfuPolicy::new()),
             "fifo" => Box::new(FifoPolicy::new()),
+            "arc" => Box::new(ArcPolicy::new(config.max_blocks)),
+            "sink_window" => Box::new(SinkWindowPolicy::new(
+                config.attention_sink_blocks,
+                config.recent_window_blocks,
+            )),
             _ => Box::new(LruPolicy::new()), // default: LRU
         };
 
@@ -550,9 +878,15 @@ impl TieringEngine {
             "lru" => Box::new(LruPolicy::new()),
             "lfu" => Box::new(LfuPolicy::new()),
             "fifo" => Box::new(FifoPolicy::new()),
+            "arc" => {
+                // Determine capacity from current CPU buffer sizing
+                let cap = self.cpu_buffer_size / self.max_batch_blocks.max(1);
+                Box::new(ArcPolicy::new(cap.max(1)))
+            }
+            "sink_window" => Box::new(SinkWindowPolicy::new(1, 4)),
             other => {
                 return Err(anyhow::anyhow!(
-                    "unknown eviction policy '{}' (expected lru, lfu, or fifo)",
+                    "unknown eviction policy '{}' (expected lru, lfu, fifo, arc, or sink_window)",
                     other
                 ));
             }
@@ -713,9 +1047,32 @@ impl TieringEngine {
         candidates: &[BlockHandle],
         count: usize,
     ) -> Result<Vec<BlockHandle>> {
+        self.evict_blocks_internal(pool, candidates, count, false)
+    }
+
+    /// Evict blocks with background flag — used by proactive background eviction.
+    pub fn evict_blocks_background(
+        &self,
+        pool: &KcmmPool,
+        candidates: &[BlockHandle],
+        count: usize,
+    ) -> Result<Vec<BlockHandle>> {
+        self.evict_blocks_internal(pool, candidates, count, true)
+    }
+
+    /// Internal eviction implementation with metrics recording.
+    fn evict_blocks_internal(
+        &self,
+        pool: &KcmmPool,
+        candidates: &[BlockHandle],
+        count: usize,
+        is_background: bool,
+    ) -> Result<Vec<BlockHandle>> {
         if candidates.is_empty() || count == 0 {
             return Ok(Vec::new());
         }
+
+        let evict_start = std::time::Instant::now();
 
         // 1. Select victims
         let victims = self
@@ -729,16 +1086,38 @@ impl TieringEngine {
         // If memcpy batching is available and the victim count justifies the
         // gather-kernel launch overhead, use the batched path.
         const MIN_BATCH_FOR_GATHER: usize = 8;
-        if victims.len() >= MIN_BATCH_FOR_GATHER
+        let result = if victims.len() >= MIN_BATCH_FOR_GATHER
             && self.gather_kernel.is_some()
             && self.gpu_staging.is_some()
         {
-            return self.evict_blocks_batched(pool, &victims);
+            self.evict_blocks_batched(pool, &victims)
+        } else {
+            self.evict_blocks_unbatched(pool, &victims)
+        };
+
+        let latency_us = evict_start.elapsed().as_micros() as u64;
+
+        match &result {
+            Ok(evicted) => {
+                pool.record_eviction(evicted.len(), latency_us, is_background);
+            }
+            Err(_) => {
+                pool.record_eviction_failure();
+            }
         }
 
-        // 2. Phase 1 — Submit all async D2H copies
+        result
+    }
+
+    /// Unbatched eviction path (extracted from evict_blocks for metrics clarity).
+    fn evict_blocks_unbatched(
+        &self,
+        pool: &KcmmPool,
+        victims: &[BlockHandle],
+    ) -> Result<Vec<BlockHandle>> {
+        // Phase 1 — Submit all async D2H copies
         let mut pending: Vec<EvictContext> = Vec::with_capacity(victims.len());
-        for &victim in &victims {
+        for &victim in victims {
             let block_idx = pool
                 .find_block_idx(victim)
                 .ok_or_else(|| anyhow::anyhow!("victim block {:?} not found in pool", victim))?;
@@ -752,7 +1131,6 @@ impl TieringEngine {
                         error = %e,
                         "KCMM: evict_submit_async failed, skipping"
                     );
-                    // Continue — partial success is better than total failure.
                 }
             }
         }
@@ -761,10 +1139,7 @@ impl TieringEngine {
             return Ok(Vec::new());
         }
 
-        // 3. Phase 2 — ONE synchronise for the entire batch.
-        //    If this fails, *all* pending blocks may be in an unknown state
-        //    (some D2H copies may have completed, others not).  We
-        //    conservatively roll back every pending block.
+        // Phase 2 — ONE synchronise for the entire batch.
         if let Err(e) = pool.streams.evict.synchronize() {
             tracing::error!(
                 pending_count = pending.len(),
@@ -793,7 +1168,7 @@ impl TieringEngine {
             return Err(e);
         }
 
-        // 4. Phase 3 — Finalize all blocks (no GPU ops, fast)
+        // Phase 3 — Finalize all blocks
         let mut evicted = Vec::with_capacity(pending.len());
         for ctx in pending {
             let handle = ctx.handle;
@@ -1025,6 +1400,18 @@ impl TieringEngine {
         }
 
         Ok(evicted)
+    }
+
+    /// Evict blocks selected by the policy from the given candidates.
+    /// Convenience wrapper: calls evict_blocks with is_background=false.
+    #[allow(dead_code)]
+    fn evict_policy_selected(
+        &self,
+        pool: &KcmmPool,
+        candidates: &[BlockHandle],
+        count: usize,
+    ) -> Result<Vec<BlockHandle>> {
+        self.evict_blocks(pool, candidates, count)
     }
 
     /// Copy all K and V layers for a block from GPU to CPU.
@@ -1326,19 +1713,35 @@ impl TieringEngine {
             return Ok(());
         }
 
+        let restore_start = std::time::Instant::now();
+        let block_count = blocks.len();
+
         const MIN_BATCH_FOR_SCATTER: usize = 8;
-        if blocks.len() >= MIN_BATCH_FOR_SCATTER
+        let result = if blocks.len() >= MIN_BATCH_FOR_SCATTER
             && self.scatter_kernel.is_some()
             && self.gpu_staging.is_some()
         {
-            return self.restore_blocks_batched(pool, blocks);
+            self.restore_blocks_batched(pool, blocks)
+        } else {
+            // Fall back to sequential single-block restore.
+            for &(block_idx, cpu_offset) in blocks {
+                self.restore_block(pool, block_idx, cpu_offset)?;
+            }
+            Ok(())
+        };
+
+        let latency_us = restore_start.elapsed().as_micros() as u64;
+
+        match &result {
+            Ok(()) => {
+                pool.record_restoration(block_count, latency_us);
+            }
+            Err(_) => {
+                pool.record_restoration_failure();
+            }
         }
 
-        // Fall back to sequential single-block restore.
-        for &(block_idx, cpu_offset) in blocks {
-            self.restore_block(pool, block_idx, cpu_offset)?;
-        }
-        Ok(())
+        result
     }
 
     /// Copy all K and V layers for a block from CPU to GPU.
@@ -1544,6 +1947,10 @@ mod tests {
             eviction_policy: "lru".to_string(),
             prefetch_window: 4,
             max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
         }
     }
 
@@ -2353,6 +2760,10 @@ mod tests {
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
                 max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
             };
 
             let pool = KcmmPool::new(
@@ -2664,6 +3075,10 @@ mod tests {
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
                 max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
             };
 
             let pool = KcmmPool::new(

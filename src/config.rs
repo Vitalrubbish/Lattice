@@ -117,6 +117,22 @@ pub struct KcmmConfig {
     /// Default: 64.
     #[serde(default = "default_max_batch_blocks")]
     pub max_batch_blocks: usize,
+    /// Free block ratio below which the background eviction thread
+    /// proactively evicts cold blocks to CPU.  Default: 0.2 (20%).
+    #[serde(default = "default_low_watermark_threshold")]
+    pub low_watermark_threshold: f32,
+    /// Interval in milliseconds between background eviction checks.
+    /// Default: 100.
+    #[serde(default = "default_background_evict_interval_ms")]
+    pub background_evict_interval_ms: u64,
+    /// Number of attention sink blocks (initial tokens) protected from
+    /// eviction by the "sink_window" policy.  Default: 1.
+    #[serde(default = "default_attention_sink_blocks")]
+    pub attention_sink_blocks: usize,
+    /// Number of recent window blocks (final tokens) protected from
+    /// eviction by the "sink_window" policy.  Default: 4.
+    #[serde(default = "default_recent_window_blocks")]
+    pub recent_window_blocks: usize,
 }
 
 fn default_block_size() -> usize {
@@ -140,6 +156,18 @@ fn default_prefetch_window() -> usize {
 fn default_max_batch_blocks() -> usize {
     64
 }
+fn default_low_watermark_threshold() -> f32 {
+    0.2
+}
+fn default_background_evict_interval_ms() -> u64 {
+    100
+}
+fn default_attention_sink_blocks() -> usize {
+    1
+}
+fn default_recent_window_blocks() -> usize {
+    4
+}
 
 impl Default for KcmmConfig {
     fn default() -> Self {
@@ -151,6 +179,10 @@ impl Default for KcmmConfig {
             eviction_policy: default_eviction_policy(),
             prefetch_window: default_prefetch_window(),
             max_batch_blocks: default_max_batch_blocks(),
+            low_watermark_threshold: default_low_watermark_threshold(),
+            background_evict_interval_ms: default_background_evict_interval_ms(),
+            attention_sink_blocks: default_attention_sink_blocks(),
+            recent_window_blocks: default_recent_window_blocks(),
         }
     }
 }
@@ -322,6 +354,10 @@ mod tests {
             eviction_policy: "lfu".to_string(),
             prefetch_window: 8,
             max_batch_blocks: 32,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
         };
         let json = serde_json::to_string(&cfg).expect("serialize");
         let parsed: KcmmConfig = serde_json::from_str(&json).expect("deserialize");

@@ -46,6 +46,10 @@ fn make_tiering_pool(
         eviction_policy: "lru".to_string(),
         prefetch_window: 4,
         max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
     };
 
     let pool = KcmmPool::new(

@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::config::KcmmConfig;
 use crate::cuda::CudaContext;
-use crate::kcmm::pool::{BlockLocation, KcmmPool};
+use crate::kcmm::pool::{BlockLocation, KcmmPool, SequencePriority};
 use crate::kcmm::metrics::KcmmMetrics;
 
 // ---------------------------------------------------------------------------
@@ -93,6 +93,17 @@ pub struct kcmm_config_t {
     pub max_batch: usize,
     /// Maximum sequence length in tokens.
     pub max_seq_len: usize,
+    /// Low watermark threshold for proactive background eviction (0.0–1.0).
+    /// Default: 0.2 (20% free blocks triggers background eviction).
+    pub low_watermark_threshold: f32,
+    /// Background eviction check interval in milliseconds. Default: 100.
+    pub background_evict_interval_ms: u64,
+    /// Number of attention sink blocks protected by "sink_window" policy.
+    /// Default: 1.
+    pub attention_sink_blocks: usize,
+    /// Number of recent window blocks protected by "sink_window" policy.
+    /// Default: 4.
+    pub recent_window_blocks: usize,
 }
 
 impl Default for kcmm_config_t {
@@ -111,6 +122,10 @@ impl Default for kcmm_config_t {
             head_dim: 64,
             max_batch: 8,
             max_seq_len: 128,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
         }
     }
 }
@@ -295,6 +310,10 @@ pub unsafe extern "C" fn kcmm_pool_create(
         eviction_policy: policy_from_i32(cfg.eviction_policy).to_string(),
         prefetch_window: cfg.prefetch_window,
         max_batch_blocks: cfg.max_batch_blocks,
+        low_watermark_threshold: cfg.low_watermark_threshold,
+        background_evict_interval_ms: cfg.background_evict_interval_ms,
+        attention_sink_blocks: cfg.attention_sink_blocks,
+        recent_window_blocks: cfg.recent_window_blocks,
     };
 
     // Initialize CUDA context
@@ -1391,11 +1410,9 @@ pub unsafe extern "C" fn kcmm_hint(
         match hint {
             kcmm_hint_t::KCMM_HINT_MULTI_TURN
             | kcmm_hint_t::KCMM_HINT_SYSTEM_PROMPT
-            | kcmm_hint_t::KCMM_HINT_HIGH_PRIORITY
             | kcmm_hint_t::KCMM_HINT_ATTENTION_SINK
             | kcmm_hint_t::KCMM_HINT_HEAVY_HITTER => {
                 // Protect: touch the sequence (update last_access to now)
-                // This effectively makes LRU treat these blocks as recently used.
                 drop(seqs);
                 handle.pool.touch(seq_idx as usize);
 
@@ -1408,12 +1425,37 @@ pub unsafe extern "C" fn kcmm_hint(
                     }
                 }
             }
-            kcmm_hint_t::KCMM_HINT_NEAR_END
-            | kcmm_hint_t::KCMM_HINT_LOW_PRIORITY
-            | kcmm_hint_t::KCMM_HINT_EVICTABLE => {
-                // Cool: mark the sequence as preferred victims.
+            kcmm_hint_t::KCMM_HINT_HIGH_PRIORITY => {
+                // Strong protection: touch + set High priority class
+                drop(seqs);
+                handle.pool.touch(seq_idx as usize);
+                handle.pool.set_sequence_priority(
+                    seq_idx as usize,
+                    SequencePriority::High,
+                );
+            }
+            kcmm_hint_t::KCMM_HINT_NEAR_END => {
+                // Mark cold but keep normal priority
                 drop(seqs);
                 handle.pool.cool(seq_idx as usize);
+            }
+            kcmm_hint_t::KCMM_HINT_LOW_PRIORITY => {
+                // Mark cold + set Low priority class
+                drop(seqs);
+                handle.pool.cool(seq_idx as usize);
+                handle.pool.set_sequence_priority(
+                    seq_idx as usize,
+                    SequencePriority::Low,
+                );
+            }
+            kcmm_hint_t::KCMM_HINT_EVICTABLE => {
+                // Mark cold + set Evictable (can discard without restore)
+                drop(seqs);
+                handle.pool.cool(seq_idx as usize);
+                handle.pool.set_sequence_priority(
+                    seq_idx as usize,
+                    SequencePriority::Evictable,
+                );
             }
         }
     }

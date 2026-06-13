@@ -3,9 +3,74 @@
 // Collects and exposes standardized GPU memory fragmentation metrics
 // (IFR, PME, BU, RFI) to the C API and monitoring infrastructure.
 //
-// Full implementation in step 3 weeks 15-16.
+// Also tracks eviction/restoration counters, per-policy statistics,
+// and operation latency histograms for observability.
 
 use crate::cache::unified_frag::{UnifiedFragMetrics, UnifiedFragSummary};
+use std::collections::HashMap;
+
+/// Per-eviction-policy statistics.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyStats {
+    /// Total eviction operations under this policy.
+    pub eviction_count: u64,
+    /// Total restoration operations under this policy.
+    pub restoration_count: u64,
+    /// Cumulative blocks evicted under this policy.
+    pub evicted_blocks: u64,
+    /// Cumulative blocks restored under this policy.
+    pub restored_blocks: u64,
+    /// Average blocks per eviction batch (running sum / count).
+    pub avg_evict_batch_size: f64,
+}
+
+/// Simple histogram bucket for operation latencies.
+#[derive(Debug, Clone, Default)]
+pub struct LatencyHistogram {
+    /// Count of samples recorded.
+    pub count: u64,
+    /// Sum of all latencies in microseconds.
+    pub sum_us: u64,
+    /// Minimum latency in microseconds.
+    pub min_us: u64,
+    /// Maximum latency in microseconds.
+    pub max_us: u64,
+    /// Bucket boundaries in microseconds: [0, 100, 250, 500, 1000, 2500, 5000, 10000, inf].
+    pub buckets: [u64; 9],
+}
+
+impl LatencyHistogram {
+    /// Record a latency sample in microseconds.
+    pub fn record(&mut self, latency_us: u64) {
+        self.count += 1;
+        self.sum_us += latency_us;
+        if self.count == 1 {
+            self.min_us = latency_us;
+            self.max_us = latency_us;
+        } else {
+            self.min_us = self.min_us.min(latency_us);
+            self.max_us = self.max_us.max(latency_us);
+        }
+        // Bucket boundaries: 0, 100, 250, 500, 1000, 2500, 5000, 10000, inf
+        const BOUNDS: [u64; 8] = [100, 250, 500, 1000, 2500, 5000, 10000, u64::MAX];
+        for (i, &bound) in BOUNDS.iter().enumerate() {
+            if latency_us < bound {
+                self.buckets[i] += 1;
+                return;
+            }
+        }
+        self.buckets[8] += 1;
+    }
+
+    /// Average latency in microseconds, or 0 if no samples.
+    pub fn avg_us(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_us as f64 / self.count as f64
+        }
+    }
+}
 
 /// KCMM metrics snapshot — mirrors the C API `kcmm_metrics_t`.
 #[derive(Debug, Clone)]
@@ -28,6 +93,24 @@ pub struct KcmmMetrics {
     pub eviction_count: u64,
     /// Total restoration operations since pool creation.
     pub restoration_count: u64,
+
+    // --- New observability fields (step 3 eviction improvements) ---
+    /// Cumulative blocks evicted (GPU→CPU).
+    pub evicted_blocks_total: u64,
+    /// Cumulative blocks restored (CPU→GPU).
+    pub restored_blocks_total: u64,
+    /// Eviction operations that failed (e.g. CPU slot exhaustion).
+    pub eviction_failures: u64,
+    /// Restoration operations that failed.
+    pub restoration_failures: u64,
+    /// Background eviction operations triggered by low-watermark.
+    pub background_eviction_count: u64,
+    /// Per-policy statistics keyed by policy name.
+    pub policy_stats: HashMap<String, PolicyStats>,
+    /// Eviction latency histogram (GPU→CPU, microseconds).
+    pub eviction_latency: LatencyHistogram,
+    /// Restoration latency histogram (CPU→GPU, microseconds).
+    pub restoration_latency: LatencyHistogram,
 }
 
 impl Default for KcmmMetrics {
@@ -42,6 +125,14 @@ impl Default for KcmmMetrics {
             nvme_blocks: 0,
             eviction_count: 0,
             restoration_count: 0,
+            evicted_blocks_total: 0,
+            restored_blocks_total: 0,
+            eviction_failures: 0,
+            restoration_failures: 0,
+            background_eviction_count: 0,
+            policy_stats: HashMap::new(),
+            eviction_latency: LatencyHistogram::default(),
+            restoration_latency: LatencyHistogram::default(),
         }
     }
 }
@@ -59,6 +150,14 @@ impl KcmmMetrics {
             nvme_blocks: 0,
             eviction_count: 0,
             restoration_count: 0,
+            evicted_blocks_total: 0,
+            restored_blocks_total: 0,
+            eviction_failures: 0,
+            restoration_failures: 0,
+            background_eviction_count: 0,
+            policy_stats: HashMap::new(),
+            eviction_latency: LatencyHistogram::default(),
+            restoration_latency: LatencyHistogram::default(),
         }
     }
 
@@ -113,6 +212,14 @@ mod tests {
         assert_eq!(m.nvme_blocks, 0);
         assert_eq!(m.eviction_count, 0);
         assert_eq!(m.restoration_count, 0);
+        assert_eq!(m.evicted_blocks_total, 0);
+        assert_eq!(m.restored_blocks_total, 0);
+        assert_eq!(m.eviction_failures, 0);
+        assert_eq!(m.restoration_failures, 0);
+        assert_eq!(m.background_eviction_count, 0);
+        assert!(m.policy_stats.is_empty());
+        assert_eq!(m.eviction_latency.count, 0);
+        assert_eq!(m.restoration_latency.count, 0);
     }
 
     #[test]
@@ -164,6 +271,14 @@ mod tests {
             nvme_blocks: 0,
             eviction_count: 3,
             restoration_count: 1,
+            evicted_blocks_total: 12,
+            restored_blocks_total: 8,
+            eviction_failures: 0,
+            restoration_failures: 0,
+            background_eviction_count: 2,
+            policy_stats: HashMap::new(),
+            eviction_latency: LatencyHistogram::default(),
+            restoration_latency: LatencyHistogram::default(),
         };
         let summary = m.to_ufs_summary();
         assert_eq!(summary.sample_count, 1);
@@ -206,6 +321,14 @@ mod tests {
             nvme_blocks: 5,
             eviction_count: 10,
             restoration_count: 7,
+            evicted_blocks_total: 40,
+            restored_blocks_total: 30,
+            eviction_failures: 1,
+            restoration_failures: 0,
+            background_eviction_count: 3,
+            policy_stats: HashMap::new(),
+            eviction_latency: LatencyHistogram::default(),
+            restoration_latency: LatencyHistogram::default(),
         };
         let m2 = m1.clone();
         assert_eq!(m2.ifr, m1.ifr);
@@ -214,5 +337,7 @@ mod tests {
         assert_eq!(m2.rfi, m1.rfi);
         assert_eq!(m2.gpu_blocks, m1.gpu_blocks);
         assert_eq!(m2.eviction_count, m1.eviction_count);
+        assert_eq!(m2.evicted_blocks_total, m1.evicted_blocks_total);
+        assert_eq!(m2.background_eviction_count, m1.background_eviction_count);
     }
 }

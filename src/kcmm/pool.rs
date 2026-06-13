@@ -12,13 +12,16 @@ use cudarc::driver::sys::{self, CUdeviceptr};
 use cudarc::driver::{CudaSlice, DevicePtr};
 use half::f16;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use super::sharing::SharingManager;
 use super::streams::KcmmStreams;
 use super::superblock::{align_up, BlockHandle, LayerKvPool, SuperblockInfo, SUPERBLOCK_SIZE};
 use super::tiering::TieringEngine;
+use super::metrics::KcmmMetrics;
 use crate::cache::cuda_vmm::CudaVmm;
 use crate::cache::fragmentation_tracker::RuntimeFragmentationTracker;
 use crate::config::KcmmConfig;
@@ -60,6 +63,30 @@ pub(crate) struct BlockInfo {
     pub(crate) location: BlockLocation,
 }
 
+// --- Sequence priority ---
+
+/// Priority class for eviction victim selection.
+///
+/// Sequences are evicted in priority order: `Evictable` first,
+/// then `Low`, then `Normal`, then `High`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SequencePriority {
+    /// Can be discarded without restore (e.g. one-shot batch job).
+    Evictable = 0,
+    /// Low-priority: preferred victim under memory pressure.
+    Low = 1,
+    /// Normal priority: default.
+    Normal = 2,
+    /// High-priority: protected, evicted only as last resort.
+    High = 3,
+}
+
+impl Default for SequencePriority {
+    fn default() -> Self {
+        SequencePriority::Normal
+    }
+}
+
 // --- Sequence state ---
 
 /// Per-sequence metadata for KCMM pool tracking.
@@ -78,6 +105,8 @@ pub struct SequenceState {
     /// Number of prefix blocks shared with other sequences.
     /// (Used in step 4; always 0 in step 3.)
     pub shared_prefix_len: usize,
+    /// Eviction priority class.
+    pub priority: SequencePriority,
 }
 
 impl SequenceState {
@@ -88,6 +117,7 @@ impl SequenceState {
             is_active: true,
             last_access: Instant::now(),
             shared_prefix_len: 0,
+            priority: SequencePriority::default(),
         }
     }
 }
@@ -144,6 +174,14 @@ pub struct KcmmPool {
 
     /// Fragmentation tracker for UFS metrics.
     pub fragmentation_tracker: RuntimeFragmentationTracker,
+
+    /// Eviction/restoration metrics (populated by tiering engine).
+    pub metrics: Mutex<KcmmMetrics>,
+
+    /// Background eviction shutdown flag.
+    background_evict_running: AtomicBool,
+    /// Background eviction thread handle.
+    background_evict_handle: Mutex<Option<JoinHandle<()>>>,
 
     /// Number of transformer layers (determines how many per-layer pools).
     pub num_layers: usize,
@@ -229,6 +267,9 @@ impl KcmmPool {
             sharing: None,
             streams,
             fragmentation_tracker: RuntimeFragmentationTracker::new(bytes_per_token_k),
+            metrics: Mutex::new(KcmmMetrics::default()),
+            background_evict_running: AtomicBool::new(false),
+            background_evict_handle: Mutex::new(None),
             num_layers,
             elem_per_block,
             block_bytes,
@@ -544,6 +585,51 @@ impl KcmmPool {
         if seq_idx < seqs.len() {
             seqs[seq_idx].is_active = false;
         }
+    }
+
+    /// Set the eviction priority for a sequence.
+    pub fn set_sequence_priority(&self, seq_idx: usize, priority: SequencePriority) {
+        let mut seqs = self.sequences.lock();
+        if seq_idx < seqs.len() {
+            seqs[seq_idx].priority = priority;
+        }
+    }
+
+    /// Get the eviction priority for a sequence.
+    pub fn sequence_priority(&self, seq_idx: usize) -> SequencePriority {
+        let seqs = self.sequences.lock();
+        if seq_idx < seqs.len() {
+            seqs[seq_idx].priority
+        } else {
+            SequencePriority::Normal
+        }
+    }
+
+    /// Get the block handles for a sequence's resident GPU blocks only.
+    /// Returns (block_idx, BlockHandle) pairs for GpuResident blocks.
+    pub fn sequence_gpu_handles(&self, seq_idx: usize) -> Vec<(u32, crate::kcmm::superblock::BlockHandle)> {
+        let seqs = self.sequences.lock();
+        if seq_idx >= seqs.len() {
+            return Vec::new();
+        }
+        let info = self.block_info.lock();
+        seqs[seq_idx]
+            .block_table
+            .iter()
+            .filter_map(|&bi| {
+                info.get(bi as usize).and_then(|b| {
+                    if let BlockLocation::GpuResident(h, _) = &b.location {
+                        if b.in_use {
+                            Some((bi, *h))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
     }
 
     /// Update sequence length.
@@ -1133,6 +1219,162 @@ impl KcmmPool {
         ratio < threshold
     }
 
+    // --- Metrics recording ---
+
+    /// Record a successful eviction operation.
+    pub fn record_eviction(&self, block_count: usize, latency_us: u64, is_background: bool) {
+        let mut m = self.metrics.lock();
+        m.eviction_count += 1;
+        m.evicted_blocks_total += block_count as u64;
+        m.eviction_latency.record(latency_us);
+        if is_background {
+            m.background_eviction_count += 1;
+        }
+        // Update per-policy stats
+        if let Some(ref tiering) = self.tiering {
+            let policy_name = tiering.current_policy_name();
+            let entry = m.policy_stats.entry(policy_name).or_default();
+            entry.eviction_count += 1;
+            entry.evicted_blocks += block_count as u64;
+            let n = entry.eviction_count as f64;
+            entry.avg_evict_batch_size =
+                (entry.avg_evict_batch_size * (n - 1.0) + block_count as f64) / n;
+        }
+    }
+
+    /// Record a failed eviction operation.
+    pub fn record_eviction_failure(&self) {
+        let mut m = self.metrics.lock();
+        m.eviction_failures += 1;
+    }
+
+    /// Record a successful restoration operation.
+    pub fn record_restoration(&self, block_count: usize, latency_us: u64) {
+        let mut m = self.metrics.lock();
+        m.restoration_count += 1;
+        m.restored_blocks_total += block_count as u64;
+        m.restoration_latency.record(latency_us);
+        // Update per-policy stats
+        if let Some(ref tiering) = self.tiering {
+            let policy_name = tiering.current_policy_name();
+            let entry = m.policy_stats.entry(policy_name).or_default();
+            entry.restoration_count += 1;
+            entry.restored_blocks += block_count as u64;
+        }
+    }
+
+    /// Record a failed restoration operation.
+    pub fn record_restoration_failure(&self) {
+        let mut m = self.metrics.lock();
+        m.restoration_failures += 1;
+    }
+
+    /// Collect a snapshot of the KCMM metrics (including eviction counters).
+    pub fn collect_kcmm_metrics(&self) -> KcmmMetrics {
+        self.metrics.lock().clone()
+    }
+
+    // --- Background eviction ---
+
+    /// Start the background eviction thread.
+    ///
+    /// Periodically checks the low watermark and proactively evicts
+    /// cold blocks before admission-path memory pressure occurs.
+    /// Uses the configured eviction policy to select victims from
+    /// cooled (inactive) sequences.
+    ///
+    /// `pool_arc` must be an `Arc<KcmmPool>` that will outlive the
+    /// background thread. This is typically the same Arc used by the
+    /// FFI handle or the KvCacheBackend.
+    pub fn start_background_eviction(self: &Arc<KcmmPool>) {
+        if self.background_evict_running.swap(true, Ordering::SeqCst) {
+            return; // Already running
+        }
+
+        let pool = Arc::clone(self);
+        let interval =
+            Duration::from_millis(self.config.background_evict_interval_ms);
+        let threshold = self.config.low_watermark_threshold;
+        let batch_size = self.config.max_batch_blocks.min(16);
+
+        let handle = thread::spawn(move || {
+            loop {
+                thread::sleep(interval);
+
+                if !pool.background_evict_running.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                // Skip if tiering is disabled
+                let tiering = match pool.tiering.as_ref() {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                // Check low watermark
+                if !pool.below_low_watermark(threshold) {
+                    continue;
+                }
+
+                // Collect candidates from cooled / inactive sequences.
+                let candidates: Vec<super::superblock::BlockHandle> = {
+                    let seqs = pool.sequences.lock();
+                    let info = pool.block_info.lock();
+                    let mut handles = Vec::new();
+
+                    for seq in seqs.iter() {
+                        if seq.is_active {
+                            continue; // Skip active sequences
+                        }
+                        for &block_idx in &seq.block_table {
+                            if let Some(bi) = info.get(block_idx as usize) {
+                                if let BlockLocation::GpuResident(h, _) = &bi.location {
+                                    if bi.in_use {
+                                        handles.push(*h);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    handles
+                };
+
+                if candidates.is_empty() {
+                    continue;
+                }
+
+                // Evict in background mode
+                let to_evict = batch_size.min(candidates.len());
+                match tiering.evict_blocks_background(&pool, &candidates, to_evict) {
+                    Ok(evicted) => {
+                        if !evicted.is_empty() {
+                            tracing::debug!(
+                                count = evicted.len(),
+                                "KCMM: background eviction completed"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "KCMM: background eviction failed"
+                        );
+                    }
+                }
+            }
+        });
+
+        *self.background_evict_handle.lock() = Some(handle);
+    }
+
+    /// Stop the background eviction thread and wait for it to join.
+    pub fn stop_background_eviction(&self) {
+        self.background_evict_running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.background_evict_handle.lock().take() {
+            let _ = handle.join();
+        }
+    }
+
     // --- Accessors for KvCacheBackend trait ---
 
     /// Tokens per block.
@@ -1620,6 +1862,10 @@ mod tests {
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
                 max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
             };
             let pool = KcmmPool::new(
                 ctx.clone(),
@@ -1646,6 +1892,10 @@ mod tests {
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
                 max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
             };
             let pool = KcmmPool::new(
                 ctx.clone(),
@@ -1936,6 +2186,10 @@ mod tests {
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
                 max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
             };
             // max_seq_len=16384 → max_blocks_per_seq=1024. max_batch=4 → 4096 blocks.
             let pool =
@@ -1963,6 +2217,10 @@ mod tests {
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
                 max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
             };
             let pool = KcmmPool::new(
                 ctx.clone(),

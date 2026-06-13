@@ -290,41 +290,76 @@ impl ContinuousScheduler {
                     // KCMM path: use tiering engine instead of SwapManager
                     #[cfg(feature = "kcmm")]
                     if self.backend.is_kcmm() {
-                        let victim_idx = self.select_victim(running);
-                        if let Some(idx) = victim_idx {
+                        // Calculate how many blocks we need to free.
+                        let free_blocks = self
+                            .backend
+                            .kcmm_pool()
+                            .map(|p| p.free_physical_blocks())
+                            .unwrap_or(0);
+                        let needed_blocks =
+                            blocks_needed.saturating_sub(free_blocks);
+
+                        if needed_blocks == 0 {
+                            // Shouldn't happen (alloc_sequence failed but free
+                            // blocks exist), but handle gracefully.
+                            i += 1;
+                            continue;
+                        }
+
+                        // Collect block-granularity victims across potentially
+                        // multiple sequences, respecting priority order.
+                        let mut evicted_total = 0usize;
+                        let mut victims_seen: usize = 0;
+                        let max_victims = running.len().min(4); // at most 4 victims per attempt
+
+                        while evicted_total < needed_blocks && victims_seen < max_victims {
+                            let victim_idx = self.select_victim(running);
+                            let idx = match victim_idx {
+                                Some(i) => i,
+                                None => break,
+                            };
+                            victims_seen += 1;
+
                             let victim = &running[idx];
-                            tracing::info!(
-                                req_id = victim.req.id,
-                                seq_idx = victim.seq_idx,
-                                blocks = victim.num_blocks,
-                                "KCMM: evicting sequence via tiering engine"
-                            );
+                            let victim_seq_idx = victim.seq_idx;
+
+                            // Collect GPU-resident block handles for this sequence
+                            let candidates: Vec<_> = if let Some(pool) = self.backend.kcmm_pool() {
+                                pool.sequence_gpu_handles(victim_seq_idx)
+                                    .into_iter()
+                                    .map(|(_, h)| h)
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                            if candidates.is_empty() {
+                                // No GPU blocks to evict — skip this victim
+                                continue;
+                            }
+
+                            let to_evict = (needed_blocks - evicted_total).min(candidates.len());
 
                             if let Some(pool) = self.backend.kcmm_pool() {
                                 if let Some(ref tiering) = pool.tiering {
-                                    // Collect block handles for the victim sequence
-                                    let block_table = pool.get_block_table(victim.seq_idx);
-                                    let candidates: Vec<_> = match &block_table {
-                                        Some(bt) => bt.iter()
-                                            .filter_map(|&bi| pool.get_block_handle(bi))
-                                            .collect(),
-                                        None => Vec::new(),
-                                    };
+                                    match tiering.evict_blocks(
+                                        pool,
+                                        &candidates,
+                                        to_evict,
+                                    ) {
+                                        Ok(evicted) => {
+                                            evicted_total += evicted.len();
+                                            tracing::debug!(
+                                                req_id = victim.req.id,
+                                                seq_idx = victim_seq_idx,
+                                                evicted = evicted.len(),
+                                                total_evicted = evicted_total,
+                                                needed = needed_blocks,
+                                                "KCMM: block-granularity eviction via tiering"
+                                            );
 
-                                    if !candidates.is_empty() {
-                                        match tiering.evict_blocks(
-                                            pool,
-                                            &candidates,
-                                            candidates.len(),
-                                        ) {
-                                            Ok(evicted) => {
-                                                tracing::debug!(
-                                                    req_id = victim.req.id,
-                                                    evicted = evicted.len(),
-                                                    "KCMM: sequence evicted to CPU via tiering"
-                                                );
-                                                // Do NOT unregister — blocks stay
-                                                // registered in the pool as CpuResident.
+                                            if evicted.len() >= candidates.len() {
+                                                // Fully evicted: move to swapped
                                                 let v = running.remove(idx);
                                                 self.seq_last_epoch.remove(&v.seq_idx);
                                                 let seq_idx = v.seq_idx;
@@ -338,24 +373,28 @@ impl ContinuousScheduler {
                                                     kv_data: EvictedSeqData::dummy(),
                                                     seq_idx,
                                                 });
-                                                continue; // retry same i
                                             }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    req_id = victim.req.id,
-                                                    "KCMM eviction failed: {e}"
-                                                );
-                                            }
+                                            // If partially evicted: sequence
+                                            // stays in running with remaining
+                                            // GPU-resident blocks.
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                req_id = victim.req.id,
+                                                "KCMM eviction failed: {e}"
+                                            );
                                         }
                                     }
-                                } else {
-                                    tracing::warn!(
-                                        "KCMM: tiering disabled, cannot evict — OOM"
-                                    );
                                 }
                             }
                         }
-                        // KCMM eviction failed or no victim — skip this request
+
+                        if evicted_total >= needed_blocks {
+                            // Freed enough — retry admission
+                            continue;
+                        }
+
+                        // Not enough blocks freed — skip this request
                         i += 1;
                         continue;
                     }
@@ -766,16 +805,27 @@ impl ContinuousScheduler {
     /// Select a victim sequence from the running set for eviction.
     /// Returns the index in the running Vec, or None if no sequence can be evicted.
     ///
-    /// Policy: LRU — the sequence with the smallest (oldest) epoch.
-    /// Among sequences with the same epoch, prefer those with more blocks
-    /// (fewer evictions needed to free a given amount of memory).
+    /// Priority-aware LRU:
+    ///   1. EVICTABLE sequences first (can be discarded without restore)
+    ///   2. LOW priority sequences
+    ///   3. NORMAL priority sequences
+    ///   4. HIGH priority sequences (last resort)
+    ///
+    /// Within each priority tier, uses epoch-based LRU with block-count
+    /// tiebreaker (prefer more blocks → fewer evictions to free memory).
     fn select_victim(&self, running: &[RunningRequest]) -> Option<usize> {
         if running.is_empty() {
             return None;
         }
 
-        // Don't preempt sequences still in Prefill.
-        let mut best: Option<(usize, u64, isize)> = None; // (idx, epoch, -blocks)
+        // Try each priority tier in order.
+        // We fold into a single pass by scoring candidates.
+        // Scoring: (priority_tier, epoch, -blocks) — lower = evict first.
+
+        #[cfg(feature = "kcmm")]
+        let pool = self.backend.kcmm_pool();
+
+        let mut best: Option<(usize, u32, u64, isize)> = None; // (idx, prio_tier, epoch, -blocks)
 
         for (i, r) in running.iter().enumerate() {
             if matches!(r.state, RequestState::Prefill { .. }) {
@@ -785,15 +835,33 @@ impl ContinuousScheduler {
             let epoch = self.seq_last_epoch.get(&r.seq_idx).copied().unwrap_or(0);
             let blocks = -(r.num_blocks as isize);
 
+            // Determine priority tier (0 = evictable, 1 = low, 2 = normal, 3 = high)
+            #[cfg(feature = "kcmm")]
+            let prio_tier: u32 = {
+                if let Some(ref p) = pool {
+                    match p.sequence_priority(r.seq_idx) {
+                        crate::kcmm::pool::SequencePriority::Evictable => 0,
+                        crate::kcmm::pool::SequencePriority::Low => 1,
+                        crate::kcmm::pool::SequencePriority::Normal => 2,
+                        crate::kcmm::pool::SequencePriority::High => 3,
+                    }
+                } else {
+                    2 // default normal
+                }
+            };
+            #[cfg(not(feature = "kcmm"))]
+            let prio_tier: u32 = 2; // normal
+
             match best {
                 None => {
-                    best = Some((i, epoch, blocks));
+                    best = Some((i, prio_tier, epoch, blocks));
                 }
-                Some((_, best_epoch, best_blocks)) => {
-                    if epoch < best_epoch
-                        || (epoch == best_epoch && blocks < best_blocks)
+                Some((_, best_tier, best_epoch, best_blocks)) => {
+                    if prio_tier < best_tier
+                        || (prio_tier == best_tier && epoch < best_epoch)
+                        || (prio_tier == best_tier && epoch == best_epoch && blocks < best_blocks)
                     {
-                        best = Some((i, epoch, blocks));
+                        best = Some((i, prio_tier, epoch, blocks));
                     }
                 }
             }
@@ -804,22 +872,39 @@ impl ContinuousScheduler {
             for (i, r) in running.iter().enumerate() {
                 let epoch = self.seq_last_epoch.get(&r.seq_idx).copied().unwrap_or(0);
                 let blocks = -(r.num_blocks as isize);
+                #[cfg(feature = "kcmm")]
+                let prio_tier: u32 = {
+                    if let Some(ref p) = pool {
+                        match p.sequence_priority(r.seq_idx) {
+                            crate::kcmm::pool::SequencePriority::Evictable => 0,
+                            crate::kcmm::pool::SequencePriority::Low => 1,
+                            crate::kcmm::pool::SequencePriority::Normal => 2,
+                            crate::kcmm::pool::SequencePriority::High => 3,
+                        }
+                    } else {
+                        2
+                    }
+                };
+                #[cfg(not(feature = "kcmm"))]
+                let prio_tier: u32 = 2;
+
                 match best {
                     None => {
-                        best = Some((i, epoch, blocks));
+                        best = Some((i, prio_tier, epoch, blocks));
                     }
-                    Some((_, best_epoch, best_blocks)) => {
-                        if epoch < best_epoch
-                            || (epoch == best_epoch && blocks < best_blocks)
+                    Some((_, best_tier, best_epoch, best_blocks)) => {
+                        if prio_tier < best_tier
+                            || (prio_tier == best_tier && epoch < best_epoch)
+                            || (prio_tier == best_tier && epoch == best_epoch && blocks < best_blocks)
                         {
-                            best = Some((i, epoch, blocks));
+                            best = Some((i, prio_tier, epoch, blocks));
                         }
                     }
                 }
             }
         }
 
-        best.map(|(i, _, _)| i)
+        best.map(|(i, _, _, _)| i)
     }
 }
 

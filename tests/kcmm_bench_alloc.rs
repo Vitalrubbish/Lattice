@@ -64,6 +64,10 @@ fn bench_config(block_size: usize, max_blocks: usize) -> KcmmConfig {
         eviction_policy: "lru".to_string(),
         prefetch_window: 0,
         max_batch_blocks: 0,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
     }
 }
 

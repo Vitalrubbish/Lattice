@@ -759,6 +759,17 @@ fn run_integration_workload(
                 )
             });
             if needs_restore {
+                // Count CpuResident blocks before restore so we can report
+                // block-level restore count (not just sequence-level).
+                let cpu_blocks_before = seq.block_indices.iter()
+                    .filter(|&bi| {
+                        matches!(
+                            pool.get_block_location(*bi),
+                            Some(baseline_llm_os::kcmm::pool::BlockLocation::CpuResident(_))
+                        )
+                    })
+                    .count();
+
                 let mut restored = false;
                 for attempt in 0..=ADMISSION_EVICTION_RETRY_LIMIT {
                     if pool.restore_evicted_blocks(&seq.block_indices).is_ok() {
@@ -769,7 +780,7 @@ fn run_integration_workload(
                             )
                         });
                         if !still_cpu_resident {
-                            restore_count += 1;
+                            restore_count += cpu_blocks_before;
                             restored = true;
                             break;
                         }
@@ -1016,6 +1027,10 @@ fn run_comparison(cfg: &WorkloadConfig) -> (IntegrationResult, IntegrationResult
         eviction_policy: "lru".to_string(),
         prefetch_window: 4,
         max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
     };
 
     let on_config = KcmmConfig {
@@ -1093,6 +1108,10 @@ fn run_comparison_on_first(cfg: &WorkloadConfig) -> (IntegrationResult, Integrat
         eviction_policy: "lru".to_string(),
         prefetch_window: 4,
         max_batch_blocks: 64,
+            low_watermark_threshold: 0.2,
+            background_evict_interval_ms: 100,
+            attention_sink_blocks: 1,
+            recent_window_blocks: 4,
     };
 
     let on_config = KcmmConfig {
