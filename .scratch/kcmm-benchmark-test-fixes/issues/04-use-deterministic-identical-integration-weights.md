@@ -1,6 +1,6 @@
 # Use deterministic identical weights for integration comparisons
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build

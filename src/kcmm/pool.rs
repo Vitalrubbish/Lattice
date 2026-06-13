@@ -8,19 +8,17 @@
 //   - Built-in fragmentation tracking
 
 use anyhow::{anyhow, Result};
-use cudarc::driver::{CudaSlice, DevicePtr};
 use cudarc::driver::sys::{self, CUdeviceptr};
+use cudarc::driver::{CudaSlice, DevicePtr};
 use half::f16;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::superblock::{
-    align_up, BlockHandle, LayerKvPool, SuperblockInfo, SUPERBLOCK_SIZE,
-};
-use super::streams::KcmmStreams;
-use super::tiering::TieringEngine;
 use super::sharing::SharingManager;
+use super::streams::KcmmStreams;
+use super::superblock::{align_up, BlockHandle, LayerKvPool, SuperblockInfo, SUPERBLOCK_SIZE};
+use super::tiering::TieringEngine;
 use crate::cache::cuda_vmm::CudaVmm;
 use crate::cache::fragmentation_tracker::RuntimeFragmentationTracker;
 use crate::config::KcmmConfig;
@@ -283,6 +281,18 @@ impl KcmmPool {
             return Ok(());
         }
 
+        let total_physical = self.total_physical_blocks();
+        let max_physical = self.max_physical_blocks_per_layer();
+        if total_physical >= max_physical {
+            return Err(anyhow!(
+                "KCMM physical block capacity exhausted: total_physical_blocks={} max_physical_blocks_per_layer={} max_blocks_total={} blocks_per_superblock={}",
+                total_physical,
+                max_physical,
+                self.max_blocks_total,
+                self.blocks_per_superblock(),
+            ));
+        }
+
         let num_layers = self.num_layers;
 
         for l in 0..num_layers {
@@ -314,31 +324,33 @@ impl KcmmPool {
         let mut handle: Option<BlockHandle> = None;
 
         for l in 0..num_layers {
-            let h_k = self.k_pools[l]
-                .allocator
-                .try_allocate()
-                .ok_or_else(|| anyhow!("K pool layer {}: no free block after ensure_capacity", l))?;
-            let h_v = self.v_pools[l]
-                .allocator
-                .try_allocate()
-                .ok_or_else(|| anyhow!("V pool layer {}: no free block after ensure_capacity", l))?;
+            let h_k = self.k_pools[l].allocator.try_allocate().ok_or_else(|| {
+                anyhow!("K pool layer {}: no free block after ensure_capacity", l)
+            })?;
+            let h_v = self.v_pools[l].allocator.try_allocate().ok_or_else(|| {
+                anyhow!("V pool layer {}: no free block after ensure_capacity", l)
+            })?;
 
             if let Some(ref first) = handle {
                 assert_eq!(
                     first.superblock_idx, h_k.superblock_idx,
-                    "K pool layer {} superblock_idx mismatch", l
+                    "K pool layer {} superblock_idx mismatch",
+                    l
                 );
                 assert_eq!(
                     first.block_index, h_k.block_index,
-                    "K pool layer {} block_index mismatch", l
+                    "K pool layer {} block_index mismatch",
+                    l
                 );
                 assert_eq!(
                     first.superblock_idx, h_v.superblock_idx,
-                    "V pool layer {} superblock_idx mismatch", l
+                    "V pool layer {} superblock_idx mismatch",
+                    l
                 );
                 assert_eq!(
                     first.block_index, h_v.block_index,
-                    "V pool layer {} block_index mismatch", l
+                    "V pool layer {} block_index mismatch",
+                    l
                 );
             } else {
                 handle = Some(h_k);
@@ -618,13 +630,15 @@ impl KcmmPool {
     /// CUDA kernel.
     pub fn get_all_block_offsets_f16(&self) -> Vec<u64> {
         let info = self.block_info.lock();
-        info.iter().map(|bi| {
-            if bi.in_use {
-                (bi.va_offset / std::mem::size_of::<f16>()) as u64
-            } else {
-                0u64
-            }
-        }).collect()
+        info.iter()
+            .map(|bi| {
+                if bi.in_use {
+                    (bi.va_offset / std::mem::size_of::<f16>()) as u64
+                } else {
+                    0u64
+                }
+            })
+            .collect()
     }
 
     /// Get the block location for a block index.
@@ -827,12 +841,7 @@ impl KcmmPool {
         let sbs = self.k_pools[0].superblocks.lock();
         let sb = sbs
             .get(handle.superblock_idx as usize)
-            .ok_or_else(|| {
-                anyhow!(
-                    "superblock_idx {} out of bounds",
-                    handle.superblock_idx
-                )
-            })?;
+            .ok_or_else(|| anyhow!("superblock_idx {} out of bounds", handle.superblock_idx))?;
         Ok(sb.va_base + handle.block_index as usize * self.block_bytes)
     }
 
@@ -965,15 +974,11 @@ impl KcmmPool {
             let sv = v_base + (src_off * eb) as u64;
 
             unsafe {
-                let r = sys::lib().cuMemcpyDtoDAsync_v2(
-                    dk, sk, nbytes, std::ptr::null_mut(),
-                );
+                let r = sys::lib().cuMemcpyDtoDAsync_v2(dk, sk, nbytes, std::ptr::null_mut());
                 if r != sys::CUresult::CUDA_SUCCESS {
                     return Err(anyhow!("cuMemcpyDtoDAsync K: {:?}", r));
                 }
-                let r = sys::lib().cuMemcpyDtoDAsync_v2(
-                    dv, sv, nbytes, std::ptr::null_mut(),
-                );
+                let r = sys::lib().cuMemcpyDtoDAsync_v2(dv, sv, nbytes, std::ptr::null_mut());
                 if r != sys::CUresult::CUDA_SUCCESS {
                     return Err(anyhow!("cuMemcpyDtoDAsync V: {:?}", r));
                 }
@@ -995,11 +1000,20 @@ impl KcmmPool {
     }
 
     /// Total blocks allocated across all per-layer pools.
+    ///
+    /// Per-layer K and V pools allocate and free in lockstep (see
+    /// CONTEXT.md "Lockstep Allocation"), so every pool has the same
+    /// number of physical blocks. We therefore only need to query one
+    /// representative pool.
     pub fn total_physical_blocks(&self) -> usize {
         self.k_pools[0].allocator.total_blocks_allocated()
     }
 
     /// Free blocks available across all per-layer pools.
+    ///
+    /// Because lockstep allocation keeps the per-layer K/V pools in
+    /// sync, the free-block count is identical in every pool. Querying
+    /// `k_pools[0]` is sufficient; see CONTEXT.md "Lockstep Allocation".
     pub fn free_physical_blocks(&self) -> usize {
         self.k_pools[0].allocator.free_count()
     }
@@ -1007,6 +1021,17 @@ impl KcmmPool {
     /// Blocks per superblock.
     pub fn blocks_per_superblock(&self) -> usize {
         self.k_pools[0].allocator.blocks_per_superblock
+    }
+
+    /// Maximum physical block slots available per layer after rounding the
+    /// logical `max_blocks_total` VA reservation up to CUDA's 2 MiB
+    /// superblock granularity.
+    pub fn max_physical_blocks_per_layer(&self) -> usize {
+        let blocks_per_superblock = self.blocks_per_superblock();
+        if blocks_per_superblock == 0 {
+            return 0;
+        }
+        self.max_blocks_total.div_ceil(blocks_per_superblock) * blocks_per_superblock
     }
 
     /// Superblock count.
@@ -1319,7 +1344,10 @@ mod tests {
 
     #[test]
     fn test_block_location_all_variants_constructible() {
-        let handle = BlockHandle { superblock_idx: 1, block_index: 3 };
+        let handle = BlockHandle {
+            superblock_idx: 1,
+            block_index: 3,
+        };
 
         let gpu = BlockLocation::GpuResident(handle, 0x2000);
         let cpu = BlockLocation::CpuResident(4096);
@@ -1345,7 +1373,10 @@ mod tests {
 
     #[test]
     fn test_block_location_clone() {
-        let handle = BlockHandle { superblock_idx: 7, block_index: 42 };
+        let handle = BlockHandle {
+            superblock_idx: 7,
+            block_index: 42,
+        };
         let loc = BlockLocation::GpuResident(handle, 0xABCD);
         let cloned = loc.clone();
         assert!(matches!(cloned, BlockLocation::GpuResident(_, _)));
@@ -1428,7 +1459,10 @@ mod tests {
             block_index_in_sb: 15,
             in_use: true,
             location: BlockLocation::GpuResident(
-                BlockHandle { superblock_idx: 2, block_index: 15 },
+                BlockHandle {
+                    superblock_idx: 2,
+                    block_index: 15,
+                },
                 0x10000,
             ),
         };
@@ -1477,7 +1511,10 @@ mod tests {
                     block_index_in_sb: idx,
                     in_use: true,
                     location: BlockLocation::GpuResident(
-                        BlockHandle { superblock_idx: 0, block_index: idx },
+                        BlockHandle {
+                            superblock_idx: 0,
+                            block_index: idx,
+                        },
                         (idx * 100) as u64,
                     ),
                 });
@@ -1530,7 +1567,10 @@ mod tests {
                         block_index_in_sb: idx,
                         in_use: true,
                         location: BlockLocation::GpuResident(
-                            BlockHandle { superblock_idx: 0, block_index: idx },
+                            BlockHandle {
+                                superblock_idx: 0,
+                                block_index: idx,
+                            },
                             idx as u64,
                         ),
                     });
@@ -1898,9 +1938,8 @@ mod tests {
                 max_batch_blocks: 64,
             };
             // max_seq_len=16384 → max_blocks_per_seq=1024. max_batch=4 → 4096 blocks.
-            let pool = KcmmPool::new(
-                ctx, config, 22, 4, 64, 4, 16384,
-            ).expect("create pool with large VA");
+            let pool =
+                KcmmPool::new(ctx, config, 22, 4, 64, 4, 16384).expect("create pool with large VA");
 
             let sb_blocks = pool.k_pools[0].allocator.blocks_per_superblock;
             let count = sb_blocks + 10;
@@ -1914,6 +1953,54 @@ mod tests {
         }
 
         #[test]
+        fn test_alloc_stops_at_aligned_physical_capacity() {
+            let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+            let config = KcmmConfig {
+                block_size: 16,
+                max_blocks: 32,
+                cpu_cache_path: String::new(),
+                tiering: false,
+                eviction_policy: "lru".to_string(),
+                prefetch_window: 4,
+                max_batch_blocks: 64,
+            };
+            let pool = KcmmPool::new(
+                ctx.clone(),
+                config,
+                2,  // num_layers, kept small for test speed
+                32, // kv_heads => 64 KiB blocks, 32 blocks per superblock
+                64, // head_dim
+                1,  // max_batch
+                16, // max_seq_len => max_blocks_total = 1
+            )
+            .expect("create small-capacity pool");
+
+            assert_eq!(pool.max_blocks_total, 1);
+            assert_eq!(pool.blocks_per_superblock(), 32);
+            assert_eq!(pool.max_physical_blocks_per_layer(), 32);
+
+            let mut table = Vec::new();
+            for _ in 0..pool.max_physical_blocks_per_layer() {
+                table.push(pool.alloc_block().expect("alloc within aligned capacity"));
+            }
+
+            let err = pool
+                .alloc_block()
+                .expect_err("allocation beyond aligned capacity must fail");
+            assert!(
+                err.to_string()
+                    .contains("physical block capacity exhausted"),
+                "unexpected error: {err:#}"
+            );
+            assert_eq!(
+                pool.total_physical_blocks(),
+                pool.max_physical_blocks_per_layer()
+            );
+
+            pool.free_sequence(&table);
+        }
+
+        #[test]
         fn test_lockstep_invariant() {
             let (_, pool) = make_pool();
             let num_layers = pool.num_layers;
@@ -1923,12 +2010,14 @@ mod tests {
                 assert_eq!(
                     pool.k_pools[0].allocator.free_count(),
                     pool.k_pools[l].allocator.free_count(),
-                    "K pool layer {} diverged", l
+                    "K pool layer {} diverged",
+                    l
                 );
                 assert_eq!(
                     pool.v_pools[0].allocator.free_count(),
                     pool.v_pools[l].allocator.free_count(),
-                    "V pool layer {} diverged", l
+                    "V pool layer {} diverged",
+                    l
                 );
             }
 
@@ -1939,6 +2028,80 @@ mod tests {
                     pool.k_pools[l].allocator.free_count()
                 );
             }
+        }
+
+        /// Regression test for the lockstep allocation invariant across
+        /// allocation, eviction, and free paths.
+        ///
+        /// Per CONTEXT.md "Lockstep Allocation", every per-layer K and V
+        /// pool must report the same `total_blocks_allocated()` and
+        /// `free_count()` at all times. This test exercises the tiering
+        /// eviction path, which returns physical GPU slots to the free
+        /// list, and a partial sequence free, then asserts the invariant.
+        #[test]
+        fn test_lockstep_invariant_after_alloc_evict_free() {
+            let (_ctx, pool, _dir) = make_pool_with_tiering();
+            let tiering = pool.tiering.as_ref().expect("tiering enabled");
+            let num_layers = pool.num_layers;
+
+            // Allocate two sequences so we have blocks to evict and to free.
+            let table1 = pool.alloc_sequence(4).expect("alloc sequence 1");
+            let table2 = pool.alloc_sequence(3).expect("alloc sequence 2");
+
+            // Evict the first two blocks of sequence 1 (GPU -> CPU).
+            let handles1: Vec<BlockHandle> = table1
+                .iter()
+                .map(|&idx| pool.get_block_handle(idx).expect("get handle"))
+                .collect();
+            let evicted = tiering
+                .evict_blocks(&pool, &handles1[..2], 2)
+                .expect("evict blocks");
+            assert_eq!(evicted.len(), 2, "expected two evicted blocks");
+
+            // Free one still-GPU-resident block from sequence 2.
+            pool.free_sequence(&table2[0..1]);
+
+            // Capture the canonical counts from layer 0.
+            let k_total = pool.k_pools[0].allocator.total_blocks_allocated();
+            let v_total = pool.v_pools[0].allocator.total_blocks_allocated();
+            let k_free = pool.k_pools[0].allocator.free_count();
+            let v_free = pool.v_pools[0].allocator.free_count();
+
+            // Every layer must agree with layer 0.
+            for l in 1..num_layers {
+                assert_eq!(
+                    pool.k_pools[l].allocator.total_blocks_allocated(),
+                    k_total,
+                    "K pool layer {} total_blocks_allocated diverged",
+                    l
+                );
+                assert_eq!(
+                    pool.v_pools[l].allocator.total_blocks_allocated(),
+                    v_total,
+                    "V pool layer {} total_blocks_allocated diverged",
+                    l
+                );
+                assert_eq!(
+                    pool.k_pools[l].allocator.free_count(),
+                    k_free,
+                    "K pool layer {} free_count diverged",
+                    l
+                );
+                assert_eq!(
+                    pool.v_pools[l].allocator.free_count(),
+                    v_free,
+                    "V pool layer {} free_count diverged",
+                    l
+                );
+            }
+
+            // K and V pools are also kept in lockstep with each other.
+            assert_eq!(k_total, v_total, "K and V total blocks diverged");
+            assert_eq!(k_free, v_free, "K and V free counts diverged");
+
+            // Clean up.
+            pool.free_sequence(&table1);
+            pool.free_sequence(&table2[1..]);
         }
     }
 }

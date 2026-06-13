@@ -17,7 +17,7 @@
 use baseline_llm_os::cache::backend::KvCacheBackend;
 use baseline_llm_os::config::{KcmmConfig, ModelConfig};
 use baseline_llm_os::cuda::CudaContext;
-use baseline_llm_os::kcmm::pool::KcmmPool;
+use baseline_llm_os::kcmm::{pool::KcmmPool, SUPERBLOCK_SIZE};
 use baseline_llm_os::model::weights::{ModelWeights, RawTensor};
 use baseline_llm_os::model::{LlamaTransformer, Transformer};
 use half::f16;
@@ -86,6 +86,23 @@ impl WorkloadConfig {
         self.block_size_tokens * KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS
     }
 
+    fn per_layer_block_bytes(&self) -> usize {
+        self.block_size_tokens * KV_HEADS * HEAD_DIM * 2
+    }
+
+    fn max_blocks_total(&self) -> usize {
+        self.max_batch * ((self.max_seq_len + self.block_size_tokens - 1) / self.block_size_tokens)
+    }
+
+    fn blocks_per_superblock(&self) -> usize {
+        SUPERBLOCK_SIZE / self.per_layer_block_bytes()
+    }
+
+    fn aligned_physical_block_ceiling(&self) -> usize {
+        let blocks_per_superblock = self.blocks_per_superblock();
+        self.max_blocks_total().div_ceil(blocks_per_superblock) * blocks_per_superblock
+    }
+
     /// Compute the total number of forward steps needed for the workload.
     ///
     /// Covers: last request arrival + max prompt prefill + decode generation + buffer.
@@ -103,6 +120,10 @@ impl WorkloadConfig {
     }
 }
 
+fn aligned_physical_block_ceiling(pool: &KcmmPool) -> usize {
+    pool.max_physical_blocks_per_layer()
+}
+
 // --- Result types ---
 
 #[derive(Debug, Clone)]
@@ -116,31 +137,31 @@ struct StepTiming {
 #[derive(Debug, Clone)]
 struct IntegrationResult {
     /// Requests that reached their target length.
-    completed_full: usize,
+    completed_full: f64,
     /// Requests stopped early because their block table could not grow.
-    capped: usize,
+    capped: f64,
     /// Dynamic arrivals rejected at admission.
-    rejected: usize,
+    rejected: f64,
     /// Requests still active when the fixed simulation window ended.
-    leftover_at_end: usize,
+    leftover_at_end: f64,
     /// Total generated tokens (decode only).
-    total_decode_tokens: usize,
+    total_decode_tokens: f64,
     /// Total completed prompt tokens.
-    total_prompt_tokens: usize,
+    total_prompt_tokens: f64,
     /// Total elapsed wall-clock time (ms).
-    elapsed_ms: u64,
+    elapsed_ms: f64,
     /// Throughput in tokens/sec (prompt + decode).
     tokens_per_sec: f64,
     /// Decode step timings (for P50/P99).
     step_timings: Vec<StepTiming>,
     /// Eviction count (KCMM only).
-    eviction_count: usize,
+    eviction_count: f64,
     /// Restore count (KCMM only).
-    restore_count: usize,
+    restore_count: f64,
     /// Peak concurrent sequences.
-    peak_concurrent: usize,
+    peak_concurrent: f64,
     /// Peak physical GPU blocks in use.
-    peak_blocks: usize,
+    peak_blocks: f64,
 }
 
 // --- Request simulation ---
@@ -728,7 +749,9 @@ fn run_integration_workload(
                 continue;
             }
 
-            // Restore blocks if any are on CPU.
+            // Restore blocks if any are on CPU. Restoring consumes GPU physical
+            // slots too, so at the aligned physical ceiling it may need an
+            // eviction/retry cycle just like decode-time block growth.
             let needs_restore = seq.block_indices.iter().any(|&bi| {
                 matches!(
                     pool.get_block_location(bi),
@@ -736,8 +759,35 @@ fn run_integration_workload(
                 )
             });
             if needs_restore {
-                if pool.restore_evicted_blocks(&seq.block_indices).is_ok() {
-                    restore_count += 1;
+                let mut restored = false;
+                for attempt in 0..=ADMISSION_EVICTION_RETRY_LIMIT {
+                    if pool.restore_evicted_blocks(&seq.block_indices).is_ok() {
+                        let still_cpu_resident = seq.block_indices.iter().any(|&bi| {
+                            matches!(
+                                pool.get_block_location(bi),
+                                Some(baseline_llm_os::kcmm::pool::BlockLocation::CpuResident(_))
+                            )
+                        });
+                        if !still_cpu_resident {
+                            restore_count += 1;
+                            restored = true;
+                            break;
+                        }
+                    }
+
+                    if attempt < ADMISSION_EVICTION_RETRY_LIMIT {
+                        let evicted = evict_coldest_blocks(pool, &all_for_eviction, 4);
+                        if evicted == 0 {
+                            break;
+                        }
+                        eviction_count += evicted;
+                    }
+                }
+
+                if !restored {
+                    cache.unregister_sequence(seq.seq_idx);
+                    capped += 1;
+                    continue;
                 }
             }
             pool.touch(seq.seq_idx);
@@ -837,6 +887,13 @@ fn run_integration_workload(
         }
 
         peak_concurrent = peak_concurrent.max(active.len());
+        // `total_physical_blocks()` returns the per-layer physical block count
+        // (see KcmmPool::total_physical_blocks). Because KcmmPool reserves each
+        // per-layer VA region rounded up to the 2 MiB superblock granularity,
+        // the expected ceiling is `ceil(max_blocks_total / blocks_per_superblock)
+        // * blocks_per_superblock`, not exactly `max_blocks_total`. Values above
+        // that aligned ceiling indicate a real metric/capacity/lockstep bug and
+        // are reported once after the run.
         let used = pool
             .total_physical_blocks()
             .saturating_sub(pool.free_physical_blocks());
@@ -852,28 +909,38 @@ fn run_integration_workload(
         cache.unregister_sequence(seq.seq_idx);
     }
 
-    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    let elapsed_ms = t0.elapsed().as_millis() as f64;
+    let aligned_block_ceiling = aligned_physical_block_ceiling(pool);
+    if peak_blocks > aligned_block_ceiling {
+        println!(
+            "  ⚠️  Peak GPU blocks {} exceeded aligned per-layer capacity {} (max_blocks_total={}, blocks_per_superblock={}); see issue 17.",
+            peak_blocks,
+            aligned_block_ceiling,
+            pool.max_blocks_total,
+            pool.blocks_per_superblock(),
+        );
+    }
     let total_tokens = total_prompt_tokens + total_decode_tokens;
-    let tokens_per_sec = if elapsed_ms > 0 {
-        (total_tokens as f64) / (elapsed_ms as f64 / 1000.0)
+    let tokens_per_sec = if elapsed_ms > 0.0 {
+        (total_tokens as f64) / (elapsed_ms / 1000.0)
     } else {
         0.0
     };
 
     IntegrationResult {
-        completed_full,
-        capped,
-        rejected,
-        leftover_at_end,
-        total_decode_tokens,
-        total_prompt_tokens,
+        completed_full: completed_full as f64,
+        capped: capped as f64,
+        rejected: rejected as f64,
+        leftover_at_end: leftover_at_end as f64,
+        total_decode_tokens: total_decode_tokens as f64,
+        total_prompt_tokens: total_prompt_tokens as f64,
         elapsed_ms,
         tokens_per_sec,
         step_timings,
-        eviction_count,
-        restore_count,
-        peak_concurrent,
-        peak_blocks,
+        eviction_count: eviction_count as f64,
+        restore_count: restore_count as f64,
+        peak_concurrent: peak_concurrent as f64,
+        peak_blocks: peak_blocks as f64,
     }
 }
 
@@ -881,22 +948,30 @@ fn run_integration_workload(
 // GPU ballast — matches TieringEngine staging-buffer overhead
 // ============================================================================
 
-/// Allocate GPU memory equivalent to the TieringEngine's staging buffers
-/// so that the tiering-OFF run has the same physical GPU memory budget as
-/// tiering-ON.  This removes a systematic ~0.5 MiB bias against ON.
+/// Allocate GPU memory equivalent to the TieringEngine's staging buffers.
 ///
-/// Returns `None` if allocation fails (test continues without ballast).
+/// Ballast purpose: when tiering is OFF the TieringEngine is not created, so
+/// its GPU staging buffers are not allocated.  Without this ballast the OFF run
+/// would have more free GPU memory than the ON run, giving OFF an unfair
+/// advantage and invalidating the OFF/ON comparison.  Reserving the same
+/// staging-buffer equivalent memory before creating the OFF pool keeps the
+/// physical GPU budget identical in both configurations.
+///
+/// Ballast size calculation (in f16 elements):
+///   - GPU staging buffer: max_batch_blocks × block_size_tokens × kv_heads × head_dim
+///   - Pointer device array (u64): max_batch_blocks × num_layers × 2, converted
+///     to f16-element equivalent (1 u64 = 8 bytes = 4 f16).
 fn allocate_gpu_ballast(
     ctx: &Arc<CudaContext>,
     cfg: &WorkloadConfig,
-) -> Option<cudarc::driver::CudaSlice<f16>> {
+) -> cudarc::driver::CudaSlice<f16> {
     let max_batch_blocks: usize = 64;
     let elem_per_block = cfg.block_size_tokens * KV_HEADS * HEAD_DIM;
-    // GPU staging: max_batch_blocks × elem_per_block  f16s.
-    // ptrs_dev:    max_batch_blocks × NUM_LAYERS × 2  u64s  → converted to f16-equivalent.
     let ptrs_f16_equiv = max_batch_blocks * NUM_LAYERS * 8; // 1 u64 = 8 B = 4 f16
     let ballast_elems = max_batch_blocks * elem_per_block + ptrs_f16_equiv;
-    ctx.device.alloc_zeros::<f16>(ballast_elems).ok()
+    ctx.device.alloc_zeros::<f16>(ballast_elems).expect(
+        "GPU ballast allocation failed: tiering-OFF would have more available GPU memory than tiering-ON, invalidating the fair OFF/ON comparison. Ensure the test GPU has enough free memory for the TieringEngine staging-buffer equivalent.",
+    )
 }
 
 // ============================================================================
@@ -1067,13 +1142,25 @@ fn run_comparison_on_first(cfg: &WorkloadConfig) -> (IntegrationResult, Integrat
     (off_result, on_result)
 }
 
+/// Per-run metrics captured for statistical reporting.
+#[derive(Debug, Clone)]
+struct ComparisonMetrics {
+    off: IntegrationResult,
+    on: IntegrationResult,
+    /// Tiering ON/OFF throughput ratio for this run.
+    tp_ratio: f64,
+    /// Tiering ON/OFF full-completion capacity ratio for this run.
+    cap_ratio: f64,
+}
+
 /// Run multiple comparisons, alternating run order to cancel out systematic bias.
 fn run_comparison_repeated(
     cfg: &WorkloadConfig,
     runs: usize,
-) -> (IntegrationResult, IntegrationResult) {
+) -> (IntegrationResult, IntegrationResult, Vec<ComparisonMetrics>) {
     let mut off_results: Vec<IntegrationResult> = Vec::with_capacity(runs);
     let mut on_results: Vec<IntegrationResult> = Vec::with_capacity(runs);
+    let mut metrics: Vec<ComparisonMetrics> = Vec::with_capacity(runs);
 
     for i in 0..runs {
         println!("  --- Run {}/{} ---", i + 1, runs);
@@ -1083,6 +1170,18 @@ fn run_comparison_repeated(
         } else {
             run_comparison_on_first(cfg)
         };
+        let tp_ratio = if off.tokens_per_sec > 0.0 {
+            on.tokens_per_sec / off.tokens_per_sec
+        } else {
+            f64::NAN
+        };
+        let cap_ratio = completion_ratio(on.completed_full, off.completed_full);
+        metrics.push(ComparisonMetrics {
+            off: off.clone(),
+            on: on.clone(),
+            tp_ratio,
+            cap_ratio,
+        });
         off_results.push(off);
         on_results.push(on);
     }
@@ -1090,6 +1189,7 @@ fn run_comparison_repeated(
     (
         aggregate_results(&off_results),
         aggregate_results(&on_results),
+        metrics,
     )
 }
 
@@ -1103,25 +1203,27 @@ fn aggregate_results(results: &[IntegrationResult]) -> IntegrationResult {
         return results[0].clone();
     }
 
-    let completed_full = results.iter().map(|r| r.completed_full).sum::<usize>() / results.len();
-    let capped = results.iter().map(|r| r.capped).sum::<usize>() / results.len();
-    let rejected = results.iter().map(|r| r.rejected).sum::<usize>() / results.len();
-    let leftover_at_end = results.iter().map(|r| r.leftover_at_end).sum::<usize>() / results.len();
-    let total_decode_tokens =
-        results.iter().map(|r| r.total_decode_tokens).sum::<usize>() / results.len();
-    let total_prompt_tokens =
-        results.iter().map(|r| r.total_prompt_tokens).sum::<usize>() / results.len();
-    let elapsed_ms = results.iter().map(|r| r.elapsed_ms).sum::<u64>() / results.len() as u64;
-    let total_tokens = (total_prompt_tokens + total_decode_tokens) as f64;
-    let tokens_per_sec = if elapsed_ms > 0 {
-        total_tokens / (elapsed_ms as f64 / 1000.0)
+    let n = results.len() as f64;
+    let completed_full = results.iter().map(|r| r.completed_full).sum::<f64>() / n;
+    let capped = results.iter().map(|r| r.capped).sum::<f64>() / n;
+    let rejected = results.iter().map(|r| r.rejected).sum::<f64>() / n;
+    let leftover_at_end = results.iter().map(|r| r.leftover_at_end).sum::<f64>() / n;
+    let total_decode_tokens = results.iter().map(|r| r.total_decode_tokens).sum::<f64>() / n;
+    let total_prompt_tokens = results.iter().map(|r| r.total_prompt_tokens).sum::<f64>() / n;
+    let elapsed_ms = results.iter().map(|r| r.elapsed_ms).sum::<f64>() / n;
+    let total_tokens = total_prompt_tokens + total_decode_tokens;
+    let tokens_per_sec = if elapsed_ms > 0.0 {
+        total_tokens / (elapsed_ms / 1000.0)
     } else {
         0.0
     };
-    let eviction_count = results.iter().map(|r| r.eviction_count).sum::<usize>() / results.len();
-    let restore_count = results.iter().map(|r| r.restore_count).sum::<usize>() / results.len();
-    let peak_concurrent = results.iter().map(|r| r.peak_concurrent).max().unwrap_or(0);
-    let peak_blocks = results.iter().map(|r| r.peak_blocks).max().unwrap_or(0);
+    let eviction_count = results.iter().map(|r| r.eviction_count).sum::<f64>() / n;
+    let restore_count = results.iter().map(|r| r.restore_count).sum::<f64>() / n;
+    let peak_concurrent = results
+        .iter()
+        .map(|r| r.peak_concurrent)
+        .fold(0.0f64, f64::max);
+    let peak_blocks = results.iter().map(|r| r.peak_blocks).fold(0.0f64, f64::max);
 
     // Merge all step timings for percentile computation.
     let mut step_timings: Vec<StepTiming> = Vec::new();
@@ -1160,10 +1262,30 @@ fn compute_latency_percentiles(timings: &[StepTiming]) -> (u64, u64, u64, u64) {
     (p50, p90, p95, p99)
 }
 
-fn completion_ratio(on: usize, off: usize) -> f64 {
-    if off > 0 {
-        on as f64 / off as f64
-    } else if on > 0 {
+/// Compute P50/P90/P95/P99 step latency as floating-point values.
+fn compute_latency_percentiles_f64(timings: &[StepTiming]) -> (f64, f64, f64, f64) {
+    let (p50, p90, p95, p99) = compute_latency_percentiles(timings);
+    (p50 as f64, p90 as f64, p95 as f64, p99 as f64)
+}
+
+/// Sample mean and sample standard deviation (N-1 denominator).
+fn mean_std(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    if values.len() == 1 {
+        return (mean, 0.0);
+    }
+    let variance =
+        values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
+    (mean, variance.sqrt())
+}
+
+fn completion_ratio(on: f64, off: f64) -> f64 {
+    if off > 0.0 {
+        on / off
+    } else if on > 0.0 {
         f64::INFINITY
     } else {
         f64::NAN
@@ -1171,9 +1293,9 @@ fn completion_ratio(on: usize, off: usize) -> f64 {
 }
 
 fn evictions_per_full_completion(result: &IntegrationResult) -> f64 {
-    if result.completed_full > 0 {
-        result.eviction_count as f64 / result.completed_full as f64
-    } else if result.eviction_count > 0 {
+    if result.completed_full > 0.0 {
+        result.eviction_count / result.completed_full
+    } else if result.eviction_count > 0.0 {
         f64::INFINITY
     } else {
         0.0
@@ -1221,10 +1343,10 @@ fn kcmm_engine_integration_single() {
 
     // Workload config: tight memory, sustained concurrency.
     //   block_size=16, block_bytes=64 KiB (random Xavier-init weights)
-    //   max_batch=16, max_seq_len=640 → max 640 blocks (~40 MiB)
+    //   max_batch=16, max_seq_len=640 → max 640 logical blocks (~40 MiB)
     //   32 requests arrive during the run, each doing 384 decode steps.
     //   At peak concurrency (~step 450-550): 32 seqs × avg ~25 blocks ≈ 800
-    //   blocks needed, exceeding the 640-block pool → triggers eviction.
+    //   blocks needed, exceeding the 640-block pool and triggering eviction.
     //   Re-heating cycle (every 48 steps after step 192) creates cold→hot
     //   transitions that exercise the evict→restore path.
     let cfg = WorkloadConfig {
@@ -1250,12 +1372,19 @@ fn kcmm_engine_integration_single() {
         gpu_budget_mb,
         cfg.total_requests,
     );
+    println!(
+        "pool capacity: max_blocks_total={} blocks_per_superblock={} aligned_physical_ceiling={} per layer",
+        cfg.max_blocks_total(),
+        cfg.blocks_per_superblock(),
+        cfg.aligned_physical_block_ceiling(),
+    );
     println!();
 
-    // Run 2 repetitions (alternating OFF-first / ON-first) to cancel
-    // systematic first-run bias while keeping test duration reasonable.
-    const RUNS: usize = 2;
-    let (off, on) = run_comparison_repeated(&cfg, RUNS);
+    // Run 5 repetitions (alternating OFF-first / ON-first) to cancel
+    // systematic first-run bias and obtain enough samples for a variance
+    // estimate while keeping total runtime reasonable.
+    const RUNS: usize = 5;
+    let (off, on, per_run) = run_comparison_repeated(&cfg, RUNS);
     let off_epfc = evictions_per_full_completion(&off);
     let on_epfc = evictions_per_full_completion(&on);
 
@@ -1267,32 +1396,32 @@ fn kcmm_engine_integration_single() {
     println!("  │  Metric             │  Tiering OFF    │  Tiering ON         │");
     println!("  ├─────────────────────┼─────────────────┼─────────────────────┤");
     println!(
-        "  │  Full completions   │  {:>13}  │  {:>17}  │",
+        "  │  Full completions   │  {:>13.1}  │  {:>17.1}  │",
         off.completed_full, on.completed_full
     );
     println!(
-        "  │  Capped             │  {:>13}  │  {:>17}  │",
+        "  │  Capped             │  {:>13.1}  │  {:>17.1}  │",
         off.capped, on.capped
     );
     println!(
-        "  │  Rejected           │  {:>13}  │  {:>17}  │",
+        "  │  Rejected           │  {:>13.1}  │  {:>17.1}  │",
         off.rejected, on.rejected
     );
     println!(
-        "  │  Leftover at end    │  {:>13}  │  {:>17}  │",
+        "  │  Leftover at end    │  {:>13.1}  │  {:>17.1}  │",
         off.leftover_at_end, on.leftover_at_end
     );
     println!(
-        "  │  Total tokens       │  {:>13}  │  {:>17}  │",
+        "  │  Total tokens       │  {:>13.1}  │  {:>17.1}  │",
         off.total_prompt_tokens + off.total_decode_tokens,
         on.total_prompt_tokens + on.total_decode_tokens,
     );
     println!(
-        "  │  Decode tokens      │  {:>13}  │  {:>17}  │",
+        "  │  Decode tokens      │  {:>13.1}  │  {:>17.1}  │",
         off.total_decode_tokens, on.total_decode_tokens,
     );
     println!(
-        "  │  Elapsed (ms)       │  {:>13}  │  {:>17}  │",
+        "  │  Elapsed (ms)       │  {:>13.1}  │  {:>17.1}  │",
         off.elapsed_ms, on.elapsed_ms,
     );
     println!(
@@ -1300,7 +1429,7 @@ fn kcmm_engine_integration_single() {
         off.tokens_per_sec, on.tokens_per_sec,
     );
     println!(
-        "  │  Peak concurrent    │  {:>13}  │  {:>17}  │",
+        "  │  Peak concurrent    │  {:>13.0}  │  {:>17.0}  │",
         off.peak_concurrent, on.peak_concurrent,
     );
 
@@ -1326,11 +1455,11 @@ fn kcmm_engine_integration_single() {
     );
     println!("  ├─────────────────────┼─────────────────┼─────────────────────┤");
     println!(
-        "  │  Evictions          │  {:>13}  │  {:>17}  │",
+        "  │  Evictions          │  {:>13.1}  │  {:>17.1}  │",
         off.eviction_count, on.eviction_count,
     );
     println!(
-        "  │  Restores           │  {:>13}  │  {:>17}  │",
+        "  │  Restores           │  {:>13.1}  │  {:>17.1}  │",
         off.restore_count, on.restore_count,
     );
     println!(
@@ -1338,7 +1467,7 @@ fn kcmm_engine_integration_single() {
         off_epfc, on_epfc,
     );
     println!(
-        "  │  Peak GPU blocks    │  {:>13}  │  {:>17}  │",
+        "  │  Peak GPU blocks    │  {:>13.0}  │  {:>17.0}  │",
         off.peak_blocks, on.peak_blocks,
     );
     println!("  └─────────────────────┴─────────────────┴─────────────────────┘");
@@ -1347,22 +1476,51 @@ fn kcmm_engine_integration_single() {
     println!();
     println!("  --- Analysis ---");
 
-    // Throughput ratio
+    // Aggregate ratios (used for pass/fail thresholds).
     let tp_ratio = if off.tokens_per_sec > 0.0 {
         on.tokens_per_sec / off.tokens_per_sec
     } else {
         f64::NAN
     };
-    println!("  Throughput ratio:   Tiering ON/OFF = {:.2}×", tp_ratio);
-
-    // Capacity ratio is based on full completions only; capped requests do not count.
     let cap_ratio = completion_ratio(on.completed_full, off.completed_full);
+
+    // Per-run statistics for key comparison metrics.
+    let tp_ratios: Vec<f64> = per_run.iter().map(|m| m.tp_ratio).collect();
+    let cap_ratios: Vec<f64> = per_run.iter().map(|m| m.cap_ratio).collect();
+    let (tp_mean, tp_std) = mean_std(&tp_ratios);
+    let (cap_mean, cap_std) = mean_std(&cap_ratios);
+
+    let off_p50s: Vec<f64> = per_run
+        .iter()
+        .map(|m| compute_latency_percentiles_f64(&m.off.step_timings).0)
+        .collect();
+    let on_p50s: Vec<f64> = per_run
+        .iter()
+        .map(|m| compute_latency_percentiles_f64(&m.on.step_timings).0)
+        .collect();
+    let off_p99s: Vec<f64> = per_run
+        .iter()
+        .map(|m| compute_latency_percentiles_f64(&m.off.step_timings).3)
+        .collect();
+    let on_p99s: Vec<f64> = per_run
+        .iter()
+        .map(|m| compute_latency_percentiles_f64(&m.on.step_timings).3)
+        .collect();
+    let (off_p50_mean, off_p50_std) = mean_std(&off_p50s);
+    let (on_p50_mean, on_p50_std) = mean_std(&on_p50s);
+    let (off_p99_mean, off_p99_std) = mean_std(&off_p99s);
+    let (on_p99_mean, on_p99_std) = mean_std(&on_p99s);
+
     println!(
-        "  Capacity ratio:     Tiering ON/OFF = {:.2}×  ({} vs {} full completions)",
-        cap_ratio, on.completed_full, off.completed_full,
+        "  Throughput ratio:   Tiering ON/OFF = {:.2} ± {:.2}×",
+        tp_mean, tp_std
     );
     println!(
-        "  Outcomes:           OFF full/capped/rejected/leftover = {}/{}/{}/{}; ON = {}/{}/{}/{}",
+        "  Capacity ratio:     Tiering ON/OFF = {:.2} ± {:.2}×  ({:.1} vs {:.1} full completions)",
+        cap_mean, cap_std, on.completed_full, off.completed_full,
+    );
+    println!(
+        "  Outcomes:           OFF full/capped/rejected/leftover = {:.1}/{:.1}/{:.1}/{:.1}; ON = {:.1}/{:.1}/{:.1}/{:.1}",
         off.completed_full,
         off.capped,
         off.rejected,
@@ -1371,6 +1529,18 @@ fn kcmm_engine_integration_single() {
         on.capped,
         on.rejected,
         on.leftover_at_end,
+    );
+    println!();
+    println!("  --- Statistical summary (mean ± std over {RUNS} runs) ---");
+    println!("  Throughput ratio:   {:.2} ± {:.2}×", tp_mean, tp_std);
+    println!("  Capacity ratio:     {:.2} ± {:.2}×", cap_mean, cap_std);
+    println!(
+        "  Step P50 (µs):      OFF = {:.0} ± {:.0}, ON = {:.0} ± {:.0}",
+        off_p50_mean, off_p50_std, on_p50_mean, on_p50_std
+    );
+    println!(
+        "  Step P99 (µs):      OFF = {:.0} ± {:.0}, ON = {:.0} ± {:.0}",
+        off_p99_mean, off_p99_std, on_p99_mean, on_p99_std
     );
 
     // Per-step latency overhead
@@ -1418,9 +1588,9 @@ fn kcmm_engine_integration_single() {
     );
 
     // Tiering activity
-    if on.eviction_count > 0 {
+    if on.eviction_count > 0.0 {
         println!(
-            "  ✅ Tiering active: {} evictions, {} restores",
+            "  ✅ Tiering active: {:.1} evictions, {:.1} restores",
             on.eviction_count, on.restore_count,
         );
         if is_thrashing(&on) {
@@ -1455,12 +1625,12 @@ fn kcmm_engine_integration_single() {
     // Per-step latency should be reasonable — warn if tiering adds >50% overhead
     if off_p50 > 0 {
         let overhead = (on_p50 as f64 / off_p50 as f64) - 1.0;
-        if overhead > 0.5 && on.eviction_count > 0 {
+        if overhead > 0.5 && on.eviction_count > 0.0 {
             println!(
                 "  ⚠️  Tiering adds significant per-step latency overhead ({:.1}%)",
                 overhead * 100.0
             );
-        } else if on.eviction_count > 0 {
+        } else if on.eviction_count > 0.0 {
             println!(
                 "  ✅ Tiering latency overhead is acceptable ({:.1}%)",
                 overhead * 100.0
@@ -1488,6 +1658,7 @@ fn kcmm_engine_integration_sweep() {
     println!(
         "Thrashing metric: evictions/full-completion > {THRASHING_EVICTIONS_PER_FULL_COMPLETION:.1} is THRASH."
     );
+    println!("Repeats per config: 5 alternating OFF-first/ON-first comparisons.");
     println!();
 
     let configs = vec![
@@ -1533,49 +1704,92 @@ fn kcmm_engine_integration_sweep() {
         },
     ];
 
+    const RUNS: usize = 5;
+
     println!(
-        "  {:<52} {:>13} {:>13} {:>7} {:>7} {:>8} {:>7} {:>8}",
+        "  {:<52} {:>13} {:>13} {:>12} {:>12} {:>8} {:>7} {:>8}",
         "Config", "OFF F/C/R/L", "ON F/C/R/L", "TpRatio", "CapRat", "Ev/Full", "Evict", "Status"
     );
-    println!("  {}", "-".repeat(130));
+    println!("  {}", "-".repeat(146));
 
     let mut best_tp = 0.0f64;
     let mut best_label = String::new();
 
     for cfg in &configs {
-        let (off, on) = run_comparison(cfg);
+        let (off, on, per_run) = run_comparison_repeated(cfg, RUNS);
 
-        let tp_ratio = if off.tokens_per_sec > 0.0 {
-            on.tokens_per_sec / off.tokens_per_sec
-        } else {
-            f64::NAN
-        };
-        let cap_ratio = completion_ratio(on.completed_full, off.completed_full);
+        let tp_ratios: Vec<f64> = per_run.iter().map(|m| m.tp_ratio).collect();
+        let cap_ratios: Vec<f64> = per_run.iter().map(|m| m.cap_ratio).collect();
+        let (tp_mean, tp_std) = mean_std(&tp_ratios);
+        let (cap_mean, cap_std) = mean_std(&cap_ratios);
+        let tp_summary = format!("{tp_mean:.2}±{tp_std:.2}x");
+        let cap_summary = format!("{cap_mean:.2}±{cap_std:.2}x");
+
+        let off_p50s: Vec<f64> = per_run
+            .iter()
+            .map(|m| compute_latency_percentiles_f64(&m.off.step_timings).0)
+            .collect();
+        let on_p50s: Vec<f64> = per_run
+            .iter()
+            .map(|m| compute_latency_percentiles_f64(&m.on.step_timings).0)
+            .collect();
+        let off_p99s: Vec<f64> = per_run
+            .iter()
+            .map(|m| compute_latency_percentiles_f64(&m.off.step_timings).3)
+            .collect();
+        let on_p99s: Vec<f64> = per_run
+            .iter()
+            .map(|m| compute_latency_percentiles_f64(&m.on.step_timings).3)
+            .collect();
+        let (off_p50_mean, off_p50_std) = mean_std(&off_p50s);
+        let (on_p50_mean, on_p50_std) = mean_std(&on_p50s);
+        let (off_p99_mean, off_p99_std) = mean_std(&off_p99s);
+        let (on_p99_mean, on_p99_std) = mean_std(&on_p99s);
+
         let on_epfc = evictions_per_full_completion(&on);
-        let status = integration_status(cap_ratio, tp_ratio, &on);
+        let status = integration_status(cap_mean, tp_mean, &on);
         let off_outcomes = format!(
-            "{}/{}/{}/{}",
+            "{:.0}/{:.0}/{:.0}/{:.0}",
             off.completed_full, off.capped, off.rejected, off.leftover_at_end,
         );
         let on_outcomes = format!(
-            "{}/{}/{}/{}",
+            "{:.0}/{:.0}/{:.0}/{:.0}",
             on.completed_full, on.capped, on.rejected, on.leftover_at_end,
         );
 
         println!(
-            "  {:<52} {:>13} {:>13} {:>6.2}× {:>6.2}× {:>8.1} {:>7} {:>8}",
+            "  {:<52} {:>13} {:>13} {:>12} {:>12} {:>8.1} {:>7.0} {:>8}",
             cfg.label(),
             off_outcomes,
             on_outcomes,
-            tp_ratio,
-            cap_ratio,
+            tp_summary,
+            cap_summary,
             on_epfc,
             on.eviction_count,
             status,
         );
+        println!(
+            "  {:<52} max_blocks_total={} blocks_per_superblock={} aligned_physical_ceiling={}",
+            "  physical ceiling",
+            cfg.max_blocks_total(),
+            cfg.blocks_per_superblock(),
+            cfg.aligned_physical_block_ceiling(),
+        );
+        println!(
+            "  {:<52} OFF P50={:.0}±{:.0}us P99={:.0}±{:.0}us; ON P50={:.0}±{:.0}us P99={:.0}±{:.0}us",
+            "  step latency mean±std",
+            off_p50_mean,
+            off_p50_std,
+            off_p99_mean,
+            off_p99_std,
+            on_p50_mean,
+            on_p50_std,
+            on_p99_mean,
+            on_p99_std,
+        );
 
-        if tp_ratio > best_tp && tp_ratio.is_finite() {
-            best_tp = tp_ratio;
+        if tp_mean > best_tp && tp_mean.is_finite() {
+            best_tp = tp_mean;
             best_label = cfg.label();
         }
     }

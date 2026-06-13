@@ -8,8 +8,9 @@
 # eviction/restore counts, and capacity ratio.
 #
 # Usage:
-#   ./scripts/run_kcmm_integration_bench.sh              # Run both tests (debug)
-#   ./scripts/run_kcmm_integration_bench.sh --release    # Optimised build
+#   ./scripts/run_kcmm_integration_bench.sh              # Run both tests (release)
+#   ./scripts/run_kcmm_integration_bench.sh --debug      # Use debug build (faster compile)
+#   ./scripts/run_kcmm_integration_bench.sh --release    # Optimised build (default)
 #   ./scripts/run_kcmm_integration_bench.sh --single     # Single config only
 #   ./scripts/run_kcmm_integration_bench.sh --sweep      # Sweep only
 #   ./scripts/run_kcmm_integration_bench.sh --filter <s> # Run tests matching <s>
@@ -23,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 
 # ── Argument parsing ──
-PROFILE="debug"
+PROFILE="release"
 MODE="both"   # both | single | sweep
 FILTER=""
 
@@ -56,15 +57,17 @@ while [[ $# -gt 0 ]]; do
             echo "  LlamaTransformer + KcmmPool continuous batching workload"
             echo ""
             echo "Options:"
-            echo "  --release   Build with optimisations (slower compile, faster runtime)"
-            echo "  --debug      Build without optimisations (default, faster compile)"
-            echo "  --single     Run single-config benchmark only (~2 min)"
-            echo "  --sweep      Run parameter sweep only (~4 min)"
-            echo "  --filter     Only run tests whose name contains this substring"
+            echo "  --release   Build with optimisations (default, slower compile, faster runtime)"
+            echo "  --debug     Build without optimisations (faster compile, slower runtime)"
+            echo "  --single    Run single-config benchmark only (~4 min; 5 repeats)"
+            echo "  --sweep     Run parameter sweep only (~10-12 min; 5 repeats/config)"
+            echo "  --filter    Only run tests whose name contains this substring"
             echo ""
             echo "Examples:"
-            echo "  $0 --release                  # Full benchmark (single + sweep), optimised"
-            echo "  $0 --single --release         # Quick single-config run"
+            echo "  $0                            # Full benchmark (single + sweep), release build (default)"
+            echo "  $0 --single                   # Quick single-config run, release build (default)"
+            echo "  $0 --debug                    # Full benchmark, debug build"
+            echo "  $0 --single --debug           # Quick single-config run, debug build"
             echo "  $0 --filter single            # Only the single test"
             exit 0
             ;;
@@ -115,7 +118,7 @@ if [ "$MODE" = "both" ] || [ "$MODE" = "single" ]; then
     TESTS+=("kcmm_engine_integration_single|Single Config — detailed P50/P90/P95/P99, eviction metrics")
 fi
 if [ "$MODE" = "both" ] || [ "$MODE" = "sweep" ]; then
-    TESTS+=("kcmm_engine_integration_sweep|Parameter Sweep — 4 configs, block size × pool capacity × prompt dist")
+    TESTS+=("kcmm_engine_integration_sweep|Parameter Sweep — 4 configs × 5 repeats, block size × pool capacity × prompt dist")
 fi
 
 # Apply filter

@@ -361,6 +361,10 @@ fn kcmm_bench_cumemmap_latency() {
 
     println!("\n=== KCMM Benchmark 2c: cuMemMap / cuMemUnmap Latency ===");
     println!("GPU map granularity: {} bytes", vmm.map_granularity);
+    println!(
+        "NOTE: sizes below the GPU map granularity ({}) are skipped because cuMemMap rounds up internally.",
+        vmm.map_granularity
+    );
 
     // Measure across block-relevant sizes (blocks are typically 32-128 KiB,
     // but cuMemMap maps at the superblock granularity of 2 MiB internally).

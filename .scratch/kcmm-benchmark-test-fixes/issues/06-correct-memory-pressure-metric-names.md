@@ -1,6 +1,6 @@
 # Correct memory pressure metric names and throughput reporting
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build

@@ -12,14 +12,14 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice};
-use cudarc::driver::sys;
-use parking_lot::Mutex;
 use crate::config::KcmmConfig;
 use crate::cuda::CudaContext;
 use crate::kcmm::pool::{BlockLocation, KcmmPool};
 use crate::kcmm::superblock::BlockHandle;
+use anyhow::{Context, Result};
+use cudarc::driver::sys;
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice};
+use parking_lot::Mutex;
 
 // --- Eviction policy trait ---
 
@@ -295,8 +295,7 @@ impl CpuSlotAllocator {
             .unwrap_or(self.free_ranges.len());
 
         // Check if we can merge with the preceding range.
-        let merge_prev =
-            insert_idx > 0 && self.free_ranges[insert_idx - 1].end == offset;
+        let merge_prev = insert_idx > 0 && self.free_ranges[insert_idx - 1].end == offset;
         // Check if we can merge with the following range.
         let merge_next =
             insert_idx < self.free_ranges.len() && self.free_ranges[insert_idx].start == end;
@@ -345,7 +344,6 @@ pub struct TieringEngine {
     slot_allocator: Mutex<CpuSlotAllocator>,
 
     // --- Memcpy batching infrastructure ---
-
     /// GPU staging buffer for gather/scatter kernels (f16 elements).
     /// Holds one layer's worth of batched data: `max_batch_blocks × half_count`.
     gpu_staging: Option<CudaSlice<half::f16>>,
@@ -467,9 +465,11 @@ impl TieringEngine {
                     let (gk, sk) = Self::compile_kv_gather_kernels(&dev)?;
                     let half_count = block_bytes / std::mem::size_of::<half::f16>();
                     let gpu_staging_elems = max_batch_blocks * half_count;
-                    let gs = dev.alloc_zeros::<half::f16>(gpu_staging_elems)
+                    let gs = dev
+                        .alloc_zeros::<half::f16>(gpu_staging_elems)
                         .with_context(|| "alloc GPU staging buffer (f16) for memcpy batching")?;
-                    let ptrs = dev.alloc_zeros::<u64>(max_batch_blocks * num_layers * 2)
+                    let ptrs = dev
+                        .alloc_zeros::<u64>(max_batch_blocks * num_layers * 2)
                         .with_context(|| "alloc ptrs device array for gather/scatter kernels")?;
                     (Some(gs), Some(ptrs), Some(gk), Some(sk), Some(dev))
                 } else {
@@ -506,9 +506,7 @@ impl TieringEngine {
     }
 
     /// Compile the gather/scatter KV kernels via NVRTC.
-    fn compile_kv_gather_kernels(
-        device: &Arc<CudaDevice>,
-    ) -> Result<(CudaFunction, CudaFunction)> {
+    fn compile_kv_gather_kernels(device: &Arc<CudaDevice>) -> Result<(CudaFunction, CudaFunction)> {
         let mut include_paths = vec!["/usr/include".into()];
         let cuda_home = std::env::var("CUDA_HOME")
             .or_else(|_| std::env::var("CUDA_PATH"))
@@ -665,10 +663,7 @@ impl TieringEngine {
         pool.release_block_physical(ctx.block_idx)?;
 
         // Mark as CpuResident
-        pool.set_block_location(
-            ctx.block_idx,
-            BlockLocation::CpuResident(ctx.cpu_offset),
-        )?;
+        pool.set_block_location(ctx.block_idx, BlockLocation::CpuResident(ctx.cpu_offset))?;
 
         tracing::debug!(
             ctx.block_idx,
@@ -723,7 +718,10 @@ impl TieringEngine {
         }
 
         // 1. Select victims
-        let victims = self.eviction_policy.lock().select_victims(candidates, count);
+        let victims = self
+            .eviction_policy
+            .lock()
+            .select_victims(candidates, count);
         if victims.is_empty() {
             return Ok(Vec::new());
         }
@@ -741,9 +739,9 @@ impl TieringEngine {
         // 2. Phase 1 — Submit all async D2H copies
         let mut pending: Vec<EvictContext> = Vec::with_capacity(victims.len());
         for &victim in &victims {
-            let block_idx = pool.find_block_idx(victim).ok_or_else(|| {
-                anyhow::anyhow!("victim block {:?} not found in pool", victim)
-            })?;
+            let block_idx = pool
+                .find_block_idx(victim)
+                .ok_or_else(|| anyhow::anyhow!("victim block {:?} not found in pool", victim))?;
 
             match self.evict_submit_async(pool, block_idx, victim) {
                 Ok(ctx) => pending.push(ctx),
@@ -849,9 +847,9 @@ impl TieringEngine {
         // --- Phase 1: Alloc CPU slots + mark Evicting ---
         let mut pending: Vec<EvictContext> = Vec::with_capacity(n);
         for &victim in victims {
-            let block_idx = pool.find_block_idx(victim).ok_or_else(|| {
-                anyhow::anyhow!("victim block {:?} not found in pool", victim)
-            })?;
+            let block_idx = pool
+                .find_block_idx(victim)
+                .ok_or_else(|| anyhow::anyhow!("victim block {:?} not found in pool", victim))?;
 
             let cpu_offset = match self.alloc_cpu_slot(per_block_bytes) {
                 Ok(off) => off,
@@ -890,8 +888,7 @@ impl TieringEngine {
         // then launch one gather kernel per layer with the appropriate offset
         // into the pre-allocated device array.  ptrs_dev is allocated once in
         // TieringEngine::new() with enough capacity for all layers.
-        let ptrs_dev = self.ptrs_dev.as_ref()
-            .context("ptrs_dev not initialised")?;
+        let ptrs_dev = self.ptrs_dev.as_ref().context("ptrs_dev not initialised")?;
         let ptrs_dev_base = CudaContext::device_ptr(ptrs_dev) as u64;
         let actual_n = pending.len();
         let layers_total = num_layers * 2;
@@ -930,7 +927,8 @@ impl TieringEngine {
         };
         if cu_result != sys::CUresult::CUDA_SUCCESS {
             return Err(anyhow::anyhow!(
-                "cuMemcpyHtoDAsync_v2 (batched ptrs) failed: {:?}", cu_result
+                "cuMemcpyHtoDAsync_v2 (batched ptrs) failed: {:?}",
+                cu_result
             ));
         }
 
@@ -940,7 +938,8 @@ impl TieringEngine {
         for _l in 0..num_layers {
             for _is_v in 0..2 {
                 // Device pointer to this layer's slot: base + layer_idx * max_batch_blocks * 8
-                let ptrs_offset = (layer_idx * self.max_batch_blocks * std::mem::size_of::<u64>()) as u64;
+                let ptrs_offset =
+                    (layer_idx * self.max_batch_blocks * std::mem::size_of::<u64>()) as u64;
 
                 // Launch gather kernel on default stream.
                 // SAFETY: all source VAs are valid GPU addresses allocated by the pool.
@@ -955,12 +954,10 @@ impl TieringEngine {
                 // Batched D2H on default stream: GPU staging → CPU staging[this layer's region].
                 let layer_byte_offset = layer_idx * actual_n * block_bytes;
                 let nbytes = actual_n * block_bytes;
-                let gpu_staging_ptr =
-                    CudaContext::device_ptr(gpu_staging) as sys::CUdeviceptr;
+                let gpu_staging_ptr = CudaContext::device_ptr(gpu_staging) as sys::CUdeviceptr;
                 // SAFETY: cpu_staging is at least layer_byte_offset + nbytes bytes.
-                let dst_ptr = unsafe {
-                    (self.cpu_staging.as_ptr() as *mut u8).add(layer_byte_offset)
-                };
+                let dst_ptr =
+                    unsafe { (self.cpu_staging.as_ptr() as *mut u8).add(layer_byte_offset) };
                 let cu_result = unsafe {
                     sys::lib().cuMemcpyDtoHAsync_v2(
                         dst_ptr as *mut std::ffi::c_void,
@@ -971,7 +968,8 @@ impl TieringEngine {
                 };
                 if cu_result != sys::CUresult::CUDA_SUCCESS {
                     return Err(anyhow::anyhow!(
-                        "cuMemcpyDtoHAsync_v2 (staging) failed: {:?}", cu_result
+                        "cuMemcpyDtoHAsync_v2 (staging) failed: {:?}",
+                        cu_result
                     ));
                 }
 
@@ -982,7 +980,9 @@ impl TieringEngine {
         // --- Phase 3: Synchronise default stream ---
         // All operations (H2D ptrs, gather kernel, D2H staging) were submitted
         // on the default stream.  One synchronize waits for all layers.
-        device.synchronize().context("batched evict default-stream synchronize")?;
+        device
+            .synchronize()
+            .context("batched evict default-stream synchronize")?;
 
         // --- Phase 4: CPU scatter — staging → per-block CPU slots ---
         // CPU staging layout: [batch_K0][batch_V0][batch_K1][batch_V1]
@@ -1117,10 +1117,8 @@ impl TieringEngine {
                 Err(e) => {
                     tracing::warn!(block_idx, cpu_offset, error = %e,
                         "KCMM: GPU alloc failed in batched restore, rolling back");
-                    let _ = pool.set_block_location(
-                        block_idx,
-                        BlockLocation::CpuResident(cpu_offset),
-                    );
+                    let _ =
+                        pool.set_block_location(block_idx, BlockLocation::CpuResident(cpu_offset));
                     continue;
                 }
             };
@@ -1133,10 +1131,7 @@ impl TieringEngine {
             // Update BlockInfo with new physical allocation
             if let Err(e) = pool.update_block_physical(block_idx, va_offset, sb_idx, blk_in_sb) {
                 let _ = pool.release_block_physical(block_idx);
-                let _ = pool.set_block_location(
-                    block_idx,
-                    BlockLocation::CpuResident(cpu_offset),
-                );
+                let _ = pool.set_block_location(block_idx, BlockLocation::CpuResident(cpu_offset));
                 tracing::warn!(block_idx, cpu_offset, error = %e,
                     "KCMM: update_block_physical failed in batched restore, skipping");
                 continue;
@@ -1152,7 +1147,10 @@ impl TieringEngine {
         }
 
         if pending.is_empty() {
-            return Ok(());
+            return Err(anyhow::anyhow!(
+                "batched restore could not allocate GPU physical blocks for any of {} requested blocks",
+                n
+            ));
         }
 
         // --- Phase 2: CPU gather → batched H2D → scatter kernel per layer ---
@@ -1168,8 +1166,7 @@ impl TieringEngine {
         // before the per-layer loop, reducing 44 H2D calls to 1.
         let actual_n = pending.len();
         let layers_total = num_layers * 2;
-        let ptrs_dev = self.ptrs_dev.as_ref()
-            .context("ptrs_dev not initialised")?;
+        let ptrs_dev = self.ptrs_dev.as_ref().context("ptrs_dev not initialised")?;
         let ptrs_dev_base = CudaContext::device_ptr(ptrs_dev) as u64;
 
         // Pre-compute all destination pointer arrays on the CPU side.
@@ -1229,13 +1226,11 @@ impl TieringEngine {
                 // Step 2b: Batched H2D on default stream — CPU staging[this layer] → GPU staging.
                 let layer_byte_offset = layer_idx * actual_n * block_bytes;
                 let nbytes = actual_n * block_bytes;
-                let gpu_staging_ptr =
-                    CudaContext::device_ptr(gpu_staging) as sys::CUdeviceptr;
+                let gpu_staging_ptr = CudaContext::device_ptr(gpu_staging) as sys::CUdeviceptr;
                 let cu_result = unsafe {
                     sys::lib().cuMemcpyHtoDAsync_v2(
                         gpu_staging_ptr,
-                        self.cpu_staging.as_ptr().add(layer_byte_offset)
-                            as *const std::ffi::c_void,
+                        self.cpu_staging.as_ptr().add(layer_byte_offset) as *const std::ffi::c_void,
                         nbytes,
                         std::ptr::null_mut(), // default stream
                     )
@@ -1248,7 +1243,8 @@ impl TieringEngine {
                 }
 
                 // Step 2c: Launch scatter kernel with offset into pre-loaded ptrs_dev.
-                let ptrs_offset = (layer_idx * self.max_batch_blocks * std::mem::size_of::<u64>()) as u64;
+                let ptrs_offset =
+                    (layer_idx * self.max_batch_blocks * std::mem::size_of::<u64>()) as u64;
                 crate::cuda::kernels::launch_kv_scatter(
                     scatter_kernel,
                     gpu_staging,
@@ -1278,17 +1274,17 @@ impl TieringEngine {
             );
             for ctx in &pending {
                 let _ = pool.release_block_physical(ctx.block_idx);
-                let _ = pool.set_block_location(
-                    ctx.block_idx,
-                    BlockLocation::CpuResident(ctx.cpu_offset),
-                );
+                let _ = pool
+                    .set_block_location(ctx.block_idx, BlockLocation::CpuResident(ctx.cpu_offset));
             }
             return Err(anyhow::anyhow!(
-                "batched restore synchronize failed: {:#}", e
+                "batched restore synchronize failed: {:#}",
+                e
             ));
         }
 
         // --- Phase 4: Finalize ---
+        let restored_count = pending.len();
         for ctx in pending {
             let block_idx = ctx.block_idx;
             let new_handle = ctx.new_handle;
@@ -1300,6 +1296,14 @@ impl TieringEngine {
                     "KCMM: restore_finalize failed in batched path"
                 );
             }
+        }
+
+        if restored_count != n {
+            return Err(anyhow::anyhow!(
+                "batched restore only restored {} of {} requested blocks",
+                restored_count,
+                n
+            ));
         }
 
         Ok(())
@@ -1317,11 +1321,7 @@ impl TieringEngine {
     /// must have already verified that each block is in `CpuResident` state.
     ///
     /// Mirrors the auto-dispatch pattern of `evict_blocks`.
-    pub(crate) fn restore_blocks(
-        &self,
-        pool: &KcmmPool,
-        blocks: &[(u32, usize)],
-    ) -> Result<()> {
+    pub(crate) fn restore_blocks(&self, pool: &KcmmPool, blocks: &[(u32, usize)]) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
@@ -1428,10 +1428,9 @@ impl TieringEngine {
                     "KCMM: CRITICAL — failed to release physical block during restore rollback"
                 );
             }
-            if let Err(loc_err) = pool.set_block_location(
-                block_idx,
-                BlockLocation::CpuResident(cpu_offset),
-            ) {
+            if let Err(loc_err) =
+                pool.set_block_location(block_idx, BlockLocation::CpuResident(cpu_offset))
+            {
                 tracing::error!(
                     block_idx,
                     cpu_offset,
@@ -1595,7 +1594,8 @@ mod tests {
         config.cpu_cache_path = path_str.to_string();
         config.max_blocks = 0;
 
-        let engine = TieringEngine::new(&config, 1, 16, None).expect("create engine with zero blocks");
+        let engine =
+            TieringEngine::new(&config, 1, 16, None).expect("create engine with zero blocks");
         assert!(engine.cpu_buffer.is_null());
         assert_eq!(engine.cpu_buffer_size, 0);
 
@@ -1693,7 +1693,10 @@ mod tests {
     // --- Helper to create test BlockHandles ---
 
     fn bh(sb: u32, blk: u32) -> BlockHandle {
-        BlockHandle { superblock_idx: sb, block_index: blk }
+        BlockHandle {
+            superblock_idx: sb,
+            block_index: blk,
+        }
     }
 
     // --- LruPolicy tests ---
@@ -1881,13 +1884,20 @@ mod tests {
             let h2 = bh(0, 2); // accessed 2 times
 
             policy.on_access(h0);
-            for _ in 0..3 { policy.on_access(h1); }
-            for _ in 0..2 { policy.on_access(h2); }
+            for _ in 0..3 {
+                policy.on_access(h1);
+            }
+            for _ in 0..2 {
+                policy.on_access(h2);
+            }
 
             let victims = policy.select_victims(&[h0, h1, h2], 3);
             assert_eq!(victims.len(), 3);
             assert_eq!(victims[0], h0, "least frequent (count=1) should be first");
-            assert_eq!(victims[1], h2, "second least frequent (count=2) should be second");
+            assert_eq!(
+                victims[1], h2,
+                "second least frequent (count=2) should be second"
+            );
             assert_eq!(victims[2], h1, "most frequent (count=3) should be last");
         }
 
@@ -1896,7 +1906,9 @@ mod tests {
             let policy = LfuPolicy::new();
             for i in 0..5 {
                 let h = bh(0, i);
-                for _ in 0..(i + 1) { policy.on_access(h); }
+                for _ in 0..(i + 1) {
+                    policy.on_access(h);
+                }
             }
             let candidates: Vec<BlockHandle> = (0..5).map(|i| bh(0, i)).collect();
             let victims = policy.select_victims(&candidates, 2);
@@ -1951,8 +1963,10 @@ mod tests {
             let h = bh(0, 0);
             // on_access on an untracked block should NOT insert it
             policy.on_access(h);
-            assert!(!policy.alloc_times.lock().contains_key(&h),
-                "FIFO on_access must not insert untracked blocks");
+            assert!(
+                !policy.alloc_times.lock().contains_key(&h),
+                "FIFO on_access must not insert untracked blocks"
+            );
             // on_allocate inserts; on_access should not update
             policy.on_allocate(h);
             let t1 = *policy.alloc_times.lock().get(&h).unwrap();
@@ -2091,7 +2105,10 @@ mod tests {
 
         let victims = engine.eviction_policy.lock().select_victims(&[h0, h1], 1);
         assert_eq!(victims.len(), 1);
-        assert_eq!(victims[0], h0, "LFU should evict least frequent (h0, count=1)");
+        assert_eq!(
+            victims[0], h0,
+            "LFU should evict least frequent (h0, count=1)"
+        );
 
         drop(engine);
         drop(dir);
@@ -2330,9 +2347,9 @@ mod tests {
 
             let config = KcmmConfig {
                 block_size: 16,
-                max_blocks: 256,   // enough for CPU buffer = 256 * 16 * 2 = 8192 bytes
+                max_blocks: 256, // enough for CPU buffer = 256 * 16 * 2 = 8192 bytes
                 cpu_cache_path: path_str,
-                tiering: true,      // enable tiering
+                tiering: true, // enable tiering
                 eviction_policy: "lru".to_string(),
                 prefetch_window: 4,
                 max_batch_blocks: 64,
@@ -2373,7 +2390,9 @@ mod tests {
             assert_eq!(evicted[0], handle);
 
             // Verify location is CpuResident
-            let loc = pool.get_block_location(block_idx).expect("get location after evict");
+            let loc = pool
+                .get_block_location(block_idx)
+                .expect("get location after evict");
             assert!(
                 matches!(loc, BlockLocation::CpuResident(_)),
                 "evicted block should be CpuResident, got {:?}",
@@ -2434,8 +2453,13 @@ mod tests {
             // Offsets should be sequential: 0, total_per_block, 2*total_per_block
             offsets.sort();
             for (i, &off) in offsets.iter().enumerate() {
-                assert_eq!(off, i * total_per_block,
-                    "block {} should be at offset {}", i, i * total_per_block);
+                assert_eq!(
+                    off,
+                    i * total_per_block,
+                    "block {} should be at offset {}",
+                    i,
+                    i * total_per_block
+                );
             }
         }
 
@@ -2484,9 +2508,7 @@ mod tests {
                 .collect();
 
             // Ask for 10 evictions, only 2 available
-            let evicted = tiering
-                .evict_blocks(&pool, &handles, 10)
-                .expect("evict");
+            let evicted = tiering.evict_blocks(&pool, &handles, 10).expect("evict");
             assert_eq!(evicted.len(), 2);
         }
 
@@ -2503,15 +2525,15 @@ mod tests {
                 .collect();
 
             let physical_total_before = pool.total_physical_blocks();
-            let _ = tiering
-                .evict_blocks(&pool, &handles, 2)
-                .expect("evict");
+            let _ = tiering.evict_blocks(&pool, &handles, 2).expect("evict");
 
             // Evicted blocks should NOT reduce total_physical_blocks (we only
             // returned them to the free list — they're still in the superblock).
             let physical_total_after = pool.total_physical_blocks();
-            assert_eq!(physical_total_before, physical_total_after,
-                "physical total should be unchanged after eviction");
+            assert_eq!(
+                physical_total_before, physical_total_after,
+                "physical total should be unchanged after eviction"
+            );
         }
 
         #[test]
@@ -2563,7 +2585,10 @@ mod tests {
             assert_eq!(evicted[0], h0);
 
             // h0 should no longer be tracked by policy (on_evict called)
-            let remaining = tiering.eviction_policy.lock().select_victims(&[h0, h1, h2], 2);
+            let remaining = tiering
+                .eviction_policy
+                .lock()
+                .select_victims(&[h0, h1, h2], 2);
             // h0 should be skipped (no tracking) — only h1, h2 selected
             assert_eq!(remaining.len(), 2);
             assert!(!remaining.contains(&h0));
@@ -2586,20 +2611,15 @@ mod tests {
 
             // Copy pattern to GPU (H2D on evict stream)
             unsafe {
-                pool.streams.evict
-                    .memcpy_h2d_async(
-                        gpu_va_k0,
-                        pattern.as_ptr() as *const u8,
-                        block_bytes,
-                    )
+                pool.streams
+                    .evict
+                    .memcpy_h2d_async(gpu_va_k0, pattern.as_ptr() as *const u8, block_bytes)
                     .expect("h2d memcpy");
             }
             pool.streams.evict.synchronize().expect("sync");
 
             // Evict the block
-            let evicted = tiering
-                .evict_blocks(&pool, &[handle], 1)
-                .expect("evict");
+            let evicted = tiering.evict_blocks(&pool, &[handle], 1).expect("evict");
             assert_eq!(evicted.len(), 1);
 
             // Read back the CPU buffer at the evicted offset
@@ -2616,8 +2636,10 @@ mod tests {
                 std::slice::from_raw_parts(src, num_elements).to_vec()
             };
 
-            assert_eq!(readback, pattern,
-                "CPU buffer should contain the exact pattern written to GPU K layer");
+            assert_eq!(
+                readback, pattern,
+                "CPU buffer should contain the exact pattern written to GPU K layer"
+            );
         }
     }
 
@@ -2666,9 +2688,7 @@ mod tests {
             let block_idx = pool.alloc_block().expect("alloc block");
             let handle = pool.get_block_handle(block_idx).expect("get handle");
 
-            let evicted = tiering
-                .evict_blocks(&pool, &[handle], 1)
-                .expect("evict");
+            let evicted = tiering.evict_blocks(&pool, &[handle], 1).expect("evict");
             assert_eq!(evicted.len(), 1);
 
             // Verify CpuResident
@@ -2685,7 +2705,9 @@ mod tests {
             assert!(va_offset > 0, "restored VA offset should be positive");
 
             // Verify GpuResident
-            let loc = pool.get_block_location(block_idx).expect("get location after restore");
+            let loc = pool
+                .get_block_location(block_idx)
+                .expect("get location after restore");
             assert!(
                 matches!(loc, BlockLocation::GpuResident(_, _)),
                 "should be GpuResident after restore, got {:?}",
@@ -2709,8 +2731,10 @@ mod tests {
             let va_after = pool
                 .restore_evicted_block(block_idx)
                 .expect("restore on GpuResident should be noop");
-            assert_eq!(va_before, va_after,
-                "restore on GpuResident block should return same VA offset");
+            assert_eq!(
+                va_before, va_after,
+                "restore on GpuResident block should return same VA offset"
+            );
 
             // Location should still be GpuResident
             let loc = pool.get_block_location(block_idx).expect("get location");
@@ -2730,9 +2754,7 @@ mod tests {
                 .collect();
 
             // Evict all 3
-            tiering
-                .evict_blocks(&pool, &handles, 3)
-                .expect("evict all");
+            tiering.evict_blocks(&pool, &handles, 3).expect("evict all");
 
             for &h in &handles {
                 let idx = pool.find_block_idx(h).expect("find block");
@@ -2744,9 +2766,7 @@ mod tests {
 
             // Restore each block
             for &idx in &table {
-                let va = pool
-                    .restore_evicted_block(idx)
-                    .expect("restore block");
+                let va = pool.restore_evicted_block(idx).expect("restore block");
                 assert!(va > 0);
                 assert!(matches!(
                     pool.get_block_location(idx).expect("get location"),
@@ -2765,9 +2785,7 @@ mod tests {
             let block_idx = pool.alloc_block().expect("alloc block");
             let handle = pool.get_block_handle(block_idx).expect("get handle");
 
-            tiering
-                .evict_blocks(&pool, &[handle], 1)
-                .expect("evict");
+            tiering.evict_blocks(&pool, &[handle], 1).expect("evict");
 
             let cpu_offset = match pool.get_block_location(block_idx).expect("get location") {
                 BlockLocation::CpuResident(off) => off,
@@ -2779,9 +2797,13 @@ mod tests {
             pool.restore_evicted_block(block_idx).expect("restore");
 
             // Allocate a new CPU slot — should get the same offset back
-            let new_offset = tiering.alloc_cpu_slot(total_per_block).expect("alloc cpu slot");
-            assert_eq!(new_offset, 0,
-                "CPU slot should be freed after restore and reallocatable at offset 0");
+            let new_offset = tiering
+                .alloc_cpu_slot(total_per_block)
+                .expect("alloc cpu slot");
+            assert_eq!(
+                new_offset, 0,
+                "CPU slot should be freed after restore and reallocatable at offset 0"
+            );
         }
 
         #[test]
@@ -2819,7 +2841,8 @@ mod tests {
             assert_eq!(evicted2.len(), 1);
 
             assert!(matches!(
-                pool.get_block_location(block_idx).expect("get location after 2nd evict"),
+                pool.get_block_location(block_idx)
+                    .expect("get location after 2nd evict"),
                 BlockLocation::CpuResident(_)
             ));
         }
@@ -2833,23 +2856,29 @@ mod tests {
             let block_idx = pool.alloc_block().expect("alloc block");
             let handle = pool.get_block_handle(block_idx).expect("get handle");
 
-            tiering
-                .evict_blocks(&pool, &[handle], 1)
-                .expect("evict");
+            tiering.evict_blocks(&pool, &[handle], 1).expect("evict");
 
             // After eviction, the old handle should NOT be tracked by LRU
             let victims = tiering.eviction_policy.lock().select_victims(&[handle], 1);
-            assert!(victims.is_empty(),
-                "evicted block's old handle should not be tracked by policy");
+            assert!(
+                victims.is_empty(),
+                "evicted block's old handle should not be tracked by policy"
+            );
 
             // Restore — policy should be notified (on_access with new handle)
             pool.restore_evicted_block(block_idx).expect("restore");
 
             // The new handle should be tracked by policy (on_access)
             let new_handle = pool.get_block_handle(block_idx).expect("get new handle");
-            let victims = tiering.eviction_policy.lock().select_victims(&[new_handle], 1);
-            assert_eq!(victims.len(), 1,
-                "restored block's new handle should be tracked by policy");
+            let victims = tiering
+                .eviction_policy
+                .lock()
+                .select_victims(&[new_handle], 1);
+            assert_eq!(
+                victims.len(),
+                1,
+                "restored block's new handle should be tracked by policy"
+            );
             assert_eq!(victims[0], new_handle);
         }
 
@@ -2867,41 +2896,38 @@ mod tests {
             let pattern: Vec<u16> = (0..num_elements).map(|i| (i % 256) as u16).collect();
             let gpu_va_k0 = pool.gpu_va_for_block(handle, 0, false).expect("va k0");
             unsafe {
-                pool.streams.evict
-                    .memcpy_h2d_async(
-                        gpu_va_k0,
-                        pattern.as_ptr() as *const u8,
-                        block_bytes,
-                    )
+                pool.streams
+                    .evict
+                    .memcpy_h2d_async(gpu_va_k0, pattern.as_ptr() as *const u8, block_bytes)
                     .expect("h2d memcpy");
             }
             pool.streams.evict.synchronize().expect("sync");
 
             // Evict the block (GPU → CPU)
-            tiering
-                .evict_blocks(&pool, &[handle], 1)
-                .expect("evict");
+            tiering.evict_blocks(&pool, &[handle], 1).expect("evict");
 
             // Restore the block (CPU → GPU)
             pool.restore_evicted_block(block_idx).expect("restore");
 
             // Read back from the NEW GPU location and verify data integrity
             let new_handle = pool.get_block_handle(block_idx).expect("get new handle");
-            let new_gpu_va = pool.gpu_va_for_block(new_handle, 0, false).expect("va k0 new");
+            let new_gpu_va = pool
+                .gpu_va_for_block(new_handle, 0, false)
+                .expect("va k0 new");
 
             let mut readback: Vec<u16> = vec![0u16; num_elements];
             unsafe {
-                pool.streams.restore.memcpy_d2h_async(
-                    readback.as_mut_ptr() as *mut u8,
-                    new_gpu_va,
-                    block_bytes,
-                )
-                .expect("d2h memcpy");
+                pool.streams
+                    .restore
+                    .memcpy_d2h_async(readback.as_mut_ptr() as *mut u8, new_gpu_va, block_bytes)
+                    .expect("d2h memcpy");
             }
             pool.streams.restore.synchronize().expect("sync");
 
-            assert_eq!(readback, pattern,
-                "restored GPU data should match the original pattern (full roundtrip)");
+            assert_eq!(
+                readback, pattern,
+                "restored GPU data should match the original pattern (full roundtrip)"
+            );
         }
 
         #[test]
@@ -2909,7 +2935,10 @@ mod tests {
             let (_ctx, pool, _dir) = make_pool_with_tiering();
 
             let result = pool.restore_evicted_block(999);
-            assert!(result.is_err(), "restore on invalid block index should error");
+            assert!(
+                result.is_err(),
+                "restore on invalid block index should error"
+            );
         }
 
         #[test]
@@ -2944,10 +2973,8 @@ mod tests {
 
     mod gather_scatter_kernels {
         use super::*;
+        use crate::cuda::kernels::{launch_kv_gather, launch_kv_scatter};
         use crate::cuda::CudaContext;
-        use crate::cuda::kernels::{
-            launch_kv_gather, launch_kv_scatter,
-        };
         use cudarc::driver::CudaSlice;
         use half::f16;
         use std::sync::Arc;
@@ -2956,15 +2983,21 @@ mod tests {
         fn setup() -> (Arc<CudaContext>, CudaFunction, CudaFunction) {
             let ctx = Arc::new(CudaContext::new(0).expect("cuda device"));
             let (gather, scatter) =
-                TieringEngine::compile_kv_gather_kernels(&ctx.device)
-                    .expect("compile kernels");
+                TieringEngine::compile_kv_gather_kernels(&ctx.device).expect("compile kernels");
             (ctx, gather, scatter)
         }
 
         /// Fill a GPU buffer with a known pattern and return the pattern.
-        fn fill_pattern(ctx: &CudaContext, slice: &mut CudaSlice<f16>, n: usize, seed: u16) -> Vec<f16> {
+        fn fill_pattern(
+            ctx: &CudaContext,
+            slice: &mut CudaSlice<f16>,
+            n: usize,
+            seed: u16,
+        ) -> Vec<f16> {
             let pattern: Vec<f16> = (0..n)
-                .map(|i| f16::from_f32((i.wrapping_mul(seed as usize).wrapping_add(13) % 1000) as f32))
+                .map(|i| {
+                    f16::from_f32((i.wrapping_mul(seed as usize).wrapping_add(13) % 1000) as f32)
+                })
                 .collect();
             ctx.h2d_sync(&pattern, slice).expect("h2d sync");
             pattern
@@ -2984,30 +3017,48 @@ mod tests {
             let num_blocks = 1;
 
             // Create 1 source buffer with a known pattern
-            let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+            let mut src = ctx
+                .device
+                .alloc_zeros::<f16>(half_count)
+                .expect("alloc src");
             let pattern = fill_pattern(&ctx, &mut src, half_count, 7);
 
             // Build src_ptrs device array
             let src_ptr = CudaContext::device_ptr(&src);
             let src_ptrs_host = vec![src_ptr];
-            let mut src_ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
-            ctx.h2d_sync(&src_ptrs_host, &mut src_ptrs_dev).expect("h2d ptrs");
+            let mut src_ptrs_dev = ctx
+                .device
+                .alloc_zeros::<u64>(num_blocks)
+                .expect("alloc ptrs");
+            ctx.h2d_sync(&src_ptrs_host, &mut src_ptrs_dev)
+                .expect("h2d ptrs");
 
             // Allocate staging buffer
-            let mut staging = ctx.device.alloc_zeros::<f16>(half_count * num_blocks)
+            let mut staging = ctx
+                .device
+                .alloc_zeros::<f16>(half_count * num_blocks)
                 .expect("alloc staging");
 
             // Launch gather
             unsafe {
-                launch_kv_gather(&gather, CudaContext::device_ptr(&src_ptrs_dev) as u64, &mut staging, half_count, num_blocks)
-                    .expect("gather kernel");
+                launch_kv_gather(
+                    &gather,
+                    CudaContext::device_ptr(&src_ptrs_dev) as u64,
+                    &mut staging,
+                    half_count,
+                    num_blocks,
+                )
+                .expect("gather kernel");
             }
             ctx.synchronize().expect("sync");
 
             // Read back staging and verify
             let result = readback(&ctx, &staging, half_count * num_blocks);
-            assert_eq!(&result[..half_count], &pattern[..],
-                "gather single block: data mismatch");
+            assert_eq!(
+                &result[..half_count],
+                &pattern[..],
+                "gather single block: data mismatch"
+            );
         }
 
         #[test]
@@ -3022,22 +3073,36 @@ mod tests {
             let mut ptrs_host: Vec<u64> = Vec::new();
 
             for i in 0..num_blocks {
-                let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+                let mut src = ctx
+                    .device
+                    .alloc_zeros::<f16>(half_count)
+                    .expect("alloc src");
                 let pat = fill_pattern(&ctx, &mut src, half_count, (i as u16 + 1) * 11);
                 ptrs_host.push(CudaContext::device_ptr(&src));
                 patterns.push(pat);
                 srcs.push(src);
             }
 
-            let mut ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+            let mut ptrs_dev = ctx
+                .device
+                .alloc_zeros::<u64>(num_blocks)
+                .expect("alloc ptrs");
             ctx.h2d_sync(&ptrs_host, &mut ptrs_dev).expect("h2d ptrs");
 
-            let mut staging = ctx.device.alloc_zeros::<f16>(half_count * num_blocks)
+            let mut staging = ctx
+                .device
+                .alloc_zeros::<f16>(half_count * num_blocks)
                 .expect("alloc staging");
 
             unsafe {
-                launch_kv_gather(&gather, CudaContext::device_ptr(&ptrs_dev) as u64, &mut staging, half_count, num_blocks)
-                    .expect("gather kernel");
+                launch_kv_gather(
+                    &gather,
+                    CudaContext::device_ptr(&ptrs_dev) as u64,
+                    &mut staging,
+                    half_count,
+                    num_blocks,
+                )
+                .expect("gather kernel");
             }
             ctx.synchronize().expect("sync");
 
@@ -3045,8 +3110,12 @@ mod tests {
             for i in 0..num_blocks {
                 let start = i * half_count;
                 let end = start + half_count;
-                assert_eq!(&result[start..end], &patterns[i][..],
-                    "gather block {}: data mismatch", i);
+                assert_eq!(
+                    &result[start..end],
+                    &patterns[i][..],
+                    "gather block {}: data mismatch",
+                    i
+                );
             }
         }
 
@@ -3057,27 +3126,46 @@ mod tests {
             let num_blocks = 1;
 
             // Create contiguous source with a known pattern
-            let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+            let mut src = ctx
+                .device
+                .alloc_zeros::<f16>(half_count)
+                .expect("alloc src");
             let pattern = fill_pattern(&ctx, &mut src, half_count, 13);
 
             // Create destination buffer (zeroed)
-            let mut dst = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc dst");
+            let mut dst = ctx
+                .device
+                .alloc_zeros::<f16>(half_count)
+                .expect("alloc dst");
             let dst_ptr = CudaContext::device_ptr(&dst);
             let dst_ptrs_host = vec![dst_ptr];
-            let mut dst_ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
-            ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev).expect("h2d ptrs");
+            let mut dst_ptrs_dev = ctx
+                .device
+                .alloc_zeros::<u64>(num_blocks)
+                .expect("alloc ptrs");
+            ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev)
+                .expect("h2d ptrs");
 
             // Launch scatter
             unsafe {
-                launch_kv_scatter(&scatter, &src, CudaContext::device_ptr(&dst_ptrs_dev) as u64, half_count, num_blocks)
-                    .expect("scatter kernel");
+                launch_kv_scatter(
+                    &scatter,
+                    &src,
+                    CudaContext::device_ptr(&dst_ptrs_dev) as u64,
+                    half_count,
+                    num_blocks,
+                )
+                .expect("scatter kernel");
             }
             ctx.synchronize().expect("sync");
 
             // Read back destination and verify
             let result = readback(&ctx, &dst, half_count);
-            assert_eq!(&result[..], &pattern[..],
-                "scatter single block: data mismatch");
+            assert_eq!(
+                &result[..],
+                &pattern[..],
+                "scatter single block: data mismatch"
+            );
         }
 
         #[test]
@@ -3104,23 +3192,40 @@ mod tests {
             let mut dsts: Vec<CudaSlice<f16>> = Vec::new();
             let mut dst_ptrs_host: Vec<u64> = Vec::new();
             for _ in 0..num_blocks {
-                let dst = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc dst");
+                let dst = ctx
+                    .device
+                    .alloc_zeros::<f16>(half_count)
+                    .expect("alloc dst");
                 dst_ptrs_host.push(CudaContext::device_ptr(&dst));
                 dsts.push(dst);
             }
-            let mut dst_ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
-            ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev).expect("h2d ptrs");
+            let mut dst_ptrs_dev = ctx
+                .device
+                .alloc_zeros::<u64>(num_blocks)
+                .expect("alloc ptrs");
+            ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev)
+                .expect("h2d ptrs");
 
             unsafe {
-                launch_kv_scatter(&scatter, &src, CudaContext::device_ptr(&dst_ptrs_dev) as u64, half_count, num_blocks)
-                    .expect("scatter kernel");
+                launch_kv_scatter(
+                    &scatter,
+                    &src,
+                    CudaContext::device_ptr(&dst_ptrs_dev) as u64,
+                    half_count,
+                    num_blocks,
+                )
+                .expect("scatter kernel");
             }
             ctx.synchronize().expect("sync");
 
             for i in 0..num_blocks {
                 let result = readback(&ctx, &dsts[i], half_count);
-                assert_eq!(&result[..], &expected[i][..],
-                    "scatter block {}: data mismatch", i);
+                assert_eq!(
+                    &result[..],
+                    &expected[i][..],
+                    "scatter block {}: data mismatch",
+                    i
+                );
             }
         }
 
@@ -3135,22 +3240,37 @@ mod tests {
             let mut original: Vec<Vec<f16>> = Vec::new();
             let mut src_ptrs_host: Vec<u64> = Vec::new();
             for i in 0..num_blocks {
-                let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+                let mut src = ctx
+                    .device
+                    .alloc_zeros::<f16>(half_count)
+                    .expect("alloc src");
                 let pat = fill_pattern(&ctx, &mut src, half_count, (i as u16 + 3) * 17);
                 src_ptrs_host.push(CudaContext::device_ptr(&src));
                 original.push(pat);
                 srcs.push(src);
             }
 
-            let mut ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+            let mut ptrs_dev = ctx
+                .device
+                .alloc_zeros::<u64>(num_blocks)
+                .expect("alloc ptrs");
 
             // ---- Gather: scattered → contiguous staging ----
-            ctx.h2d_sync(&src_ptrs_host, &mut ptrs_dev).expect("h2d gather ptrs");
-            let mut staging = ctx.device.alloc_zeros::<f16>(half_count * num_blocks)
+            ctx.h2d_sync(&src_ptrs_host, &mut ptrs_dev)
+                .expect("h2d gather ptrs");
+            let mut staging = ctx
+                .device
+                .alloc_zeros::<f16>(half_count * num_blocks)
                 .expect("alloc staging");
             unsafe {
-                launch_kv_gather(&gather, CudaContext::device_ptr(&ptrs_dev) as u64, &mut staging, half_count, num_blocks)
-                    .expect("gather kernel");
+                launch_kv_gather(
+                    &gather,
+                    CudaContext::device_ptr(&ptrs_dev) as u64,
+                    &mut staging,
+                    half_count,
+                    num_blocks,
+                )
+                .expect("gather kernel");
             }
             ctx.synchronize().expect("sync after gather");
 
@@ -3159,24 +3279,41 @@ mod tests {
             let mut dsts: Vec<CudaSlice<f16>> = Vec::new();
             let mut dst_ptrs_host: Vec<u64> = Vec::new();
             for _ in 0..num_blocks {
-                let dst = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc dst");
+                let dst = ctx
+                    .device
+                    .alloc_zeros::<f16>(half_count)
+                    .expect("alloc dst");
                 dst_ptrs_host.push(CudaContext::device_ptr(&dst));
                 dsts.push(dst);
             }
-            let mut dst_ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
-            ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev).expect("h2d scatter ptrs");
+            let mut dst_ptrs_dev = ctx
+                .device
+                .alloc_zeros::<u64>(num_blocks)
+                .expect("alloc ptrs");
+            ctx.h2d_sync(&dst_ptrs_host, &mut dst_ptrs_dev)
+                .expect("h2d scatter ptrs");
 
             unsafe {
-                launch_kv_scatter(&scatter, &staging, CudaContext::device_ptr(&dst_ptrs_dev) as u64, half_count, num_blocks)
-                    .expect("scatter kernel");
+                launch_kv_scatter(
+                    &scatter,
+                    &staging,
+                    CudaContext::device_ptr(&dst_ptrs_dev) as u64,
+                    half_count,
+                    num_blocks,
+                )
+                .expect("scatter kernel");
             }
             ctx.synchronize().expect("sync after scatter");
 
             // Verify roundtrip identity
             for i in 0..num_blocks {
                 let result = readback(&ctx, &dsts[i], half_count);
-                assert_eq!(&result[..], &original[i][..],
-                    "gather-scatter roundtrip block {}: data mismatch", i);
+                assert_eq!(
+                    &result[..],
+                    &original[i][..],
+                    "gather-scatter roundtrip block {}: data mismatch",
+                    i
+                );
             }
         }
 
@@ -3191,30 +3328,48 @@ mod tests {
             let mut _srcs: Vec<CudaSlice<f16>> = Vec::new();
 
             for i in 0..num_blocks {
-                let mut src = ctx.device.alloc_zeros::<f16>(half_count).expect("alloc src");
+                let mut src = ctx
+                    .device
+                    .alloc_zeros::<f16>(half_count)
+                    .expect("alloc src");
                 let pat = fill_pattern(&ctx, &mut src, half_count, (i as u16).wrapping_mul(3));
                 ptrs_host.push(CudaContext::device_ptr(&src));
                 patterns.push(pat);
                 _srcs.push(src);
             }
 
-            let mut ptrs_dev = ctx.device.alloc_zeros::<u64>(num_blocks).expect("alloc ptrs");
+            let mut ptrs_dev = ctx
+                .device
+                .alloc_zeros::<u64>(num_blocks)
+                .expect("alloc ptrs");
             ctx.h2d_sync(&ptrs_host, &mut ptrs_dev).expect("h2d ptrs");
 
-            let mut staging = ctx.device.alloc_zeros::<f16>(half_count * num_blocks)
+            let mut staging = ctx
+                .device
+                .alloc_zeros::<f16>(half_count * num_blocks)
                 .expect("alloc staging");
 
             unsafe {
-                launch_kv_gather(&gather, CudaContext::device_ptr(&ptrs_dev) as u64, &mut staging, half_count, num_blocks)
-                    .expect("gather kernel max batch");
+                launch_kv_gather(
+                    &gather,
+                    CudaContext::device_ptr(&ptrs_dev) as u64,
+                    &mut staging,
+                    half_count,
+                    num_blocks,
+                )
+                .expect("gather kernel max batch");
             }
             ctx.synchronize().expect("sync");
 
             let result = readback(&ctx, &staging, half_count * num_blocks);
             for i in 0..num_blocks {
                 let start = i * half_count;
-                assert_eq!(&result[start..start + half_count], &patterns[i][..],
-                    "gather max batch block {}: mismatch", i);
+                assert_eq!(
+                    &result[start..start + half_count],
+                    &patterns[i][..],
+                    "gather max batch block {}: mismatch",
+                    i
+                );
             }
         }
     }

@@ -1,6 +1,6 @@
 # Clarify batch eviction amortization statistic
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build

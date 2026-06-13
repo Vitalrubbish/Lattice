@@ -2,6 +2,14 @@
 //
 // KCMM Phase E — Benchmark 1: Block allocation / free throughput.
 //
+// These tests measure the pool-allocator metadata / free-list fast path.
+// The pool is pre-provisioned with superblocks up to `max_blocks`, so a
+// single-block alloc_sequence / free_sequence pair exercises CPU-side
+// bookkeeping inside `KcmmPool` rather than CUDA physical allocation
+// (cuMemMap / cuMemCreate/cuMemRelease) or superblock creation.  A separate
+// slow-path benchmark that deliberately triggers a new superblock allocation
+// is left as future work.
+//
 // Measures the latency of single-block alloc_sequence + free_sequence
 // operations across varying block sizes and pool capacities.
 //
@@ -51,7 +59,7 @@ fn bench_config(block_size: usize, max_blocks: usize) -> KcmmConfig {
     KcmmConfig {
         block_size,
         max_blocks,
-        tiering: false, // no tiering overhead
+        tiering: false,                // no tiering overhead
         cpu_cache_path: String::new(), // not used when tiering is false
         eviction_policy: "lru".to_string(),
         prefetch_window: 0,
@@ -76,12 +84,15 @@ fn kcmm_bench_alloc_throughput() {
     //   block_size=256 → block_bytes = 4*256*64*2 = 131 072 B = 128 KiB
     let block_sizes: &[usize] = &[64, 128, 256];
 
-    println!("\n=== KCMM Benchmark 1: Allocation / Free Throughput ===");
+    println!("\n=== KCMM Benchmark 1: Pool Allocator Metadata / Free-List Path Latency ===");
     println!(
-        "model: kv_heads={kv_heads}, head_dim={head_dim}, num_layers={num_layers}"
+        "  (pool is pre-provisioned; this measures CPU bookkeeping, not CUDA physical allocation)"
     );
-    println!("{:>10} {:>14} {:>12} {:>12} {:>12} {:>12}",
-             "blk_bytes", "pool_blocks", "alloc_p50", "alloc_p99", "free_p50", "free_p99");
+    println!("model: kv_heads={kv_heads}, head_dim={head_dim}, num_layers={num_layers}");
+    println!(
+        "{:>10} {:>14} {:>12} {:>12} {:>12} {:>12}",
+        "blk_bytes", "pool_blocks", "alloc_p50", "alloc_p99", "free_p50", "free_p99"
+    );
     println!("{}", "-".repeat(76));
 
     for &block_size in block_sizes {
@@ -122,7 +133,7 @@ fn kcmm_bench_alloc_throughput() {
         );
     }
 
-    println!("=== End Benchmark 1 ===\n");
+    println!("=== End Pool Allocator Metadata Path Benchmark ===\n");
 }
 
 // --- Pool-size sweep ---
@@ -136,7 +147,7 @@ fn kcmm_bench_alloc_pool_size_sweep() {
     let head_dim = 64;
     let block_size = 128; // 64 KiB blocks
 
-    println!("\n=== KCMM Benchmark 1b: Pool-Size Sweep ===");
+    println!("\n=== KCMM Benchmark 1b: Pool-Size Sweep (Metadata / Free-List Path) ===");
     println!(
         "block_size={block_size} tokens ({blk_bytes} bytes/block)",
         blk_bytes = kv_heads * block_size * head_dim * 2
@@ -156,7 +167,7 @@ fn kcmm_bench_alloc_pool_size_sweep() {
             kv_heads,
             head_dim,
             (max_blocks / 16).max(1), // max_batch
-            256,                        // max_seq_len
+            256,                      // max_seq_len
         )
         .expect("create KcmmPool");
 
@@ -188,18 +199,10 @@ fn kcmm_bench_alloc_concurrent_sequences() {
     let block_size = 128;
 
     let cfg = bench_config(block_size, 4096);
-    let pool = KcmmPool::new(
-        ctx.clone(),
-        cfg,
-        num_layers,
-        kv_heads,
-        head_dim,
-        256,
-        256,
-    )
-    .expect("create KcmmPool");
+    let pool = KcmmPool::new(ctx.clone(), cfg, num_layers, kv_heads, head_dim, 256, 256)
+        .expect("create KcmmPool");
 
-    println!("\n=== KCMM Benchmark 1c: Multi-Sequence Allocation ===");
+    println!("\n=== KCMM Benchmark 1c: Multi-Sequence Allocation (Metadata / Free-List Path) ===");
 
     // Allocate many concurrent sequences, each with 4 blocks (simulates
     // multi-user workload), then free all.  Run multiple rounds for
@@ -221,7 +224,9 @@ fn kcmm_bench_alloc_concurrent_sequences() {
         let t0 = Instant::now();
         let mut all_tables = Vec::with_capacity(concurrency);
         for _ in 0..concurrency {
-            let table = pool.alloc_sequence(blocks_per_seq).expect("multi-seq alloc");
+            let table = pool
+                .alloc_sequence(blocks_per_seq)
+                .expect("multi-seq alloc");
             all_tables.push(table);
         }
         let total_ns = t0.elapsed().as_nanos() as u64;

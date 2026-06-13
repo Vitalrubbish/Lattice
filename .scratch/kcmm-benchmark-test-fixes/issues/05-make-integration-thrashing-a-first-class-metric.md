@@ -1,6 +1,6 @@
 # Make integration thrashing a first-class metric
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build

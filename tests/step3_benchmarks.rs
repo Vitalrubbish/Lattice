@@ -49,12 +49,10 @@ fn step3_max_concurrent_requests() {
     );
     println!(
         "block_bytes={}, blocks_per_superblock={}",
-        cache.block_bytes, cache.blocks_per_superblock()
+        cache.block_bytes,
+        cache.blocks_per_superblock()
     );
-    println!(
-        "prompt lens (cycle): {:?}",
-        prompt_lens
-    );
+    println!("prompt lens (cycle): {:?}", prompt_lens);
 
     // ── Phase 1: admit sequences with initial prompt blocks ──
     let mut admitted = 0usize;
@@ -113,10 +111,16 @@ fn step3_max_concurrent_requests() {
     let stats = cache.stats();
     println!("\nResults:");
     println!("  capacity at workload:     {}", admitted);
-    println!("  total blocks allocated:   {}", stats.total_blocks_allocated);
+    println!(
+        "  total blocks allocated:   {}",
+        stats.total_blocks_allocated
+    );
     println!("  blocks in use:            {}", stats.blocks_in_use);
     println!("  free blocks in pool:      {}", stats.free_blocks_in_pool);
-    println!("  superblocks allocated:    {}", stats.superblocks_allocated);
+    println!(
+        "  superblocks allocated:    {}",
+        stats.superblocks_allocated
+    );
     println!(
         "  physical memory:          {:.2} MiB",
         stats.physical_memory_mib
@@ -179,15 +183,28 @@ fn step3_cumemmap_overhead() {
         .collect();
 
     let iters = 64;
-    
 
     // --- Per-layer mapping benchmark (mimics per-block approach) ---
     let per_layer_sizes = [
-        8192, 16384, 32768, 65536, 131072, 262144, 524288, SUPERBLOCK_SIZE,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+        SUPERBLOCK_SIZE,
     ];
 
     println!("\nPer-call latency vs. mapping size:");
-    println!("  {:>8}  {:>12}  {:>12}", "size", "map (µs)", "unmap (µs)");
+    println!(
+        "  NOTE: GPU map granularity is {} bytes, so only sizes >= {} are measured.",
+        vmm.map_granularity, vmm.map_granularity
+    );
+    println!(
+        "  {:>8}  {:>12}  {:>12}  {:>12}",
+        "size", "map (µs)", "unmap (µs)", "combined (µs)"
+    );
 
     for &size in &per_layer_sizes {
         if size > SUPERBLOCK_SIZE || size < vmm.map_granularity {
@@ -195,7 +212,7 @@ fn step3_cumemmap_overhead() {
         }
         let phys = vmm.create_physical(size).expect("create phys");
 
-        // Warmup
+        // Warmup: separate map and unmap warmup to stabilise both paths.
         for _ in 0..2 {
             for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
                 vmm.map(vk, 0, phys, 0, size).unwrap();
@@ -205,29 +222,46 @@ fn step3_cumemmap_overhead() {
             }
         }
 
-        let start = std::time::Instant::now();
+        // Measure map and unmap separately.
+        let mut map_elapsed = std::time::Duration::ZERO;
+        let mut unmap_elapsed = std::time::Duration::ZERO;
         for _ in 0..iters {
             for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
+                let t0 = std::time::Instant::now();
                 vmm.map(vk, 0, phys, 0, size).unwrap();
+                map_elapsed += t0.elapsed();
+
+                let t0 = std::time::Instant::now();
                 vmm.map(vv, 0, phys, 0, size).unwrap();
+                map_elapsed += t0.elapsed();
+
+                let t0 = std::time::Instant::now();
                 vmm.unmap(vk, 0, size).unwrap();
+                unmap_elapsed += t0.elapsed();
+
+                let t0 = std::time::Instant::now();
                 vmm.unmap(vv, 0, size).unwrap();
+                unmap_elapsed += t0.elapsed();
             }
         }
-        let elapsed = start.elapsed();
-        let total_ops = iters * num_layers * 2 * 2; // map+unmap × K+V
-        let avg_us = elapsed.as_micros() as f64 / total_ops as f64;
+        let map_ops = iters * num_layers * 2;
+        let unmap_ops = iters * num_layers * 2;
+        let map_avg_us = map_elapsed.as_micros() as f64 / map_ops as f64;
+        let unmap_avg_us = unmap_elapsed.as_micros() as f64 / unmap_ops as f64;
+        let combined_us = (map_elapsed.as_micros() + unmap_elapsed.as_micros()) as f64
+            / (map_ops + unmap_ops) as f64;
 
-        println!("  {:>8}  {:>12.2}  {:>12.2}", size, avg_us, avg_us);
+        println!(
+            "  {:>8}  {:>12.2}  {:>12.2}  {:>12.2}",
+            size, map_avg_us, unmap_avg_us, combined_us
+        );
 
         vmm.release_physical(phys).expect("release");
     }
 
     // --- Full superblock (2MB) mapping per layer ---
     println!("\nFull-superblock (2MB) mapping per layer:");
-    let phys = vmm
-        .create_physical(SUPERBLOCK_SIZE)
-        .expect("create phys");
+    let phys = vmm.create_physical(SUPERBLOCK_SIZE).expect("create phys");
 
     // Warmup
     for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
@@ -237,23 +271,40 @@ fn step3_cumemmap_overhead() {
         vmm.unmap(vv, 0, SUPERBLOCK_SIZE).unwrap();
     }
 
-    let start = std::time::Instant::now();
+    let mut map_elapsed = std::time::Duration::ZERO;
+    let mut unmap_elapsed = std::time::Duration::ZERO;
     for _ in 0..iters {
         for (&vk, &vv) in va_k.iter().zip(va_v.iter()) {
+            let t0 = std::time::Instant::now();
             vmm.map(vk, 0, phys, 0, SUPERBLOCK_SIZE).unwrap();
+            map_elapsed += t0.elapsed();
+
+            let t0 = std::time::Instant::now();
             vmm.map(vv, 0, phys, 0, SUPERBLOCK_SIZE).unwrap();
+            map_elapsed += t0.elapsed();
+
+            let t0 = std::time::Instant::now();
             vmm.unmap(vk, 0, SUPERBLOCK_SIZE).unwrap();
+            unmap_elapsed += t0.elapsed();
+
+            let t0 = std::time::Instant::now();
             vmm.unmap(vv, 0, SUPERBLOCK_SIZE).unwrap();
+            unmap_elapsed += t0.elapsed();
         }
     }
-    let elapsed = start.elapsed();
-    let total_ops = iters * num_layers * 2 * 2;
-    let avg_us = elapsed.as_micros() as f64 / total_ops as f64;
-    println!("  avg per 2MB map/unmap:  {:.2} µs", avg_us);
+    let map_ops = iters * num_layers * 2;
+    let unmap_ops = iters * num_layers * 2;
+    let map_avg_us = map_elapsed.as_micros() as f64 / map_ops as f64;
+    let unmap_avg_us = unmap_elapsed.as_micros() as f64 / unmap_ops as f64;
+    let combined_us =
+        (map_elapsed.as_micros() + unmap_elapsed.as_micros()) as f64 / (map_ops + unmap_ops) as f64;
+    println!("  avg per 2MB map:        {:.2} µs", map_avg_us);
+    println!("  avg per 2MB unmap:      {:.2} µs", unmap_avg_us);
+    println!("  avg per 2MB combined:   {:.2} µs", combined_us);
     println!(
-        "  total for {} layers:    {:.2} µs",
+        "  total combined for {} layers:    {:.2} µs",
         num_layers,
-        avg_us * num_layers as f64 * 2.0
+        combined_us * num_layers as f64 * 2.0
     );
 
     // Cleanup

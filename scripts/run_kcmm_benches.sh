@@ -37,6 +37,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --debug    Build and run with debug profile (faster compile, slower runtime)"
+            echo "             Default profile is release."
             echo "  --filter   Only run tests whose name contains this substring"
             exit 0
             ;;

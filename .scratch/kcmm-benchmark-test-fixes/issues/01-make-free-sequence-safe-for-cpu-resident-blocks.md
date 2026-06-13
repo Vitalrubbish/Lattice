@@ -1,6 +1,6 @@
 # Make freeing CpuResident blocks safe
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build

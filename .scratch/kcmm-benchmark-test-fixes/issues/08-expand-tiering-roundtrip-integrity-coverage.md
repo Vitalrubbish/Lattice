@@ -1,6 +1,6 @@
 # Expand tiering roundtrip integrity coverage
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build

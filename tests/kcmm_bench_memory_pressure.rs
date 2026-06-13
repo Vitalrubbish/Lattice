@@ -15,7 +15,7 @@
 use baseline_llm_os::cache::paged_kv::PagedKvCache;
 use baseline_llm_os::config::{KcmmConfig, ModelConfig};
 use baseline_llm_os::cuda::CudaContext;
-use baseline_llm_os::kcmm::pool::KcmmPool;
+use baseline_llm_os::kcmm::pool::{BlockLocation, KcmmPool};
 use baseline_llm_os::kcmm::superblock::BlockHandle;
 use baseline_llm_os::kcmm::tiering::TieringEngine;
 use std::sync::Arc;
@@ -255,7 +255,7 @@ fn evict_coldest_blocks(
     tiering: &TieringEngine,
     seqs: &[TrackedSeq],
     min_count: usize,
-) -> bool {
+) -> usize {
     // Always collect at least MIN_BATCH_FOR_GATHER (8) candidates so the
     // batched eviction path (gather kernel) is used — one synchronise for
     // all victims instead of one per victim.  This cuts synchronise calls
@@ -301,27 +301,54 @@ fn evict_coldest_blocks(
     let scan_us = t_scan.elapsed().as_micros() as u64;
 
     if candidates.is_empty() {
-        return false;
+        return 0;
     }
 
     let handles: Vec<BlockHandle> = candidates.iter().map(|(_, h)| *h).collect();
     let batch_size = handles.len();
 
     let t_evict = Instant::now();
-    let ok = tiering.evict_blocks(pool, &handles, batch_size).is_ok();
+    let evicted_count = match tiering.evict_blocks(pool, &handles, batch_size) {
+        Ok(evicted) => evicted.len(),
+        Err(_) => 0,
+    };
     let evict_us = t_evict.elapsed().as_micros() as u64;
 
     if scan_us + evict_us > 5000 {
         println!(
-            "    [evict detail] batch={}  scan={}µs  evict={}µs  total={}µs",
+            "    [evict detail] batch={} evicted={} scan={}µs  evict={}µs  total={}µs",
             batch_size,
+            evicted_count,
             scan_us,
             evict_us,
             scan_us + evict_us,
         );
     }
 
-    ok
+    evicted_count
+}
+
+fn count_cpu_resident_blocks(pool: &KcmmPool, block_indices: &[u32]) -> usize {
+    block_indices
+        .iter()
+        .filter(|&&idx| {
+            matches!(
+                pool.get_block_location(idx),
+                Some(BlockLocation::CpuResident(_))
+            )
+        })
+        .count()
+}
+
+fn free_sequence_and_account(
+    pool: &KcmmPool,
+    block_table: &[u32],
+    cpu_swap_live_bytes: &mut u64,
+    block_bytes: u64,
+) {
+    let cpu_blocks = count_cpu_resident_blocks(pool, block_table);
+    *cpu_swap_live_bytes = cpu_swap_live_bytes.saturating_sub(cpu_blocks as u64 * block_bytes);
+    pool.free_sequence(block_table);
 }
 
 fn try_alloc_with_eviction(
@@ -330,6 +357,7 @@ fn try_alloc_with_eviction(
     active_seqs: &[TrackedSeq],
     num_blocks: usize,
     eviction_count: &mut usize,
+    cpu_swap_live_bytes: &mut u64,
     peak_cpu_swap: &mut u64,
     block_bytes: u64,
 ) -> Option<Vec<u32>> {
@@ -339,9 +367,11 @@ fn try_alloc_with_eviction(
     }
 
     // Evict to make room, then retry.
-    if evict_coldest_blocks(pool, tiering, active_seqs, num_blocks.max(4)) {
+    let evicted = evict_coldest_blocks(pool, tiering, active_seqs, num_blocks.max(4));
+    if evicted > 0 {
         *eviction_count += 1;
-        *peak_cpu_swap = (*peak_cpu_swap).max((*eviction_count as u64).saturating_mul(block_bytes));
+        *cpu_swap_live_bytes = cpu_swap_live_bytes.saturating_add(evicted as u64 * block_bytes);
+        *peak_cpu_swap = (*peak_cpu_swap).max(*cpu_swap_live_bytes);
     }
 
     pool.alloc_sequence(num_blocks).ok()
@@ -360,6 +390,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
     let mut total_blocks_allocated = 0usize;
     let mut eviction_count = 0usize;
     let mut peak_cpu_swap: u64 = 0;
+    let mut cpu_swap_live_bytes: u64 = 0;
     let mut seq_counter = 0usize;
     let mut eviction_time_us: u64 = 0;
     let mut alloc_time_us: u64 = 0;
@@ -378,6 +409,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
             &active_seqs,
             initial_blocks,
             &mut eviction_count,
+            &mut cpu_swap_live_bytes,
             &mut peak_cpu_swap,
             block_bytes,
         ) {
@@ -440,7 +472,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
             if seq.current_len_tokens >= seq.target_len_tokens {
                 // Complete.
                 if let Some(bt) = pool.get_block_table(seq_idx) {
-                    pool.free_sequence(&bt);
+                    free_sequence_and_account(pool, &bt, &mut cpu_swap_live_bytes, block_bytes);
                 }
                 completed += 1;
                 continue;
@@ -463,10 +495,12 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
                     Err(_) => {
                         // Try eviction, then retry once.
                         let t_evict = Instant::now();
-                        if evict_coldest_blocks(pool, tiering, &still_active, 4) {
+                        let evicted = evict_coldest_blocks(pool, tiering, &still_active, 4);
+                        if evicted > 0 {
                             eviction_count += 1;
-                            peak_cpu_swap = peak_cpu_swap
-                                .max((eviction_count as u64).saturating_mul(block_bytes));
+                            cpu_swap_live_bytes =
+                                cpu_swap_live_bytes.saturating_add(evicted as u64 * block_bytes);
+                            peak_cpu_swap = peak_cpu_swap.max(cpu_swap_live_bytes);
                         }
                         eviction_time_us += t_evict.elapsed().as_micros() as u64;
                         match pool.alloc_block() {
@@ -480,7 +514,12 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
                             Err(_) => {
                                 capped += 1;
                                 if let Some(bt) = pool.get_block_table(seq_idx) {
-                                    pool.free_sequence(&bt);
+                                    free_sequence_and_account(
+                                        pool,
+                                        &bt,
+                                        &mut cpu_swap_live_bytes,
+                                        block_bytes,
+                                    );
                                 }
                             }
                         }
@@ -539,7 +578,7 @@ fn run_kcmm_workload(pool: &KcmmPool, cfg: &WorkloadConfig) -> CapacityResult {
     // Clean up.
     for seq in &active_seqs {
         if let Some(bt) = pool.get_block_table(seq.seq_idx) {
-            pool.free_sequence(&bt);
+            free_sequence_and_account(pool, &bt, &mut cpu_swap_live_bytes, block_bytes);
         }
     }
 
@@ -707,7 +746,7 @@ fn kcmm_bench_memory_pressure_single() {
         baseline.total_blocks_allocated,
     );
     println!(
-        "    elapsed={}ms, elapsed_throughput={:.2} completed/s",
+        "    elapsed={}ms, elapsed_throughput={:.2} completed sequences/s",
         baseline.elapsed_ms, baseline_completed_per_sec,
     );
 
@@ -725,7 +764,7 @@ fn kcmm_bench_memory_pressure_single() {
         kcmm.eviction_count, kcmm.cpu_swap_peak_bytes, kcmm.peak_blocks,
     );
     println!(
-        "    elapsed={}ms, elapsed_throughput={:.2} completed/s",
+        "    elapsed={}ms, elapsed_throughput={:.2} completed sequences/s",
         kcmm.elapsed_ms, kcmm_completed_per_sec,
     );
 
@@ -734,7 +773,7 @@ fn kcmm_bench_memory_pressure_single() {
         kcmm.completed, baseline.completed, completion_ratio,
     );
     println!(
-        "  elapsed_throughput is reported separately: baseline={:.2} completed/s, kcmm={:.2} completed/s",
+        "  elapsed_throughput is reported separately: baseline={:.2} completed sequences/s, kcmm={:.2} completed sequences/s",
         baseline_completed_per_sec, kcmm_completed_per_sec,
     );
 
@@ -838,10 +877,10 @@ fn kcmm_bench_memory_pressure_sweep() {
         "Evict",
         "BaseMs",
         "KcmmMs",
-        "ThrB/s",
-        "ThrK/s"
+        "ComplB/s",
+        "ComplK/s"
     );
-    println!("  {}", "-".repeat(164));
+    println!("  {}", "-".repeat(183));
 
     let mut max_ratio = 0.0f64;
     let mut best_label = String::new();
