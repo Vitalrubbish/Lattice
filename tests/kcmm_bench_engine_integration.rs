@@ -158,6 +158,18 @@ struct IntegrationResult {
     eviction_count: f64,
     /// Restore count (KCMM only).
     restore_count: f64,
+    /// Total blocks evicted (cumulative).
+    evicted_blocks_total: f64,
+    /// Total blocks restored (cumulative).
+    restored_blocks_total: f64,
+    /// Background eviction count.
+    background_eviction_count: f64,
+    /// Average eviction latency (µs).
+    eviction_latency_avg_us: f64,
+    /// Average restoration latency (µs).
+    restoration_latency_avg_us: f64,
+    /// Active eviction policy name.
+    policy_name: String,
     /// Peak concurrent sequences.
     peak_concurrent: f64,
     /// Peak physical GPU blocks in use.
@@ -938,6 +950,26 @@ fn run_integration_workload(
         0.0
     };
 
+    // Collect detailed KCMM eviction metrics if tiering is active.
+    let (evicted_blocks_total, restored_blocks_total, background_eviction_count,
+         eviction_latency_avg_us, restoration_latency_avg_us, policy_name) =
+        if pool.config.tiering {
+            let m = pool.collect_kcmm_metrics();
+            let ev_lat_avg = m.eviction_latency.avg_us();
+            let re_lat_avg = m.restoration_latency.avg_us();
+            let pol_name = pool.tiering.as_ref()
+                .map(|t| t.current_policy_name())
+                .unwrap_or_else(|| "none".to_string());
+            (m.evicted_blocks_total as f64,
+             m.restored_blocks_total as f64,
+             m.background_eviction_count as f64,
+             ev_lat_avg,
+             re_lat_avg,
+             pol_name)
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0.0, "tiering_off".to_string())
+        };
+
     IntegrationResult {
         completed_full: completed_full as f64,
         capped: capped as f64,
@@ -950,6 +982,12 @@ fn run_integration_workload(
         step_timings,
         eviction_count: eviction_count as f64,
         restore_count: restore_count as f64,
+        evicted_blocks_total,
+        restored_blocks_total,
+        background_eviction_count,
+        eviction_latency_avg_us,
+        restoration_latency_avg_us,
+        policy_name,
         peak_concurrent: peak_concurrent as f64,
         peak_blocks: peak_blocks as f64,
     }
@@ -1019,12 +1057,15 @@ fn run_comparison(cfg: &WorkloadConfig) -> (IntegrationResult, IntegrationResult
     let max_blocks =
         cfg.max_batch * ((cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens);
 
+    // Honour KCMM_POLICY env var for policy comparison sweeps.
+    let policy_override = std::env::var("KCMM_POLICY").unwrap_or_else(|_| "lru".to_string());
+
     let off_config = KcmmConfig {
         block_size: cfg.block_size_tokens,
         max_blocks,
         cpu_cache_path: cpu_path.clone(),
         tiering: false,
-        eviction_policy: "lru".to_string(),
+        eviction_policy: policy_override.clone(),
         prefetch_window: 4,
         max_batch_blocks: 64,
             low_watermark_threshold: 0.2,
@@ -1100,12 +1141,15 @@ fn run_comparison_on_first(cfg: &WorkloadConfig) -> (IntegrationResult, Integrat
     let max_blocks =
         cfg.max_batch * ((cfg.max_seq_len + cfg.block_size_tokens - 1) / cfg.block_size_tokens);
 
+    // Honour KCMM_POLICY env var for policy comparison sweeps.
+    let policy_override = std::env::var("KCMM_POLICY").unwrap_or_else(|_| "lru".to_string());
+
     let off_config = KcmmConfig {
         block_size: cfg.block_size_tokens,
         max_blocks,
         cpu_cache_path: cpu_path.clone(),
         tiering: false,
-        eviction_policy: "lru".to_string(),
+        eviction_policy: policy_override.clone(),
         prefetch_window: 4,
         max_batch_blocks: 64,
             low_watermark_threshold: 0.2,
@@ -1238,6 +1282,12 @@ fn aggregate_results(results: &[IntegrationResult]) -> IntegrationResult {
     };
     let eviction_count = results.iter().map(|r| r.eviction_count).sum::<f64>() / n;
     let restore_count = results.iter().map(|r| r.restore_count).sum::<f64>() / n;
+    let evicted_blocks_total = results.iter().map(|r| r.evicted_blocks_total).sum::<f64>() / n;
+    let restored_blocks_total = results.iter().map(|r| r.restored_blocks_total).sum::<f64>() / n;
+    let background_eviction_count = results.iter().map(|r| r.background_eviction_count).sum::<f64>() / n;
+    let eviction_latency_avg_us = results.iter().map(|r| r.eviction_latency_avg_us).sum::<f64>() / n;
+    let restoration_latency_avg_us = results.iter().map(|r| r.restoration_latency_avg_us).sum::<f64>() / n;
+    let policy_name = results.first().map(|r| r.policy_name.clone()).unwrap_or_default();
     let peak_concurrent = results
         .iter()
         .map(|r| r.peak_concurrent)
@@ -1262,6 +1312,12 @@ fn aggregate_results(results: &[IntegrationResult]) -> IntegrationResult {
         step_timings,
         eviction_count,
         restore_count,
+        evicted_blocks_total,
+        restored_blocks_total,
+        background_eviction_count,
+        eviction_latency_avg_us,
+        restoration_latency_avg_us,
+        policy_name,
         peak_concurrent,
         peak_blocks,
     }
@@ -1609,9 +1665,24 @@ fn kcmm_engine_integration_single() {
     // Tiering activity
     if on.eviction_count > 0.0 {
         println!(
-            "  ✅ Tiering active: {:.1} evictions, {:.1} restores",
-            on.eviction_count, on.restore_count,
+            "  ✅ Tiering active:  {:.1} evictions ({:.1} blocks), {:.1} restores ({:.1} blocks)",
+            on.eviction_count, on.evicted_blocks_total,
+            on.restore_count, on.restored_blocks_total,
         );
+        println!(
+            "     Policy:           {}",
+            on.policy_name,
+        );
+        println!(
+            "     Evict latency:    {:.0} µs avg, Restore latency: {:.0} µs avg",
+            on.eviction_latency_avg_us, on.restoration_latency_avg_us,
+        );
+        if on.background_eviction_count > 0.0 {
+            println!(
+                "     Background evict: {:.1} ops",
+                on.background_eviction_count,
+            );
+        }
         if is_thrashing(&on) {
             println!(
                 "  ⚠️  THRASH: {:.1} evictions/full-completion exceeds {:.1}",

@@ -27,6 +27,7 @@ PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 PROFILE="release"
 MODE="both"   # both | single | sweep
 FILTER=""
+POLICY=""     # eviction policy override (lru, lfu, arc, sink_window)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,8 +51,12 @@ while [[ $# -gt 0 ]]; do
             FILTER="$2"
             shift 2
             ;;
+        --policy)
+            POLICY="$2"
+            shift 2
+            ;;
         --help|-h)
-            echo "Usage: $0 [--release|--debug] [--single|--sweep] [--filter <substring>]"
+            echo "Usage: $0 [--release|--debug] [--single|--sweep] [--filter <substring>] [--policy <name>]"
             echo ""
             echo "KCMM §1.6 Engine Integration Benchmark"
             echo "  LlamaTransformer + KcmmPool continuous batching workload"
@@ -62,10 +67,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --single    Run single-config benchmark only (~4 min; 5 repeats)"
             echo "  --sweep     Run parameter sweep only (~10-12 min; 5 repeats/config)"
             echo "  --filter    Only run tests whose name contains this substring"
+            echo "  --policy    Eviction policy override: lru (default), lfu, arc, sink_window"
             echo ""
             echo "Examples:"
             echo "  $0                            # Full benchmark (single + sweep), release build (default)"
             echo "  $0 --single                   # Quick single-config run, release build (default)"
+            echo "  $0 --policy arc --single      # Single-config with ARC policy"
             echo "  $0 --debug                    # Full benchmark, debug build"
             echo "  $0 --single --debug           # Quick single-config run, debug build"
             echo "  $0 --filter single            # Only the single test"
@@ -98,6 +105,10 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RESULTS_DIR="$PROJ_DIR/results/kcmm_engine_integration_${TIMESTAMP}"
 mkdir -p "$RESULTS_DIR"
 
+if [ -n "$POLICY" ]; then
+    export KCMM_POLICY="$POLICY"
+    echo "Policy:  $POLICY"
+fi
 echo "Results: $RESULTS_DIR"
 echo "Profile: $PROFILE"
 echo "Mode:    $MODE"
