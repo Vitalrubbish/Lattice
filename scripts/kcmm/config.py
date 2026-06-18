@@ -1,0 +1,177 @@
+"""Configuration helpers for the KCMM vLLM observer launcher."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from dataclasses import dataclass
+
+from .bindings import KcmmConfig
+
+
+EVICTION_POLICY_CODES = {
+    "lru": 0,
+    "lfu": 1,
+    "fifo": 2,
+}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    return default if raw in (None, "") else int(raw)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    return default if raw in (None, "") else float(raw)
+
+
+@dataclass(frozen=True)
+class ObserverConfig:
+    """KCMM launcher settings for Phase I.C.
+
+    The default model shape is intentionally tiny. Phase I.C only proves that
+    the Python process can create a KCMM CUDA pool beside vLLM and sample its
+    observer metrics; it does not size the pool for the served model yet.
+    """
+
+    library_path: str | None = None
+    device_ordinal: int = 0
+    block_size: int = 16
+    max_blocks: int = 64
+    num_layers: int = 1
+    kv_heads: int = 1
+    head_dim: int = 64
+    max_batch: int = 1
+    max_seq_len: int = 16
+    cpu_cache_path: str = "/dev/shm/kcmm_vllm_observer"
+    enable_tiering: bool = False
+    eviction_policy: str = "lru"
+    prefetch_window: int = 4
+    max_batch_blocks: int = 64
+    low_watermark_threshold: float = 0.2
+    background_evict_interval_ms: int = 100
+    attention_sink_blocks: int = 1
+    recent_window_blocks: int = 4
+    probe_blocks: int = 1
+    observer_only: bool = False
+    skip_observer: bool = False
+    destroy_before_vllm: bool = False
+    print_seams: bool = False
+
+    @classmethod
+    def from_env(cls) -> "ObserverConfig":
+        return cls(
+            library_path=os.environ.get("KCMM_LIB_PATH") or None,
+            device_ordinal=_env_int("KCMM_DEVICE_ORDINAL", 0),
+            block_size=_env_int("KCMM_BLOCK_SIZE", 16),
+            max_blocks=_env_int("KCMM_MAX_BLOCKS", 64),
+            num_layers=_env_int("KCMM_NUM_LAYERS", 1),
+            kv_heads=_env_int("KCMM_KV_HEADS", 1),
+            head_dim=_env_int("KCMM_HEAD_DIM", 64),
+            max_batch=_env_int("KCMM_MAX_BATCH", 1),
+            max_seq_len=_env_int("KCMM_MAX_SEQ_LEN", 16),
+            cpu_cache_path=os.environ.get(
+                "KCMM_CPU_CACHE_PATH", "/dev/shm/kcmm_vllm_observer"
+            ),
+            enable_tiering=_env_bool("KCMM_ENABLE_TIERING", False),
+            eviction_policy=os.environ.get("KCMM_EVICTION_POLICY", "lru"),
+            prefetch_window=_env_int("KCMM_PREFETCH_WINDOW", 4),
+            max_batch_blocks=_env_int("KCMM_MAX_BATCH_BLOCKS", 64),
+            low_watermark_threshold=_env_float("KCMM_LOW_WATERMARK_THRESHOLD", 0.2),
+            background_evict_interval_ms=_env_int(
+                "KCMM_BACKGROUND_EVICT_INTERVAL_MS", 100
+            ),
+            attention_sink_blocks=_env_int("KCMM_ATTENTION_SINK_BLOCKS", 1),
+            recent_window_blocks=_env_int("KCMM_RECENT_WINDOW_BLOCKS", 4),
+            probe_blocks=_env_int("KCMM_PROBE_BLOCKS", 1),
+            observer_only=_env_bool("KCMM_OBSERVER_ONLY", False),
+            skip_observer=_env_bool("KCMM_SKIP_OBSERVER", False),
+            destroy_before_vllm=_env_bool("KCMM_DESTROY_BEFORE_VLLM", False),
+            print_seams=_env_bool("KCMM_PRINT_SEAMS", False),
+        )
+
+    @classmethod
+    def from_namespace(cls, namespace: argparse.Namespace) -> "ObserverConfig":
+        base = cls.from_env()
+        values = {}
+        for field in base.__dataclass_fields__:
+            arg_name = (
+                f"kcmm_{field}" if field != "library_path" else "kcmm_lib_path"
+            )
+            value = getattr(namespace, arg_name, None)
+            values[field] = getattr(base, field) if value is None else value
+        return cls(**values)
+
+    def to_c_config(self) -> KcmmConfig:
+        if self.eviction_policy not in EVICTION_POLICY_CODES:
+            raise ValueError(f"unsupported eviction policy: {self.eviction_policy}")
+
+        path = self.cpu_cache_path.encode("utf-8")
+        if len(path) >= 256:
+            raise ValueError("cpu_cache_path must fit in 255 bytes")
+
+        cfg = KcmmConfig()
+        cfg.block_size = self.block_size
+        cfg.max_blocks = self.max_blocks
+        cfg.cpu_cache_path = path
+        cfg.tiering = 1 if self.enable_tiering else 0
+        cfg.eviction_policy = EVICTION_POLICY_CODES[self.eviction_policy]
+        cfg.prefetch_window = self.prefetch_window
+        cfg.max_batch_blocks = self.max_batch_blocks
+        cfg.device_ordinal = self.device_ordinal
+        cfg.num_layers = self.num_layers
+        cfg.kv_heads = self.kv_heads
+        cfg.head_dim = self.head_dim
+        cfg.max_batch = self.max_batch
+        cfg.max_seq_len = self.max_seq_len
+        cfg.low_watermark_threshold = self.low_watermark_threshold
+        cfg.background_evict_interval_ms = self.background_evict_interval_ms
+        cfg.attention_sink_blocks = self.attention_sink_blocks
+        cfg.recent_window_blocks = self.recent_window_blocks
+        return cfg
+
+
+def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument("--kcmm-help", action="store_true", default=None)
+    parser.add_argument("--kcmm-lib-path", default=None)
+    parser.add_argument("--kcmm-device-ordinal", type=int, default=None)
+    parser.add_argument("--kcmm-block-size", type=int, default=None)
+    parser.add_argument("--kcmm-max-blocks", type=int, default=None)
+    parser.add_argument("--kcmm-num-layers", type=int, default=None)
+    parser.add_argument("--kcmm-kv-heads", type=int, default=None)
+    parser.add_argument("--kcmm-head-dim", type=int, default=None)
+    parser.add_argument("--kcmm-max-batch", type=int, default=None)
+    parser.add_argument("--kcmm-max-seq-len", type=int, default=None)
+    parser.add_argument("--kcmm-cpu-cache-path", default=None)
+    parser.add_argument("--kcmm-enable-tiering", action="store_true", default=None)
+    parser.add_argument(
+        "--kcmm-disable-tiering",
+        dest="kcmm_enable_tiering",
+        action="store_false",
+        default=None,
+    )
+    parser.add_argument(
+        "--kcmm-eviction-policy",
+        choices=sorted(EVICTION_POLICY_CODES),
+        default=None,
+    )
+    parser.add_argument("--kcmm-prefetch-window", type=int, default=None)
+    parser.add_argument("--kcmm-max-batch-blocks", type=int, default=None)
+    parser.add_argument("--kcmm-low-watermark-threshold", type=float, default=None)
+    parser.add_argument("--kcmm-background-evict-interval-ms", type=int, default=None)
+    parser.add_argument("--kcmm-attention-sink-blocks", type=int, default=None)
+    parser.add_argument("--kcmm-recent-window-blocks", type=int, default=None)
+    parser.add_argument("--kcmm-probe-blocks", type=int, default=None)
+    parser.add_argument("--kcmm-observer-only", action="store_true", default=None)
+    parser.add_argument("--kcmm-skip-observer", action="store_true", default=None)
+    parser.add_argument("--kcmm-destroy-before-vllm", action="store_true", default=None)
+    parser.add_argument("--kcmm-print-seams", action="store_true", default=None)
+    return parser
