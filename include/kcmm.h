@@ -129,6 +129,18 @@ typedef struct {
 
     /** Maximum sequence length in tokens. */
     size_t max_seq_len;
+
+    /** Low watermark threshold for proactive background eviction. Default: 0.2. */
+    float low_watermark_threshold;
+
+    /** Background eviction check interval in milliseconds. Default: 100. */
+    uint64_t background_evict_interval_ms;
+
+    /** Number of attention sink blocks protected by sink-window policy. Default: 1. */
+    size_t attention_sink_blocks;
+
+    /** Number of recent blocks protected by sink-window policy. Default: 4. */
+    size_t recent_window_blocks;
 } kcmm_config_t;
 
 /* ---------------------------------------------------------------------------

@@ -44,6 +44,16 @@ impl CudaStream {
         self.inner
     }
 
+    /// Destroy the stream and clear the handle so `Drop` becomes a no-op.
+    pub fn destroy(&mut self) {
+        if !self.inner.is_null() {
+            unsafe {
+                sys::lib().cuStreamDestroy_v2(self.inner);
+            }
+            self.inner = std::ptr::null_mut();
+        }
+    }
+
     /// Query whether all operations on the stream have completed.
     pub fn is_done(&self) -> bool {
         let cu_result = unsafe { sys::lib().cuStreamQuery(self.inner) };
@@ -99,11 +109,7 @@ impl CudaStream {
 
 impl Drop for CudaStream {
     fn drop(&mut self) {
-        if !self.inner.is_null() {
-            unsafe {
-                sys::lib().cuStreamDestroy_v2(self.inner);
-            }
-        }
+        self.destroy();
     }
 }
 
@@ -137,6 +143,13 @@ impl KcmmStreams {
         self.restore.synchronize()?;
         self.prefetch.synchronize()?;
         Ok(())
+    }
+
+    /// Explicitly destroy streams while the owning CUDA context is still alive.
+    pub fn destroy_all(&mut self) {
+        self.evict.destroy();
+        self.restore.destroy();
+        self.prefetch.destroy();
     }
 }
 

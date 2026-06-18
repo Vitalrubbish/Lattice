@@ -264,6 +264,18 @@ fn policy_from_i32(val: i32) -> &'static str {
     }
 }
 
+fn default_usize_if_zero(value: usize, default: usize) -> usize {
+    if value == 0 { default } else { value }
+}
+
+fn default_u64_if_zero(value: u64, default: u64) -> u64 {
+    if value == 0 { default } else { value }
+}
+
+fn default_f32_if_nonpositive(value: f32, default: f32) -> f32 {
+    if value <= 0.0 { default } else { value }
+}
+
 /// Convert a BlockLocation to the C enum.
 fn block_loc_to_c(loc: &BlockLocation) -> kcmm_block_location_t {
     match loc {
@@ -299,8 +311,8 @@ pub unsafe extern "C" fn kcmm_pool_create(
     let cpu_path = c_str_from_fixed(&cfg.cpu_cache_path);
 
     let kcmm_config = KcmmConfig {
-        block_size: cfg.block_size,
-        max_blocks: cfg.max_blocks,
+        block_size: default_usize_if_zero(cfg.block_size, 16),
+        max_blocks: default_usize_if_zero(cfg.max_blocks, 16384),
         cpu_cache_path: if cpu_path.is_empty() {
             "/dev/shm/kcmm_swap".to_string()
         } else {
@@ -308,12 +320,12 @@ pub unsafe extern "C" fn kcmm_pool_create(
         },
         tiering: cfg.tiering != 0,
         eviction_policy: policy_from_i32(cfg.eviction_policy).to_string(),
-        prefetch_window: cfg.prefetch_window,
-        max_batch_blocks: cfg.max_batch_blocks,
-        low_watermark_threshold: cfg.low_watermark_threshold,
-        background_evict_interval_ms: cfg.background_evict_interval_ms,
-        attention_sink_blocks: cfg.attention_sink_blocks,
-        recent_window_blocks: cfg.recent_window_blocks,
+        prefetch_window: default_usize_if_zero(cfg.prefetch_window, 4),
+        max_batch_blocks: default_usize_if_zero(cfg.max_batch_blocks, 64),
+        low_watermark_threshold: default_f32_if_nonpositive(cfg.low_watermark_threshold, 0.2),
+        background_evict_interval_ms: default_u64_if_zero(cfg.background_evict_interval_ms, 100),
+        attention_sink_blocks: default_usize_if_zero(cfg.attention_sink_blocks, 1),
+        recent_window_blocks: default_usize_if_zero(cfg.recent_window_blocks, 4),
     };
 
     // Initialize CUDA context
@@ -1643,6 +1655,50 @@ pub unsafe extern "C" fn kcmm_synchronize(pool: *mut kcmm_pool_t) -> i32 {
         Err(e) => {
             handle.set_error(format!("kcmm_synchronize: {:#}", e));
             -1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{size_of, MaybeUninit};
+    use std::ptr::addr_of;
+
+    unsafe fn config_field_offset<T>(
+        f: impl FnOnce(*const kcmm_config_t) -> *const T,
+    ) -> usize {
+        let uninit = MaybeUninit::<kcmm_config_t>::uninit();
+        let base = uninit.as_ptr();
+        f(base) as usize - base as usize
+    }
+
+    #[test]
+    fn kcmm_config_layout_matches_c_header_on_lp64() {
+        assert_eq!(size_of::<usize>(), 8);
+        assert_eq!(size_of::<kcmm_config_t>(), 376);
+
+        unsafe {
+            assert_eq!(
+                config_field_offset(|base| addr_of!((*base).max_seq_len)),
+                336
+            );
+            assert_eq!(
+                config_field_offset(|base| addr_of!((*base).low_watermark_threshold)),
+                344
+            );
+            assert_eq!(
+                config_field_offset(|base| addr_of!((*base).background_evict_interval_ms)),
+                352
+            );
+            assert_eq!(
+                config_field_offset(|base| addr_of!((*base).attention_sink_blocks)),
+                360
+            );
+            assert_eq!(
+                config_field_offset(|base| addr_of!((*base).recent_window_blocks)),
+                368
+            );
         }
     }
 }

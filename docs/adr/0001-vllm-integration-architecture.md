@@ -5,18 +5,35 @@ engines, not just our own Rust engine. vLLM is the primary target. We integrate 
 a **monkey-patch launcher script** that intercepts vLLM's block allocator and
 attention paths at well-defined points, without modifying vLLM source.
 
-Status: **accepted** (2026-06-13)
+Status: **accepted for Phase I.C observer; provisional for Phase II/III**
+(accepted 2026-06-13, narrowed 2026-06-18 after implementation review)
+
+## Scope of acceptance
+
+This ADR accepts the near-term goal of proving KCMM can coexist with a vLLM
+process without changing vLLM behavior. It does **not** yet accept the full
+allocator/write/read/tiering replacement as a stable architecture.
+
+The current repository has a working KCMM path in the Rust engine, but the vLLM
+adapter is not implemented yet: `scripts/kcmm/launcher.py`,
+`scripts/kcmm/bindings.py`, and `scripts/kcmm/patch_vllm.py` are planned files,
+not current code. The vLLM integration phases below are therefore validation
+gates, not implementation claims.
 
 ## Core decisions
 
-1. **Target vLLM 0.6.3.post1** — `BlockSpaceManagerV2` is default (block-level prefix
-   caching baseline), `--enforce-eager` is stable, Python-side block allocator path
-   is still accessible for monkey-patching, FlashInfer has pre-built sm_80 wheels
-   for A30.
-2. **Wrapper script, not source patch** — `scripts/kcmm/launcher.py` applies patches
-   at import time, keeps vLLM installation pristine for A/B comparison.
-3. **Python bindings in `scripts/kcmm/`** via `ctypes` — zero dependencies, ~20 C
-   function signatures all simple scalars/pointers, no need for cffi or pyo3.
+1. **Target vLLM 0.6.3.post1 as a controlled baseline** — `BlockSpaceManagerV2`
+   is default (block-level prefix caching baseline), `--enforce-eager` is stable,
+   and the Python-side block allocator path is still accessible for
+   monkey-patching. This is a frozen integration target, not the long-term
+   vLLM architecture target; newer vLLM V1/plugin/KV-offload paths must be
+   re-evaluated after Phase I.C.
+2. **Wrapper script, not source patch** — `scripts/kcmm/launcher.py` will apply
+   patches at import time, keeping the vLLM installation pristine for A/B
+   comparison.
+3. **Python bindings in `scripts/kcmm/`** via `ctypes` — zero dependencies, simple
+   C function signatures, no need for cffi or pyo3. This requires ABI layout
+   tests for every exported struct before Phase I.C can be considered complete.
 4. **Per-process lazy singleton** for KcmmPool — `get_or_create_pool()` called by
    the first interception point, reused across all patches within the process.
    Correct for TP=1 (current), correct per-worker for TP>1 (future).
@@ -29,7 +46,7 @@ Status: **accepted** (2026-06-13)
 |---|---|---|---|
 | 1 | Block alloc/free | `NaiveBlockAllocator` | `kcmm_alloc_blocks` / `kcmm_free_blocks` |
 | 2 | Block table management | `BlockSpaceManager` | `kcmm_register_sequence` / `kcmm_append_block_to_sequence` |
-| 3 | block_id → GPU VA | `block_tables` tensor → attention kernel | `kcmm_get_all_block_offsets_f16()` remap table (A1: base=0) |
+| 3 | block_id → GPU VA | `block_tables` tensor → attention kernel | Experimental: A1 (`block_tables` as offsets, base=0) or A2/custom attention backend |
 | 4 | Swap / eviction | `BlockSpaceManager.swap_out/in` | `kcmm_cool`/`touch` + `kcmm_evict_blocks` / `kcmm_restore_evicted_blocks` |
 | 5 | Prefix caching | `PrefixCachingBlockAllocator` | `kcmm_share_prefix` (Step 4) |
 | 6 | Hint API | (none — new capability) | `kcmm_hint` / `kcmm_protect` |
@@ -46,40 +63,44 @@ Phase I.C  — Observer (no behavior change)
   └─ Gate: all three pass → Phase II-A
 
 Phase II-A — Allocator replacement (intercepts 1, 8)
-  ├─ KCMM pool with tiering=OFF, pre-allocate equivalent to vLLM num_gpu_blocks
-  ├─ Keep reshape_and_cache + block_tables native — only the allocator changes
-  └─ Gate: throughput deviation < 5% vs stock vLLM on fragmentation benchmark
+  ├─ KCMM pool with tiering=OFF, capacity equivalent to vLLM num_gpu_blocks
+  ├─ Gate A: define the storage-of-record model for KV data
+  ├─ Gate B: prove vLLM's native write/read path can address that storage, or stop
+  └─ Gate C: throughput deviation < 5% vs stock vLLM on fragmentation benchmark
 
 Phase II-B — KV write path (intercept 2)
-  ├─ Replace reshape_and_cache with kcmm_append_kv_step (D2D copy per token)
+  ├─ Replace reshape_and_cache with stream-aware kcmm_append_kv_step
+  ├─ D2D copy must run on the current PyTorch/vLLM CUDA stream or synchronize by event
   └─ Gate: D2H read-back byte-level K/V comparison vs reference computation
 
 Phase II-C — KV read path (intercept 3, A1 approach)
-  ├─ Replace block_tables values with KCMM VA offsets, set attention kernel base=0
+  ├─ Prototype A1: replace block_tables values with KCMM VA offsets, base=0
+  ├─ If A1 violates kernel assumptions, fall back to A2/custom attention backend
   └─ Gate: token-exact match vs stock vLLM (same prompt → same completion)
 
 Phase III  — Tiering (intercepts 4, 6, 7)
   ├─ Enable tiering, add hint API calls, expose UFS metrics
-  └─ Gate: capacity ratio ≥ 1.2× vs stock vLLM under memory pressure
+  └─ Gate: capacity ratio ≥ 1.2×, P99 overhead bounded, evictions/full-completion ≤ 3.0
 ```
 
 ## Key technical decisions
 
 ### Why `--enforce-eager` is the linchpin
 
-vLLM with CUDA graphs bakes block table addresses into compiled graphs — interception
-is impossible. `--enforce-eager` disables graphs and FlasHinfer fused attention,
-making every step go through the Python scheduler → model runner → attention kernel
-path individually. This gives us a clean insertion point for intercept 3.
+vLLM with CUDA graphs can bake attention metadata and addresses into captured
+execution. `--enforce-eager` disables CUDA graphs and keeps execution step-wise,
+which is the safest mode for Phase I.C and early interception experiments.
+Attention backend selection must still be pinned and verified per vLLM version.
 
 ### Why `kcmm_append_kv_step` over slot_mapping modification (intercept 2)
 
 `reshape_and_cache` is a compiled CUDA kernel. Modifying `key_cache`/`value_cache`
 tensors to point at KCMM VA regions requires PyTorch to accept `cuMemMap`-backed
-memory (it doesn't — PyTorch's allocator tracks `cudaMalloc` allocations).
-Modifying `slot_mapping` values depends on kernel-internal address computation that
-varies across vLLM versions. `kcmm_append_kv_step` bypasses both by doing D2D copies
-directly via CUDA driver API on the default stream.
+memory as tensor storage. Modifying `slot_mapping` values depends on
+kernel-internal address computation that varies across vLLM versions.
+`kcmm_append_kv_step` bypasses both by doing D2D copies directly via CUDA driver
+API, but it must be stream-aware before it is safe inside a PyTorch/vLLM forward
+pass.
 
 ### Why A1 over A2 for VA remapping (intercept 3)
 
@@ -87,9 +108,12 @@ A1: replace `block_tables` values with f16-unit VA offsets, set kernel `kv_cache
 A2: maintain a separate GPU-side offset table indexed by block_id, replace all
 Python-side `block_tables` reads with KCMM offset queries.
 
-A1 is simpler to prototype — it reuses the existing `block_tables` tensor channel
-and only changes what values flow through it. If kernel-internal `base + block_id *
-stride` assumptions break A1, we fall back to A2.
+A1 is simpler to prototype because it reuses the existing `block_tables` tensor
+channel and only changes what values flow through it. The Rust engine does not
+prove A1: its paged-attention kernel keeps `block_tables` as block indices and
+uses a separate `block_offsets_f16` table. If vLLM kernels assume `base +
+block_id * stride`, A1 is invalid and Phase II-C must use A2 or a custom
+attention backend.
 
 ### CUDA context sharing risk
 
@@ -104,6 +128,11 @@ is real and we need separate VA reservation strategies.
 `BlockAllocator` plugin interface but it's not production-ready. We chose 0.6.3
 monkey-patch for immediate progress, with a clear upgrade path when the plugin
 interface stabilizes.
+
+**vLLM V1/plugin/KV-offload integration (deferred).** Current vLLM has moved
+toward V1, plugin hooks, hybrid KV cache management, and native KV offloading.
+Those seams may be better long-term targets than monkey-patching v0.6.3, but
+they are not the fastest path to a controlled Phase I.C coexistence test.
 
 **Modifying vLLM source directly (rejected).** Would complicate A/B comparison,
 reproducibility, and version upgrades. Wrapper script keeps the patch surface
@@ -122,7 +151,9 @@ first to validate the CUDA context foundation without touching the forward pass.
 ## Constraints
 
 - **A30 GPU (Ampere, sm_80)** — FlashInfer 0.2.x compatible, 24 GB VRAM
-- **CUDA 12.x** — required by both cudarc (Rust) and vLLM 0.6.3
+- **CUDA 12.x target environment** — required for the vLLM baseline. Local KCMM
+  Rust tests can run against older compatible driver/toolkit combinations, but
+  vLLM validation must use a host driver that supports the selected CUDA wheel.
 - **No modification to vLLM installation** — reproducible A/B comparison
 - **`--enforce-eager` always on** — non-negotiable for interception
 - **Prefix sharing (intercept 5) deferred to Step 4** — KCMM SharingManager is

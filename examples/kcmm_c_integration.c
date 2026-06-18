@@ -22,8 +22,22 @@
 
 #include "kcmm.h"
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+
+#if __SIZEOF_SIZE_T__ == 8
+_Static_assert(sizeof(kcmm_config_t) == 376, "kcmm_config_t ABI size drift");
+_Static_assert(offsetof(kcmm_config_t, max_seq_len) == 336, "max_seq_len offset drift");
+_Static_assert(offsetof(kcmm_config_t, low_watermark_threshold) == 344,
+               "low_watermark_threshold offset drift");
+_Static_assert(offsetof(kcmm_config_t, background_evict_interval_ms) == 352,
+               "background_evict_interval_ms offset drift");
+_Static_assert(offsetof(kcmm_config_t, attention_sink_blocks) == 360,
+               "attention_sink_blocks offset drift");
+_Static_assert(offsetof(kcmm_config_t, recent_window_blocks) == 368,
+               "recent_window_blocks offset drift");
+#endif
 
 /* ---------------------------------------------------------------------------
  * Minimal test harness
@@ -77,6 +91,10 @@ static kcmm_config_t default_config(void) {
     cfg.max_blocks   = 1024;
     cfg.tiering      = 0;  /* tiering off for simplicity */
     cfg.device_ordinal = 0;
+    cfg.low_watermark_threshold = 0.2f;
+    cfg.background_evict_interval_ms = 100;
+    cfg.attention_sink_blocks = 1;
+    cfg.recent_window_blocks = 4;
     return cfg;
 }
 

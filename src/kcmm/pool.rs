@@ -1515,6 +1515,11 @@ impl Drop for KcmmPool {
         for &va in &self.va_v {
             let _ = self.vmm.free_address(va, va_size);
         }
+
+        // `ctx` is declared before `streams`, so Rust would otherwise drop the
+        // CUDA context before stream handles. Destroy streams explicitly while
+        // the context is still valid.
+        self.streams.destroy_all();
     }
 }
 
