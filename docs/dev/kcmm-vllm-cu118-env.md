@@ -90,7 +90,8 @@ python -m scripts.kcmm \
   --max-seq-len-to-capture 64 \
   --guided-decoding-backend lm-format-enforcer \
   --disable-log-requests \
-  --served-model-name tiny-opt-kcmm
+  --served-model-name tiny-opt-kcmm \
+  --use-v2-block-manager
 ```
 
 Probe the OpenAI-compatible API:
