@@ -271,6 +271,130 @@ def _tensor_values_sample(value: Any, max_items: int = 32) -> Any:
         }
 
 
+def _shape_list(value: Any) -> list[int] | None:
+    try:
+        return [int(dim) for dim in value.shape]
+    except Exception:
+        return None
+
+
+def _infer_kv_cache_layout(key_cache: Any, value_cache: Any) -> dict[str, Any]:
+    key_shape = _shape_list(key_cache)
+    value_shape = _shape_list(value_cache)
+    if key_shape is None or value_shape is None:
+        return {
+            "layout": "unknown",
+            "reason": "missing cache tensor shapes",
+            "key_cache_shape": key_shape,
+            "value_cache_shape": value_shape,
+        }
+
+    if len(key_shape) == 5 and len(value_shape) == 4:
+        block_size = key_shape[3]
+        if value_shape[3] != block_size:
+            return {
+                "layout": "unknown",
+                "reason": "key/value cache block-size dimensions differ",
+                "key_cache_shape": key_shape,
+                "value_cache_shape": value_shape,
+            }
+        return {
+            "layout": "paged_kv_cache",
+            "slot_formula": "slot = block_id * block_size + offset_in_block",
+            "num_blocks": key_shape[0],
+            "block_size": block_size,
+            "key_cache_shape": key_shape,
+            "value_cache_shape": value_shape,
+        }
+
+    if len(key_shape) == 4 and len(value_shape) == 4:
+        block_size = key_shape[1]
+        if value_shape[1] != block_size:
+            return {
+                "layout": "unknown",
+                "reason": "flash key/value cache block-size dimensions differ",
+                "key_cache_shape": key_shape,
+                "value_cache_shape": value_shape,
+            }
+        return {
+            "layout": "flash_kv_cache",
+            "slot_formula": "slot = block_id * block_size + offset_in_block",
+            "num_blocks": key_shape[0],
+            "block_size": block_size,
+            "key_cache_shape": key_shape,
+            "value_cache_shape": value_shape,
+        }
+
+    return {
+        "layout": "unknown",
+        "reason": "unsupported cache tensor rank",
+        "key_cache_shape": key_shape,
+        "value_cache_shape": value_shape,
+    }
+
+
+def _slot_mapping_contract(
+    slot_mapping: Any,
+    key_cache: Any,
+    value_cache: Any,
+) -> dict[str, Any]:
+    layout = _infer_kv_cache_layout(key_cache, value_cache)
+    block_size = layout.get("block_size")
+    num_blocks = layout.get("num_blocks")
+    values = _tensor_values_sample(slot_mapping)
+    if not isinstance(block_size, int) or not isinstance(num_blocks, int):
+        return {
+            **layout,
+            "valid": False,
+            "reason": "could not infer block_size and num_blocks",
+            "slot_sample": values,
+        }
+    if block_size <= 0 or num_blocks <= 0:
+        return {
+            **layout,
+            "valid": False,
+            "reason": "invalid block_size or num_blocks",
+            "slot_sample": values,
+        }
+
+    decoded: list[dict[str, Any]] = []
+    invalid_slots: list[int] = []
+    sample = values.get("sample", []) if isinstance(values, dict) else []
+    for raw_slot in sample:
+        slot = int(raw_slot)
+        if slot < 0:
+            decoded.append(
+                {
+                    "slot": slot,
+                    "is_padding": True,
+                    "valid": True,
+                }
+            )
+            continue
+        block_id = slot // block_size
+        offset_in_block = slot % block_size
+        valid = block_id < num_blocks
+        if not valid:
+            invalid_slots.append(slot)
+        decoded.append(
+            {
+                "slot": slot,
+                "is_padding": False,
+                "block_id": block_id,
+                "offset_in_block": offset_in_block,
+                "valid": valid,
+            }
+        )
+
+    return {
+        **layout,
+        "valid": not invalid_slots,
+        "slot_sample": values,
+        "decoded_sample": decoded,
+        "invalid_slots": invalid_slots,
+    }
+
+
 def _kv_write_args_summary(
     key: Any,
     value: Any,
@@ -287,6 +411,11 @@ def _kv_write_args_summary(
         "key_cache": _tensor_summary(key_cache),
         "value_cache": _tensor_summary(value_cache),
         "slot_mapping": _tensor_summary(slot_mapping, include_values=True),
+        "slot_mapping_contract": _slot_mapping_contract(
+            slot_mapping,
+            key_cache,
+            value_cache,
+        ),
         "kv_cache_dtype": _safe_summary(kv_cache_dtype),
         "k_scale": _safe_summary(k_scale),
         "v_scale": _safe_summary(v_scale),

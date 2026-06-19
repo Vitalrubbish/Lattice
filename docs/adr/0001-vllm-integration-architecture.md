@@ -161,7 +161,12 @@ preflight gate proves the Python launcher can call `kcmm_append_kv_step`, read
 back KCMM VA bytes, and detect K/V mismatches independently of vLLM scheduling.
 Then `python -m scripts.kcmm.vllm_smoke --instrument-kv-writes` must pass to
 record the version-pinned `reshape_and_cache` tensor contract that the
-replacement must preserve.
+replacement must preserve. The trace decodes `slot_mapping` as
+`block_id = slot // block_size` and `offset_in_block = slot % block_size`,
+which means the `reshape_and_cache` seam exposes physical KV slots but not
+sequence ids. A replacement at this seam therefore needs either a direct-slot
+KCMM write API or an additional metadata-builder patch that reconstructs
+sequence/position inputs for `kcmm_append_kv_step`.
 
 ### Why A1 over A2 for VA remapping (intercept 3)
 

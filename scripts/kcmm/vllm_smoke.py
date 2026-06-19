@@ -562,6 +562,22 @@ def read_kv_write_trace(path: Path) -> dict[str, Any]:
     write_events = [event for event in events if event.get("event") == "kv_write_call"]
     if not write_events:
         raise SmokeFailure(f"KV write trace has no write events: {path}")
+    invalid_contracts: list[dict[str, Any]] = []
+    for event in write_events:
+        contract = event.get("args", {}).get("slot_mapping_contract", {})
+        if not contract.get("valid", False):
+            invalid_contracts.append(
+                {
+                    "seq": event.get("seq"),
+                    "key": event.get("key"),
+                    "contract": contract,
+                }
+            )
+    if invalid_contracts:
+        raise SmokeFailure(
+            "KV write slot_mapping contract validation failed: "
+            + json.dumps(invalid_contracts, sort_keys=True)
+        )
     return {
         "path": str(path),
         "event_count": len(events),
@@ -569,6 +585,9 @@ def read_kv_write_trace(path: Path) -> dict[str, Any]:
         "counts": summary.get("counts", {}),
         "missing_required_groups": missing,
         "first_write": write_events[0],
+        "first_slot_mapping_contract": write_events[0]
+        .get("args", {})
+        .get("slot_mapping_contract", {}),
     }
 
 

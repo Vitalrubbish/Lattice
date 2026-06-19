@@ -223,6 +223,12 @@ The trace includes shape, dtype, device, stride, element size, data pointer, and
 a bounded `slot_mapping` sample. It intentionally does not dump K/V payload
 contents.
 
+The trace also decodes the bounded `slot_mapping` sample using the vLLM contract
+`slot = block_id * block_size + offset_in_block`. This proves the write seam
+exposes physical KV slots. The next replacement slice must either add a KCMM
+direct-slot write API that consumes this mapping, or patch attention metadata
+construction to recover sequence/position context for `kcmm_append_kv_step`.
+
 Latest local Phase II.B write contract result on 2026-06-19:
 
 - Command: `python -m scripts.kcmm.vllm_smoke --instrument-kv-writes`
@@ -231,6 +237,7 @@ Latest local Phase II.B write contract result on 2026-06-19:
 - Write calls observed: `8`
 - Required KV write seam groups missing: `{}`
 - First `slot_mapping` sample: `[0, 1]`
+- First decoded slots: `(block_id=0, offset=0)`, `(block_id=0, offset=1)`
 - First `key`/`value` shape: `[2, 2, 64]`
 - First `key_cache` shape: `[134685, 2, 8, 16, 8]`
 - First `value_cache` shape: `[134685, 2, 64, 16]`
