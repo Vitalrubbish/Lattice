@@ -122,6 +122,8 @@ class ObserverConfig:
     instrument_kv_writes: bool = False
     kv_write_trace_path: str | None = None
     require_kv_write_seams: bool = False
+    kv_write_mirror: bool = False
+    kv_write_mirror_report_path: str | None = None
     shadow_allocations: bool = False
     shadow_report_path: str | None = None
     backed_allocations: bool = False
@@ -164,6 +166,10 @@ class ObserverConfig:
             instrument_kv_writes=_env_bool("KCMM_INSTRUMENT_KV_WRITES", False),
             kv_write_trace_path=os.environ.get("KCMM_KV_WRITE_TRACE_PATH") or None,
             require_kv_write_seams=_env_bool("KCMM_REQUIRE_KV_WRITE_SEAMS", False),
+            kv_write_mirror=_env_bool("KCMM_KV_WRITE_MIRROR", False),
+            kv_write_mirror_report_path=(
+                os.environ.get("KCMM_KV_WRITE_MIRROR_REPORT_PATH") or None
+            ),
             shadow_allocations=_env_bool("KCMM_SHADOW_ALLOCATIONS", False),
             shadow_report_path=os.environ.get("KCMM_SHADOW_REPORT_PATH") or None,
             backed_allocations=_env_bool("KCMM_BACKED_ALLOCATIONS", False),
@@ -228,6 +234,12 @@ class ObserverConfig:
             raise ValueError("KCMM-backed allocation mode requires the KCMM observer pool")
         if self.backed_allocations and self.shadow_allocations:
             raise ValueError("KCMM-backed allocation mode cannot be combined with shadow mode")
+        if self.kv_write_mirror and self.pool_mode != "runtime":
+            raise ValueError("KCMM KV write mirror requires --kcmm-pool-mode runtime")
+        if self.kv_write_mirror and self.skip_observer:
+            raise ValueError("KCMM KV write mirror requires the KCMM observer pool")
+        if self.kv_write_mirror and not self.backed_allocations:
+            raise ValueError("KCMM KV write mirror requires --kcmm-backed-allocations")
 
     def with_runtime_sizing(self, sizing: VllmRuntimeSizing) -> "ObserverConfig":
         sizing.validate()
@@ -319,6 +331,12 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         default=None,
     )
+    parser.add_argument(
+        "--kcmm-kv-write-mirror",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--kcmm-kv-write-mirror-report-path", default=None)
     parser.add_argument(
         "--kcmm-shadow-allocations",
         action="store_true",

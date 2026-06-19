@@ -115,6 +115,7 @@ _KV_WRITE_COUNTS: dict[str, int] = {}
 _KV_WRITE_SEQUENCE = 0
 _KV_WRITE_INSTRUMENTED = False
 _REQUIRE_KV_WRITE_SEAMS = False
+_KV_WRITE_MIRROR_PATCHED = False
 
 KV_WRITE_FUNCTIONS = {
     "vllm._custom_ops": (
@@ -624,6 +625,35 @@ def _wrap_kv_write_function(module: Any, function_name: str) -> None:
     setattr(module, function_name, wrapper)
 
 
+def _wrap_kv_write_mirror_function(
+    module: Any,
+    function_name: str,
+    mirror: Any,
+) -> None:
+    original = getattr(module, function_name)
+    if getattr(original, "_kcmm_kv_write_mirror_patched", False):
+        return
+    call_key = f"{module.__name__}.{function_name}"
+    signature = inspect.signature(original)
+
+    @wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(*args, **kwargs)
+        result = original(*args, **kwargs)
+        mirror.mirror_call(
+            call_key,
+            bound.arguments["key"],
+            bound.arguments["value"],
+            bound.arguments["key_cache"],
+            bound.arguments["value_cache"],
+            bound.arguments["slot_mapping"],
+        )
+        return result
+
+    wrapper._kcmm_kv_write_mirror_patched = True  # type: ignore[attr-defined]
+    setattr(module, function_name, wrapper)
+
+
 def _wrap_llm_engine_init(callback: Callable[[Any], dict[str, Any]]) -> bool:
     module = importlib.import_module("vllm.engine.llm_engine")
     cls = getattr(module, "LLMEngine")
@@ -1063,4 +1093,31 @@ def apply_kv_write_instrumentation(
         "require_seams": require_seams,
         "patched_functions": patched,
         "required_groups": REQUIRED_KV_WRITE_GROUPS,
+    }
+
+
+def apply_kv_write_mirror(mirror: Any) -> dict[str, object]:
+    """Patch vLLM's KV write custom-op wrappers to mirror writes into KCMM."""
+
+    global _KV_WRITE_MIRROR_PATCHED
+
+    patched: list[str] = []
+    if not _KV_WRITE_MIRROR_PATCHED:
+        for module_name, function_names in KV_WRITE_FUNCTIONS.items():
+            module = importlib.import_module(module_name)
+            for function_name in function_names:
+                if hasattr(module, function_name):
+                    _wrap_kv_write_mirror_function(module, function_name, mirror)
+                    patched.append(f"{module_name}.{function_name}")
+        _KV_WRITE_MIRROR_PATCHED = True
+
+    return {
+        "phase": "II.B",
+        "patched": True,
+        "observer_only": False,
+        "target": "vLLM KV write custom ops",
+        "write_path": "kcmm_append_kv_slots",
+        "storage_of_record": "native_vllm_kv_tensors",
+        "patched_functions": patched,
+        "required_allocator_mode": "kcmm_backed_allocator",
     }
