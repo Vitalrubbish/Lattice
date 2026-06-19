@@ -1,6 +1,6 @@
 # Instrument vLLM V2 allocator seams
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build
@@ -16,13 +16,13 @@ showing allocator construction, allocation, free, and relevant capacity values.
 
 ## Acceptance criteria
 
-- [ ] A launcher flag enables allocator seam instrumentation without changing allocation decisions or block IDs.
-- [ ] The trace records vLLM version, whether the V2 block manager is enabled, allocator class names, constructor arguments summarized safely, and allocation/free call counts.
-- [ ] The instrumentation works with prefix caching disabled and does not require prefix-caching code paths to be active.
-- [ ] The smoke-runner from issue 01 can run with instrumentation enabled and still returns a successful completion response.
-- [ ] The trace is deterministic enough for review: it should avoid raw object reprs with memory addresses where possible.
-- [ ] If a seam is not exercised, the run fails with a clear message rather than silently passing.
-- [ ] Stock vLLM smoke mode remains available and unaffected.
+- [x] A launcher flag enables allocator seam instrumentation without changing allocation decisions or block IDs.
+- [x] The trace records vLLM version, whether the V2 block manager is enabled, allocator class names, constructor arguments summarized safely, and allocation/free call counts.
+- [x] The instrumentation works with prefix caching disabled and does not require prefix-caching code paths to be active.
+- [x] The smoke-runner from issue 01 can run with instrumentation enabled and still returns a successful completion response.
+- [x] The trace is deterministic enough for review: it should avoid raw object reprs with memory addresses where possible.
+- [x] If a seam is not exercised, the run fails with a clear message rather than silently passing.
+- [x] Stock vLLM smoke mode remains available and unaffected.
 
 ## Blocked by
 

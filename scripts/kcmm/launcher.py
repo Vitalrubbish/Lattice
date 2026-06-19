@@ -10,7 +10,7 @@ from typing import Sequence
 
 from .bindings import KcmmError, KcmmLibrary, KcmmPool, result_to_dict
 from .config import ObserverConfig, add_kcmm_args
-from .patch_vllm import apply_observer_patches
+from .patch_vllm import apply_allocator_instrumentation, apply_observer_patches
 
 
 _ACTIVE_POOL: KcmmPool | None = None
@@ -95,6 +95,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = ObserverConfig.from_namespace(namespace)
 
     seam_report = None
+    allocator_report = None
+    if config.instrument_allocators:
+        allocator_report = apply_allocator_instrumentation(
+            trace_path=config.allocator_trace_path,
+            require_seams=config.require_allocator_seams,
+        )
+        _print_json({"vllm_allocator_instrumentation": allocator_report})
+
     if config.print_seams:
         seam_report = apply_observer_patches()
         if not config.observer_only:
@@ -127,6 +135,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "observer": observer_report,
                 "vllm_seams": seam_report,
+                "vllm_allocator_instrumentation": allocator_report,
             },
             stream=sys.stdout,
         )

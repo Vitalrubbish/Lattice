@@ -44,6 +44,9 @@ class SmokeConfig:
     build_kcmm: bool
     keep_model: bool
     print_seams: bool
+    instrument_allocators: bool
+    allocator_trace_path: Path
+    require_allocator_seams: bool
     log_path: Path
 
     @property
@@ -95,6 +98,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ask the KCMM launcher to print vLLM seam inspection output.",
     )
     parser.add_argument(
+        "--instrument-allocators",
+        action="store_true",
+        help="Enable observer-only vLLM V2 allocator seam instrumentation.",
+    )
+    parser.add_argument(
+        "--allocator-trace-path",
+        default=None,
+        help="Allocator instrumentation JSONL trace path. Defaults to a /tmp file.",
+    )
+    parser.add_argument(
+        "--require-allocator-seams",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail when instrumentation does not observe required allocator seams.",
+    )
+    parser.add_argument(
         "--log-path",
         default=None,
         help="Combined vLLM stdout/stderr log path. Defaults to a /tmp file.",
@@ -110,6 +129,12 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         else Path(tempfile.gettempdir())
         / f"kcmm-vllm-smoke-{int(time.time() * 1000)}.log"
     )
+    allocator_trace_path = (
+        Path(args.allocator_trace_path)
+        if args.allocator_trace_path
+        else Path(tempfile.gettempdir())
+        / f"kcmm-vllm-allocator-trace-{int(time.time() * 1000)}.jsonl"
+    )
     return SmokeConfig(
         mode=args.mode,
         host=args.host,
@@ -124,6 +149,9 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         build_kcmm=args.build_kcmm,
         keep_model=args.keep_model,
         print_seams=args.print_seams,
+        instrument_allocators=args.instrument_allocators,
+        allocator_trace_path=allocator_trace_path,
+        require_allocator_seams=args.require_allocator_seams,
         log_path=log_path,
     )
 
@@ -249,6 +277,16 @@ def vllm_command(config: SmokeConfig) -> list[str]:
         command.append("--kcmm-skip-observer")
     else:
         command.extend(["--kcmm-lib-path", str(config.kcmm_lib_path)])
+    if config.instrument_allocators:
+        command.extend(
+            [
+                "--kcmm-instrument-allocators",
+                "--kcmm-allocator-trace-path",
+                str(config.allocator_trace_path),
+            ]
+        )
+        if config.require_allocator_seams:
+            command.append("--kcmm-require-allocator-seams")
     if config.print_seams:
         command.append("--kcmm-print-seams")
     command.extend(
@@ -280,7 +318,39 @@ def vllm_command(config: SmokeConfig) -> list[str]:
             "--use-v2-block-manager",
         ]
     )
+    if config.instrument_allocators:
+        # Keep vLLM's engine in this Python process so launcher monkey-patches
+        # apply to the block manager and allocator objects being exercised.
+        command.append("--disable-frontend-multiprocessing")
     return command
+
+
+def read_allocator_trace(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise SmokeFailure(f"allocator trace was not written: {path}")
+    events: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                events.append(json.loads(line))
+    summary = next(
+        (event for event in reversed(events) if event.get("event") == "summary"),
+        None,
+    )
+    if summary is None:
+        raise SmokeFailure(f"allocator trace has no summary event: {path}")
+    missing = summary.get("missing_required_groups") or {}
+    if missing:
+        raise SmokeFailure(
+            "allocator instrumentation did not observe required seams: "
+            + json.dumps(missing, sort_keys=True)
+        )
+    return {
+        "path": str(path),
+        "event_count": len(events),
+        "counts": summary.get("counts", {}),
+        "missing_required_groups": missing,
+    }
 
 
 def start_server(config: SmokeConfig) -> subprocess.Popen[None]:
@@ -405,13 +475,14 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
     generated_model = ensure_tiny_model(config.model_path)
     process: subprocess.Popen[None] | None = None
     started_at = time.monotonic()
+    result: dict[str, Any] | None = None
     try:
         process = start_server(config)
         models = wait_for_ready(process, config)
         ready_at = time.monotonic()
         completion = run_completion(config)
         completed_at = time.monotonic()
-        return {
+        result = {
             "mode": config.mode,
             "base_url": config.base_url,
             "model_path": str(config.model_path),
@@ -428,6 +499,12 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             terminate_server(process, config)
         if generated_model and not config.keep_model:
             shutil.rmtree(config.model_path, ignore_errors=True)
+
+    if result is None:
+        raise SmokeFailure("smoke run exited without a result")
+    if config.instrument_allocators:
+        result["allocator_trace"] = read_allocator_trace(config.allocator_trace_path)
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

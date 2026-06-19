@@ -65,6 +65,9 @@ class ObserverConfig:
     skip_observer: bool = False
     destroy_before_vllm: bool = False
     print_seams: bool = False
+    instrument_allocators: bool = False
+    allocator_trace_path: str | None = None
+    require_allocator_seams: bool = False
 
     @classmethod
     def from_env(cls) -> "ObserverConfig":
@@ -96,6 +99,9 @@ class ObserverConfig:
             skip_observer=_env_bool("KCMM_SKIP_OBSERVER", False),
             destroy_before_vllm=_env_bool("KCMM_DESTROY_BEFORE_VLLM", False),
             print_seams=_env_bool("KCMM_PRINT_SEAMS", False),
+            instrument_allocators=_env_bool("KCMM_INSTRUMENT_ALLOCATORS", False),
+            allocator_trace_path=os.environ.get("KCMM_ALLOCATOR_TRACE_PATH") or None,
+            require_allocator_seams=_env_bool("KCMM_REQUIRE_ALLOCATOR_SEAMS", False),
         )
 
     @classmethod
@@ -174,4 +180,15 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--kcmm-skip-observer", action="store_true", default=None)
     parser.add_argument("--kcmm-destroy-before-vllm", action="store_true", default=None)
     parser.add_argument("--kcmm-print-seams", action="store_true", default=None)
+    parser.add_argument(
+        "--kcmm-instrument-allocators",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--kcmm-allocator-trace-path", default=None)
+    parser.add_argument(
+        "--kcmm-require-allocator-seams",
+        action="store_true",
+        default=None,
+    )
     return parser

@@ -77,6 +77,16 @@ Use stock vLLM behavior through the same process harness:
 python -m scripts.kcmm.vllm_smoke --mode stock
 ```
 
+Run with observer-only V2 allocator seam instrumentation:
+
+```bash
+python -m scripts.kcmm.vllm_smoke --instrument-allocators
+```
+
+Instrumentation mode keeps the vLLM engine in the launcher process with
+`--disable-frontend-multiprocessing` so the Python monkey-patches apply to the
+actual block manager and allocator objects.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This
