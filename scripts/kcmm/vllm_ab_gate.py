@@ -169,13 +169,16 @@ def smoke_config_for_mode(
         keep_model=True,
         print_seams=(config.print_seams and not is_stock),
         instrument_allocators=False,
+        instrument_kv_writes=False,
         runtime_derived_pool=(is_shadow or is_backed),
         shadow_allocations=is_shadow,
         backed_allocations=is_backed,
         allocator_trace_path=run_dir / f"{mode_name}-allocator-trace.jsonl",
+        kv_write_trace_path=run_dir / f"{mode_name}-kv-write-trace.jsonl",
         shadow_report_path=run_dir / f"{mode_name}-shadow-report.json",
         backed_report_path=run_dir / f"{mode_name}-backed-report.json",
         require_allocator_seams=True,
+        require_kv_write_seams=True,
         log_path=run_dir / f"{mode_name}.log",
     )
 

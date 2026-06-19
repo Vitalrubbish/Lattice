@@ -119,6 +119,9 @@ class ObserverConfig:
     instrument_allocators: bool = False
     allocator_trace_path: str | None = None
     require_allocator_seams: bool = False
+    instrument_kv_writes: bool = False
+    kv_write_trace_path: str | None = None
+    require_kv_write_seams: bool = False
     shadow_allocations: bool = False
     shadow_report_path: str | None = None
     backed_allocations: bool = False
@@ -158,6 +161,9 @@ class ObserverConfig:
             instrument_allocators=_env_bool("KCMM_INSTRUMENT_ALLOCATORS", False),
             allocator_trace_path=os.environ.get("KCMM_ALLOCATOR_TRACE_PATH") or None,
             require_allocator_seams=_env_bool("KCMM_REQUIRE_ALLOCATOR_SEAMS", False),
+            instrument_kv_writes=_env_bool("KCMM_INSTRUMENT_KV_WRITES", False),
+            kv_write_trace_path=os.environ.get("KCMM_KV_WRITE_TRACE_PATH") or None,
+            require_kv_write_seams=_env_bool("KCMM_REQUIRE_KV_WRITE_SEAMS", False),
             shadow_allocations=_env_bool("KCMM_SHADOW_ALLOCATIONS", False),
             shadow_report_path=os.environ.get("KCMM_SHADOW_REPORT_PATH") or None,
             backed_allocations=_env_bool("KCMM_BACKED_ALLOCATIONS", False),
@@ -299,6 +305,17 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--kcmm-allocator-trace-path", default=None)
     parser.add_argument(
         "--kcmm-require-allocator-seams",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--kcmm-instrument-kv-writes",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--kcmm-kv-write-trace-path", default=None)
+    parser.add_argument(
+        "--kcmm-require-kv-write-seams",
         action="store_true",
         default=None,
     )

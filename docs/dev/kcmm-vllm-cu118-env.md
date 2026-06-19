@@ -207,6 +207,35 @@ Latest local Phase II.B preflight result on 2026-06-19:
 - The smoke wrote into two KCMM blocks through a registered sequence.
 - Final KCMM stats recorded `blocks_in_use=0`.
 
+## Phase II.B vLLM write contract trace
+
+Run the observer-only vLLM KV write instrumentation before replacing
+`vllm._custom_ops.reshape_and_cache`:
+
+```bash
+python -m scripts.kcmm.vllm_smoke --instrument-kv-writes
+```
+
+The smoke patches `reshape_and_cache` and `reshape_and_cache_flash` without
+changing their behavior, then records which function is called and the tensor
+contract for `key`, `value`, `key_cache`, `value_cache`, and `slot_mapping`.
+The trace includes shape, dtype, device, stride, element size, data pointer, and
+a bounded `slot_mapping` sample. It intentionally does not dump K/V payload
+contents.
+
+Latest local Phase II.B write contract result on 2026-06-19:
+
+- Command: `python -m scripts.kcmm.vllm_smoke --instrument-kv-writes`
+- Result: completion succeeded.
+- Observed write seam: `vllm._custom_ops.reshape_and_cache`
+- Write calls observed: `8`
+- Required KV write seam groups missing: `{}`
+- First `slot_mapping` sample: `[0, 1]`
+- First `key`/`value` shape: `[2, 2, 64]`
+- First `key_cache` shape: `[134685, 2, 8, 16, 8]`
+- First `value_cache` shape: `[134685, 2, 64, 16]`
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This

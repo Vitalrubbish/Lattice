@@ -110,6 +110,24 @@ _REQUIRE_SEAMS = False
 _RUNTIME_POOL_PATCHED = False
 _SHADOW_ALLOCATOR_PATCHED = False
 _KCMM_BACKED_ALLOCATOR_PATCHED = False
+_KV_WRITE_TRACE_PATH: Path | None = None
+_KV_WRITE_COUNTS: dict[str, int] = {}
+_KV_WRITE_SEQUENCE = 0
+_KV_WRITE_INSTRUMENTED = False
+_REQUIRE_KV_WRITE_SEAMS = False
+
+KV_WRITE_FUNCTIONS = {
+    "vllm._custom_ops": (
+        "reshape_and_cache",
+        "reshape_and_cache_flash",
+    )
+}
+
+REQUIRED_KV_WRITE_GROUPS = {
+    "kv_write_function_called": tuple(
+        f"vllm._custom_ops.{name}" for name in KV_WRITE_FUNCTIONS["vllm._custom_ops"]
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -203,6 +221,78 @@ def _safe_summary(value: Any, depth: int = 0) -> Any:
     return summary
 
 
+def _tensor_summary(value: Any, include_values: bool = False) -> Any:
+    summary = _safe_summary(value)
+    if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+        return summary
+
+    try:
+        shape = [int(dim) for dim in value.shape]
+    except Exception:
+        shape = None
+    try:
+        stride = [int(dim) for dim in value.stride()]
+    except Exception:
+        stride = None
+    result: dict[str, Any] = {
+        "type": f"{type(value).__module__}.{type(value).__qualname__}",
+        "shape": shape,
+        "dtype": str(getattr(value, "dtype", "unknown")),
+        "device": str(getattr(value, "device", "unknown")),
+        "is_cuda": bool(getattr(value, "is_cuda", False)),
+        "stride": stride,
+    }
+    for method_name in ("numel", "element_size", "data_ptr"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                result[method_name] = int(method())
+            except Exception:
+                pass
+    if include_values:
+        result["values_sample"] = _tensor_values_sample(value)
+    return result
+
+
+def _tensor_values_sample(value: Any, max_items: int = 32) -> Any:
+    try:
+        flattened = value.detach().flatten()
+        total = int(flattened.numel())
+        sample = flattened[:max_items].cpu().tolist()
+        return {
+            "total": total,
+            "sample_count": len(sample),
+            "sample": [int(item) for item in sample],
+            "truncated": total > len(sample),
+        }
+    except Exception as exc:
+        return {
+            "error": f"{type(exc).__module__}.{type(exc).__qualname__}: {exc}"
+        }
+
+
+def _kv_write_args_summary(
+    key: Any,
+    value: Any,
+    key_cache: Any,
+    value_cache: Any,
+    slot_mapping: Any,
+    kv_cache_dtype: Any,
+    k_scale: Any,
+    v_scale: Any,
+) -> dict[str, Any]:
+    return {
+        "key": _tensor_summary(key),
+        "value": _tensor_summary(value),
+        "key_cache": _tensor_summary(key_cache),
+        "value_cache": _tensor_summary(value_cache),
+        "slot_mapping": _tensor_summary(slot_mapping, include_values=True),
+        "kv_cache_dtype": _safe_summary(kv_cache_dtype),
+        "k_scale": _safe_summary(k_scale),
+        "v_scale": _safe_summary(v_scale),
+    }
+
+
 def _bound_arguments(
     fn: Any,
     args: tuple[Any, ...],
@@ -235,6 +325,18 @@ def _write_trace(event: dict[str, Any]) -> None:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
+def _write_kv_write_trace(event: dict[str, Any]) -> None:
+    global _KV_WRITE_SEQUENCE
+    path = _KV_WRITE_TRACE_PATH
+    if path is None:
+        return
+    with _TRACE_LOCK:
+        _KV_WRITE_SEQUENCE += 1
+        payload = {"seq": _KV_WRITE_SEQUENCE, **event}
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
 def _record_call(
     class_path: str,
     method_name: str,
@@ -262,10 +364,38 @@ def _record_call(
     _write_trace(event)
 
 
+def _record_kv_write_call(
+    key: str,
+    args_summary: dict[str, Any],
+    error: BaseException | None = None,
+) -> None:
+    _KV_WRITE_COUNTS[key] = _KV_WRITE_COUNTS.get(key, 0) + 1
+    event: dict[str, Any] = {
+        "event": "kv_write_call",
+        "key": key,
+        "count": _KV_WRITE_COUNTS[key],
+        "args": args_summary,
+    }
+    if error is not None:
+        event["error"] = {
+            "type": f"{type(error).__module__}.{type(error).__qualname__}",
+            "message": str(error),
+        }
+    _write_kv_write_trace(event)
+
+
 def _missing_required_groups() -> dict[str, list[str]]:
     missing: dict[str, list[str]] = {}
     for group, keys in REQUIRED_ALLOCATOR_GROUPS.items():
         if not any(_TRACE_COUNTS.get(key, 0) > 0 for key in keys):
+            missing[group] = list(keys)
+    return missing
+
+
+def _missing_required_kv_write_groups() -> dict[str, list[str]]:
+    missing: dict[str, list[str]] = {}
+    for group, keys in REQUIRED_KV_WRITE_GROUPS.items():
+        if not any(_KV_WRITE_COUNTS.get(key, 0) > 0 for key in keys):
             missing[group] = list(keys)
     return missing
 
@@ -283,6 +413,25 @@ def _write_trace_summary() -> None:
     if _REQUIRE_SEAMS and missing:
         print(
             "KCMM allocator instrumentation missing required seams: "
+            + json.dumps(missing, sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _write_kv_write_trace_summary() -> None:
+    missing = _missing_required_kv_write_groups()
+    _write_kv_write_trace(
+        {
+            "event": "summary",
+            "counts": dict(sorted(_KV_WRITE_COUNTS.items())),
+            "required_groups": REQUIRED_KV_WRITE_GROUPS,
+            "missing_required_groups": missing,
+        }
+    )
+    if _REQUIRE_KV_WRITE_SEAMS and missing:
+        print(
+            "KCMM KV write instrumentation missing required seams: "
             + json.dumps(missing, sort_keys=True),
             file=sys.stderr,
             flush=True,
@@ -312,6 +461,38 @@ def _wrap_method(class_path: str, cls: type, method_name: str) -> None:
 
     wrapper._kcmm_instrumented = True  # type: ignore[attr-defined]
     setattr(cls, method_name, wrapper)
+
+
+def _wrap_kv_write_function(module: Any, function_name: str) -> None:
+    original = getattr(module, function_name)
+    if getattr(original, "_kcmm_kv_write_instrumented", False):
+        return
+    call_key = f"{module.__name__}.{function_name}"
+    signature = inspect.signature(original)
+
+    @wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(*args, **kwargs)
+        args_summary = _kv_write_args_summary(
+            bound.arguments["key"],
+            bound.arguments["value"],
+            bound.arguments["key_cache"],
+            bound.arguments["value_cache"],
+            bound.arguments["slot_mapping"],
+            bound.arguments["kv_cache_dtype"],
+            bound.arguments["k_scale"],
+            bound.arguments["v_scale"],
+        )
+        try:
+            result = original(*args, **kwargs)
+        except BaseException as exc:
+            _record_kv_write_call(call_key, args_summary, error=exc)
+            raise
+        _record_kv_write_call(call_key, args_summary)
+        return result
+
+    wrapper._kcmm_kv_write_instrumented = True  # type: ignore[attr-defined]
+    setattr(module, function_name, wrapper)
 
 
 def _wrap_llm_engine_init(callback: Callable[[Any], dict[str, Any]]) -> bool:
@@ -703,4 +884,54 @@ def apply_allocator_instrumentation(
         "require_seams": require_seams,
         "patched_methods": patched,
         "seam_report": report,
+    }
+
+
+def apply_kv_write_instrumentation(
+    trace_path: str | None = None,
+    require_seams: bool = False,
+) -> dict[str, object]:
+    """Patch vLLM's KV write custom-op wrappers to record the write contract."""
+
+    global _KV_WRITE_INSTRUMENTED, _REQUIRE_KV_WRITE_SEAMS, _KV_WRITE_TRACE_PATH
+
+    _REQUIRE_KV_WRITE_SEAMS = require_seams
+    if trace_path is None:
+        trace_path = os.environ.get("KCMM_KV_WRITE_TRACE_PATH")
+    if trace_path is None:
+        trace_path = str(Path(tempfile.gettempdir()) / "kcmm-vllm-kv-write-trace.jsonl")
+
+    _KV_WRITE_TRACE_PATH = Path(trace_path)
+    _KV_WRITE_TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _KV_WRITE_TRACE_PATH.write_text("", encoding="utf-8")
+
+    patched: list[str] = []
+    if not _KV_WRITE_INSTRUMENTED:
+        for module_name, function_names in KV_WRITE_FUNCTIONS.items():
+            module = importlib.import_module(module_name)
+            for function_name in function_names:
+                if hasattr(module, function_name):
+                    _wrap_kv_write_function(module, function_name)
+                    patched.append(f"{module_name}.{function_name}")
+        atexit.register(_write_kv_write_trace_summary)
+        _KV_WRITE_INSTRUMENTED = True
+
+    _write_kv_write_trace(
+        {
+            "event": "kv_write_instrumentation_enabled",
+            "trace_path": str(_KV_WRITE_TRACE_PATH),
+            "require_seams": require_seams,
+            "patched": patched,
+            "required_groups": REQUIRED_KV_WRITE_GROUPS,
+        }
+    )
+
+    return {
+        "phase": "II.B",
+        "patched": True,
+        "observer_only": True,
+        "trace_path": str(_KV_WRITE_TRACE_PATH),
+        "require_seams": require_seams,
+        "patched_functions": patched,
+        "required_groups": REQUIRED_KV_WRITE_GROUPS,
     }

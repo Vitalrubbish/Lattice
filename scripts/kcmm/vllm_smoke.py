@@ -46,13 +46,16 @@ class SmokeConfig:
     keep_model: bool
     print_seams: bool
     instrument_allocators: bool
+    instrument_kv_writes: bool
     runtime_derived_pool: bool
     shadow_allocations: bool
     backed_allocations: bool
     allocator_trace_path: Path
+    kv_write_trace_path: Path
     shadow_report_path: Path
     backed_report_path: Path
     require_allocator_seams: bool
+    require_kv_write_seams: bool
     log_path: Path
 
     @property
@@ -114,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Size the KCMM pool from vLLM runtime cache/model configuration.",
     )
     parser.add_argument(
+        "--instrument-kv-writes",
+        action="store_true",
+        help="Enable observer-only reshape_and_cache KV write instrumentation.",
+    )
+    parser.add_argument(
         "--shadow-allocations",
         action="store_true",
         help="Mirror vLLM GPU block allocations into KCMM shadow allocator.",
@@ -133,6 +141,17 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Fail when instrumentation does not observe required allocator seams.",
+    )
+    parser.add_argument(
+        "--kv-write-trace-path",
+        default=None,
+        help="KV write instrumentation JSONL trace path. Defaults to a /tmp file.",
+    )
+    parser.add_argument(
+        "--require-kv-write-seams",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail when KV write instrumentation does not observe reshape_and_cache.",
     )
     parser.add_argument(
         "--log-path",
@@ -155,6 +174,12 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         if args.allocator_trace_path
         else Path(tempfile.gettempdir())
         / f"kcmm-vllm-allocator-trace-{int(time.time() * 1000)}.jsonl"
+    )
+    kv_write_trace_path = (
+        Path(args.kv_write_trace_path)
+        if args.kv_write_trace_path
+        else Path(tempfile.gettempdir())
+        / f"kcmm-vllm-kv-write-trace-{int(time.time() * 1000)}.jsonl"
     )
     shadow_report_path = (
         Path(tempfile.gettempdir())
@@ -179,6 +204,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         keep_model=args.keep_model,
         print_seams=args.print_seams,
         instrument_allocators=args.instrument_allocators,
+        instrument_kv_writes=args.instrument_kv_writes,
         runtime_derived_pool=(
             args.runtime_derived_pool
             or args.shadow_allocations
@@ -187,9 +213,11 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         shadow_allocations=args.shadow_allocations,
         backed_allocations=args.backed_allocations,
         allocator_trace_path=allocator_trace_path,
+        kv_write_trace_path=kv_write_trace_path,
         shadow_report_path=shadow_report_path,
         backed_report_path=backed_report_path,
         require_allocator_seams=args.require_allocator_seams,
+        require_kv_write_seams=args.require_kv_write_seams,
         log_path=log_path,
     )
 
@@ -429,6 +457,16 @@ def vllm_command(config: SmokeConfig) -> list[str]:
         )
         if config.require_allocator_seams:
             command.append("--kcmm-require-allocator-seams")
+    if config.instrument_kv_writes:
+        command.extend(
+            [
+                "--kcmm-instrument-kv-writes",
+                "--kcmm-kv-write-trace-path",
+                str(config.kv_write_trace_path),
+            ]
+        )
+        if config.require_kv_write_seams:
+            command.append("--kcmm-require-kv-write-seams")
     if config.print_seams:
         command.append("--kcmm-print-seams")
     command.extend(
@@ -462,6 +500,7 @@ def vllm_command(config: SmokeConfig) -> list[str]:
     )
     if (
         config.instrument_allocators
+        or config.instrument_kv_writes
         or config.runtime_derived_pool
         or config.shadow_allocations
         or config.backed_allocations
@@ -497,6 +536,39 @@ def read_allocator_trace(path: Path) -> dict[str, Any]:
         "event_count": len(events),
         "counts": summary.get("counts", {}),
         "missing_required_groups": missing,
+    }
+
+
+def read_kv_write_trace(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise SmokeFailure(f"KV write trace was not written: {path}")
+    events: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                events.append(json.loads(line))
+    summary = next(
+        (event for event in reversed(events) if event.get("event") == "summary"),
+        None,
+    )
+    if summary is None:
+        raise SmokeFailure(f"KV write trace has no summary event: {path}")
+    missing = summary.get("missing_required_groups") or {}
+    if missing:
+        raise SmokeFailure(
+            "KV write instrumentation did not observe required seams: "
+            + json.dumps(missing, sort_keys=True)
+        )
+    write_events = [event for event in events if event.get("event") == "kv_write_call"]
+    if not write_events:
+        raise SmokeFailure(f"KV write trace has no write events: {path}")
+    return {
+        "path": str(path),
+        "event_count": len(events),
+        "write_event_count": len(write_events),
+        "counts": summary.get("counts", {}),
+        "missing_required_groups": missing,
+        "first_write": write_events[0],
     }
 
 
@@ -719,6 +791,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "completion": completion,
             "generated_model": generated_model,
             "runtime_derived_pool": config.runtime_derived_pool,
+            "instrument_kv_writes": config.instrument_kv_writes,
             "shadow_allocations": config.shadow_allocations,
             "backed_allocations": config.backed_allocations,
         }
@@ -737,6 +810,8 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         result["gpu_memory"] = gpu_memory
     if config.instrument_allocators:
         result["allocator_trace"] = read_allocator_trace(config.allocator_trace_path)
+    if config.instrument_kv_writes:
+        result["kv_write_trace"] = read_kv_write_trace(config.kv_write_trace_path)
     if config.shadow_allocations:
         result["shadow_allocator"] = read_shadow_report(config.shadow_report_path)
     if config.backed_allocations:

@@ -14,6 +14,7 @@ from .config import ObserverConfig, VllmRuntimeSizing, add_kcmm_args
 from .patch_vllm import (
     apply_allocator_instrumentation,
     apply_kcmm_backed_allocator,
+    apply_kv_write_instrumentation,
     apply_observer_patches,
     apply_shadow_allocator,
     apply_runtime_pool_sizing,
@@ -254,6 +255,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     seam_report = None
     allocator_report = None
+    kv_write_report = None
     runtime_pool_report = None
     shadow_report = None
     backed_report = None
@@ -273,6 +275,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             require_seams=config.require_allocator_seams,
         )
         _print_json({"vllm_allocator_instrumentation": allocator_report})
+
+    if config.instrument_kv_writes:
+        kv_write_report = apply_kv_write_instrumentation(
+            trace_path=config.kv_write_trace_path,
+            require_seams=config.require_kv_write_seams,
+        )
+        _print_json({"vllm_kv_write_instrumentation": kv_write_report})
 
     if not config.skip_observer and config.pool_mode == "runtime":
 
@@ -335,6 +344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "observer": observer_report,
                 "vllm_seams": seam_report,
                 "vllm_allocator_instrumentation": allocator_report,
+                "vllm_kv_write_instrumentation": kv_write_report,
                 "kcmm_runtime_pool_sizing": runtime_pool_report,
                 "kcmm_shadow_allocator_patch": shadow_report,
                 "kcmm_backed_allocator_patch": backed_report,

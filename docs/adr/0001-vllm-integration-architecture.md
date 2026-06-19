@@ -159,6 +159,9 @@ pass.
 Before patching vLLM, `python -m scripts.kcmm.kv_write_ffi_smoke` must pass. This
 preflight gate proves the Python launcher can call `kcmm_append_kv_step`, read
 back KCMM VA bytes, and detect K/V mismatches independently of vLLM scheduling.
+Then `python -m scripts.kcmm.vllm_smoke --instrument-kv-writes` must pass to
+record the version-pinned `reshape_and_cache` tensor contract that the
+replacement must preserve.
 
 ### Why A1 over A2 for VA remapping (intercept 3)
 
