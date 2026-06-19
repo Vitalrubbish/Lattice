@@ -1,6 +1,6 @@
 # Make vLLM smoke runs self-terminating
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build
@@ -18,13 +18,13 @@ graceful shutdown hangs.
 
 ## Acceptance criteria
 
-- [ ] A single command can run the KCMM vLLM smoke test from a clean checkout after the documented conda environment is active.
-- [ ] The runner starts vLLM through the KCMM launcher with the V2 block manager enabled.
-- [ ] The runner waits for readiness by querying the API instead of sleeping a fixed amount.
-- [ ] The runner verifies both model listing and one completion request return HTTP 200.
-- [ ] The runner terminates the whole subprocess tree and verifies the configured port is no longer listening.
-- [ ] The runner reports enough stdout/stderr context to diagnose startup failures without opening raw logs manually.
-- [ ] The runner can run in a mode that skips KCMM observer setup, so stock vLLM and KCMM launcher paths can share the same lifecycle harness.
+- [x] A single command can run the KCMM vLLM smoke test from a clean checkout after the documented conda environment is active.
+- [x] The runner starts vLLM through the KCMM launcher with the V2 block manager enabled.
+- [x] The runner waits for readiness by querying the API instead of sleeping a fixed amount.
+- [x] The runner verifies both model listing and one completion request return HTTP 200.
+- [x] The runner terminates the whole subprocess tree and verifies the configured port is no longer listening.
+- [x] The runner reports enough stdout/stderr context to diagnose startup failures without opening raw logs manually.
+- [x] The runner can run in a mode that skips KCMM observer setup, so stock vLLM and KCMM launcher paths can share the same lifecycle harness.
 
 ## Blocked by
 

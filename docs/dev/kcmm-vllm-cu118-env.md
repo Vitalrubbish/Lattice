@@ -65,6 +65,20 @@ python -m scripts.kcmm \
 
 ## vLLM server smoke test
 
+Run the automated self-terminating smoke test:
+
+```bash
+python -m scripts.kcmm.vllm_smoke
+```
+
+Use stock vLLM behavior through the same process harness:
+
+```bash
+python -m scripts.kcmm.vllm_smoke --mode stock
+```
+
+The manual steps below are the expanded form of the same check.
+
 Generate a tiny local OPT model with a vLLM-supported attention head size. This
 avoids downloading `facebook/opt-125m` during environment validation.
 

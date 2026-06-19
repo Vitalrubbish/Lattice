@@ -1,0 +1,449 @@
+"""Self-terminating KCMM/vLLM server smoke test."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_MODEL_PATH = ".scratch/kcmm-vllm/tiny-opt-head64"
+DEFAULT_MODEL_NAME = "tiny-opt-kcmm"
+DEFAULT_KCMM_LIB_PATH = "target/debug/libbaseline_llm_os.so"
+_DIRECT_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class SmokeFailure(RuntimeError):
+    """Raised when the smoke test cannot complete successfully."""
+
+
+@dataclass(frozen=True)
+class SmokeConfig:
+    mode: str
+    host: str
+    port: int
+    model_path: Path
+    model_name: str
+    kcmm_lib_path: Path
+    timeout_seconds: float
+    shutdown_timeout_seconds: float
+    prompt: str
+    max_tokens: int
+    build_kcmm: bool
+    keep_model: bool
+    print_seams: bool
+    log_path: Path
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve_repo_path(path: str) -> Path:
+    value = Path(path)
+    return value if value.is_absolute() else repo_root() / value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=("kcmm", "stock"),
+        default="kcmm",
+        help="kcmm runs the observer launcher; stock passes --kcmm-skip-observer.",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--kcmm-lib-path", default=DEFAULT_KCMM_LIB_PATH)
+    parser.add_argument("--timeout-seconds", type=float, default=180.0)
+    parser.add_argument("--shutdown-timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--prompt", default="Hello")
+    parser.add_argument("--max-tokens", type=int, default=4)
+    parser.add_argument(
+        "--build-kcmm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Build the KCMM shared library when running in kcmm mode.",
+    )
+    parser.add_argument(
+        "--keep-model",
+        action="store_true",
+        help="Keep the generated tiny model after the smoke run.",
+    )
+    parser.add_argument(
+        "--print-seams",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ask the KCMM launcher to print vLLM seam inspection output.",
+    )
+    parser.add_argument(
+        "--log-path",
+        default=None,
+        help="Combined vLLM stdout/stderr log path. Defaults to a /tmp file.",
+    )
+    return parser
+
+
+def parse_config(argv: list[str] | None = None) -> SmokeConfig:
+    args = build_parser().parse_args(argv)
+    log_path = (
+        Path(args.log_path)
+        if args.log_path
+        else Path(tempfile.gettempdir())
+        / f"kcmm-vllm-smoke-{int(time.time() * 1000)}.log"
+    )
+    return SmokeConfig(
+        mode=args.mode,
+        host=args.host,
+        port=args.port,
+        model_path=resolve_repo_path(args.model_path),
+        model_name=args.model_name,
+        kcmm_lib_path=resolve_repo_path(args.kcmm_lib_path),
+        timeout_seconds=args.timeout_seconds,
+        shutdown_timeout_seconds=args.shutdown_timeout_seconds,
+        prompt=args.prompt,
+        max_tokens=args.max_tokens,
+        build_kcmm=args.build_kcmm,
+        keep_model=args.keep_model,
+        print_seams=args.print_seams,
+        log_path=log_path,
+    )
+
+
+def tail_file(path: Path, lines: int = 120) -> str:
+    if not path.exists():
+        return ""
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return "".join(handle.readlines()[-lines:])
+
+
+def port_is_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def wait_for_port_closed(host: str, port: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not port_is_open(host, port):
+            return True
+        time.sleep(0.25)
+    return not port_is_open(host, port)
+
+
+def live_process_group_members(pgid: int) -> list[str]:
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,pgid=,stat=,cmd="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    members: list[str] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 3:
+            continue
+        pid_text, pgid_text, stat = parts[:3]
+        cmd = parts[3] if len(parts) == 4 else ""
+        try:
+            member_pgid = int(pgid_text)
+        except ValueError:
+            continue
+        if member_pgid == pgid and "Z" not in stat:
+            members.append(f"{pid_text} {pgid_text} {stat} {cmd}".rstrip())
+    return members
+
+
+def wait_process_exit(process: subprocess.Popen[None], timeout_seconds: float) -> bool:
+    if process.poll() is not None:
+        return True
+    try:
+        process.wait(timeout=max(timeout_seconds, 0.1))
+        return True
+    except subprocess.TimeoutExpired:
+        return process.poll() is not None
+
+
+def http_json(
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None = None,
+    timeout_seconds: float = 2.0,
+) -> tuple[int, dict[str, Any]]:
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with _DIRECT_HTTP_OPENER.open(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            return response.status, json.loads(body)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = {"body": body}
+        return exc.code, parsed
+
+
+def run_checked(command: list[str], description: str) -> None:
+    print(f"{description}: {' '.join(command)}", flush=True)
+    try:
+        subprocess.run(command, cwd=repo_root(), check=True)
+    except subprocess.CalledProcessError as exc:
+        raise SmokeFailure(f"{description} failed with exit code {exc.returncode}") from exc
+
+
+def ensure_kcmm_library(config: SmokeConfig) -> None:
+    if config.mode != "kcmm":
+        return
+    if config.build_kcmm or not config.kcmm_lib_path.exists():
+        cargo = shutil.which("cargo")
+        if cargo is None:
+            raise SmokeFailure("cargo not found; cannot build KCMM shared library")
+        run_checked([cargo, "build", "--features", "kcmm"], "build KCMM")
+    if not config.kcmm_lib_path.exists():
+        raise SmokeFailure(f"KCMM shared library not found: {config.kcmm_lib_path}")
+
+
+def ensure_tiny_model(model_path: Path) -> bool:
+    required = ["config.json", "model.safetensors", "tokenizer.json"]
+    if all((model_path / name).exists() for name in required):
+        return False
+
+    script = repo_root() / "scripts" / "kcmm" / "create_tiny_opt_model.py"
+    run_checked(
+        [sys.executable, str(script), "--output", str(model_path)],
+        "create tiny OPT model",
+    )
+    return True
+
+
+def vllm_command(config: SmokeConfig) -> list[str]:
+    command = [sys.executable, "-m", "scripts.kcmm"]
+    if config.mode == "stock":
+        command.append("--kcmm-skip-observer")
+    else:
+        command.extend(["--kcmm-lib-path", str(config.kcmm_lib_path)])
+    if config.print_seams:
+        command.append("--kcmm-print-seams")
+    command.extend(
+        [
+            "serve",
+            str(config.model_path),
+            "--host",
+            config.host,
+            "--port",
+            str(config.port),
+            "--dtype",
+            "float16",
+            "--max-model-len",
+            "64",
+            "--gpu-memory-utilization",
+            "0.25",
+            "--max-num-seqs",
+            "1",
+            "--max-num-batched-tokens",
+            "64",
+            "--enforce-eager",
+            "--max-seq-len-to-capture",
+            "64",
+            "--guided-decoding-backend",
+            "lm-format-enforcer",
+            "--disable-log-requests",
+            "--served-model-name",
+            config.model_name,
+            "--use-v2-block-manager",
+        ]
+    )
+    return command
+
+
+def start_server(config: SmokeConfig) -> subprocess.Popen[None]:
+    if port_is_open(config.host, config.port):
+        raise SmokeFailure(f"port already listening: {config.host}:{config.port}")
+    config.log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = config.log_path.open("w", encoding="utf-8")
+    command = vllm_command(config)
+    env = os.environ.copy()
+    no_proxy_entries = [config.host, "127.0.0.1", "localhost", "::1"]
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = env.get(key, "")
+        existing_entries = [entry for entry in existing.split(",") if entry]
+        merged = [*existing_entries]
+        for entry in no_proxy_entries:
+            if entry not in merged:
+                merged.append(entry)
+        env[key] = ",".join(merged)
+    print(f"start vLLM: {' '.join(command)}", flush=True)
+    print(f"log: {config.log_path}", flush=True)
+    return subprocess.Popen(
+        command,
+        cwd=repo_root(),
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        text=True,
+    )
+
+
+def terminate_server(
+    process: subprocess.Popen[None],
+    config: SmokeConfig,
+) -> None:
+    if process.poll() is None:
+        deadlines = [
+            (signal.SIGINT, config.shutdown_timeout_seconds * 0.30),
+            (signal.SIGTERM, config.shutdown_timeout_seconds * 0.15),
+            (signal.SIGKILL, config.shutdown_timeout_seconds * 0.55),
+        ]
+        for sig, timeout in deadlines:
+            if process.poll() is not None:
+                break
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                break
+            if wait_process_exit(process, max(timeout, 1.0)):
+                break
+
+    if not wait_for_port_closed(
+        config.host,
+        config.port,
+        timeout_seconds=config.shutdown_timeout_seconds,
+    ):
+        raise SmokeFailure(f"port still listening after shutdown: {config.port}")
+
+    wait_process_exit(process, 0.5)
+    live_members = live_process_group_members(process.pid)
+    if process.poll() is None and live_members:
+        raise SmokeFailure(
+            "vLLM process group still has live members after shutdown: "
+            + "; ".join(live_members)
+        )
+
+
+def wait_for_ready(
+    process: subprocess.Popen[None],
+    config: SmokeConfig,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + config.timeout_seconds
+    last_error = ""
+    url = f"{config.base_url}/v1/models"
+    while time.monotonic() < deadline:
+        rc = process.poll()
+        if rc is not None:
+            raise SmokeFailure(
+                f"vLLM exited before readiness with code {rc}\n"
+                f"last log lines:\n{tail_file(config.log_path)}"
+            )
+        try:
+            status, payload = http_json("GET", url, timeout_seconds=1.0)
+            if status == 200 and payload.get("object") == "list":
+                return payload
+            last_error = f"GET /v1/models returned {status}: {payload}"
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            last_error = repr(exc)
+        time.sleep(0.5)
+
+    raise SmokeFailure(
+        f"vLLM did not become ready within {config.timeout_seconds}s; "
+        f"last error: {last_error}\nlast log lines:\n{tail_file(config.log_path)}"
+    )
+
+
+def run_completion(config: SmokeConfig) -> dict[str, Any]:
+    status, payload = http_json(
+        "POST",
+        f"{config.base_url}/v1/completions",
+        payload={
+            "model": config.model_name,
+            "prompt": config.prompt,
+            "max_tokens": config.max_tokens,
+            "temperature": 0,
+        },
+        timeout_seconds=config.timeout_seconds,
+    )
+    if status != 200:
+        raise SmokeFailure(
+            f"POST /v1/completions returned {status}: {payload}\n"
+            f"last log lines:\n{tail_file(config.log_path)}"
+        )
+    choices = payload.get("choices")
+    if not choices:
+        raise SmokeFailure(f"completion response has no choices: {payload}")
+    return payload
+
+
+def run_smoke(config: SmokeConfig) -> dict[str, Any]:
+    ensure_kcmm_library(config)
+    generated_model = ensure_tiny_model(config.model_path)
+    process: subprocess.Popen[None] | None = None
+    started_at = time.monotonic()
+    try:
+        process = start_server(config)
+        models = wait_for_ready(process, config)
+        ready_at = time.monotonic()
+        completion = run_completion(config)
+        completed_at = time.monotonic()
+        return {
+            "mode": config.mode,
+            "base_url": config.base_url,
+            "model_path": str(config.model_path),
+            "model_name": config.model_name,
+            "log_path": str(config.log_path),
+            "startup_seconds": round(ready_at - started_at, 3),
+            "completion_seconds": round(completed_at - ready_at, 3),
+            "models": models,
+            "completion": completion,
+            "generated_model": generated_model,
+        }
+    finally:
+        if process is not None:
+            terminate_server(process, config)
+        if generated_model and not config.keep_model:
+            shutil.rmtree(config.model_path, ignore_errors=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    config = parse_config(argv)
+    try:
+        result = run_smoke(config)
+    except SmokeFailure as exc:
+        print(f"KCMM vLLM smoke failed: {exc}", file=sys.stderr)
+        if config.log_path.exists():
+            print(f"\nLog tail ({config.log_path}):", file=sys.stderr)
+            print(tail_file(config.log_path), file=sys.stderr)
+        return 1
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
