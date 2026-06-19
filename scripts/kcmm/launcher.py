@@ -1,4 +1,4 @@
-"""Launch vLLM with the KCMM Phase I.C observer pool."""
+"""Launch vLLM with KCMM observer and Phase II.A runtime pool hooks."""
 
 from __future__ import annotations
 
@@ -6,11 +6,15 @@ import argparse
 import atexit
 import json
 import sys
-from typing import Sequence
+from typing import Any, Sequence
 
 from .bindings import KcmmError, KcmmLibrary, KcmmPool, result_to_dict
-from .config import ObserverConfig, add_kcmm_args
-from .patch_vllm import apply_allocator_instrumentation, apply_observer_patches
+from .config import ObserverConfig, VllmRuntimeSizing, add_kcmm_args
+from .patch_vllm import (
+    apply_allocator_instrumentation,
+    apply_observer_patches,
+    apply_runtime_pool_sizing,
+)
 
 
 _ACTIVE_POOL: KcmmPool | None = None
@@ -54,15 +58,122 @@ def _destroy_active_pool() -> None:
 
 def _create_observer_pool(
     config: ObserverConfig,
+    *,
+    source: str = "fixed",
+    runtime_sizing: VllmRuntimeSizing | None = None,
 ) -> tuple[KcmmPool, dict[str, object]]:
     cuda_info = initialize_torch_cuda(config.device_ordinal)
     library = KcmmLibrary(config.library_path)
     pool = library.create_pool(config.to_c_config())
     probe = pool.observer_probe(blocks=config.probe_blocks)
-    return pool, {
+    report: dict[str, object] = {
+        "phase": "II.A" if source == "runtime" else "I.C",
+        "pool_source": source,
+        "kcmm_config": config.pool_shape_dict(),
         "cuda": cuda_info,
         "kcmm": result_to_dict(probe),
     }
+    if runtime_sizing is not None:
+        report["vllm_runtime"] = runtime_sizing.to_dict()
+        report["alignment"] = {
+            "kcmm_max_blocks": config.max_blocks,
+            "vllm_effective_num_gpu_blocks": runtime_sizing.effective_num_gpu_blocks,
+            "max_blocks_match": (
+                config.max_blocks == runtime_sizing.effective_num_gpu_blocks
+            ),
+            "tiering_disabled": not config.enable_tiering,
+        }
+    return pool, report
+
+
+def _required_positive_int(value: object, name: str) -> int:
+    if value is None:
+        raise KcmmError(f"missing vLLM runtime sizing field: {name}")
+    try:
+        integer = int(value)
+    except (TypeError, ValueError) as exc:
+        raise KcmmError(f"invalid vLLM runtime sizing field {name}: {value!r}") from exc
+    if integer <= 0:
+        raise KcmmError(f"vLLM runtime sizing field {name} must be positive")
+    return integer
+
+
+def _runtime_sizing_from_engine(engine: Any) -> VllmRuntimeSizing:
+    try:
+        import vllm
+    except Exception:
+        vllm = None
+
+    model_config = getattr(engine, "model_config", None)
+    cache_config = getattr(engine, "cache_config", None)
+    parallel_config = getattr(engine, "parallel_config", None)
+    scheduler_config = getattr(engine, "scheduler_config", None)
+    if model_config is None:
+        raise KcmmError("vLLM engine has no model_config")
+    if cache_config is None:
+        raise KcmmError("vLLM engine has no cache_config")
+    if parallel_config is None:
+        raise KcmmError("vLLM engine has no parallel_config")
+    if scheduler_config is None:
+        raise KcmmError("vLLM engine has no scheduler_config")
+
+    pipeline_parallel_size = _required_positive_int(
+        getattr(parallel_config, "pipeline_parallel_size", None),
+        "parallel_config.pipeline_parallel_size",
+    )
+    num_gpu_blocks = _required_positive_int(
+        getattr(cache_config, "num_gpu_blocks", None),
+        "cache_config.num_gpu_blocks",
+    )
+    effective_num_gpu_blocks = max(1, num_gpu_blocks // pipeline_parallel_size)
+
+    try:
+        num_layers = model_config.get_num_attention_layers(parallel_config)
+        kv_heads = model_config.get_num_kv_heads(parallel_config)
+        head_dim = model_config.get_head_size()
+    except Exception as exc:
+        raise KcmmError(f"failed to derive vLLM model KV shape: {exc}") from exc
+
+    max_num_batched_tokens = getattr(scheduler_config, "max_num_batched_tokens", 0)
+    if max_num_batched_tokens is None:
+        max_num_batched_tokens = 0
+
+    return VllmRuntimeSizing(
+        vllm_version=getattr(vllm, "__version__", "unknown"),
+        block_size=_required_positive_int(
+            getattr(cache_config, "block_size", None),
+            "cache_config.block_size",
+        ),
+        num_gpu_blocks=num_gpu_blocks,
+        num_cpu_blocks=int(getattr(cache_config, "num_cpu_blocks", 0) or 0),
+        effective_num_gpu_blocks=effective_num_gpu_blocks,
+        num_layers=_required_positive_int(num_layers, "model_config.num_attention_layers"),
+        kv_heads=_required_positive_int(kv_heads, "model_config.num_kv_heads"),
+        head_dim=_required_positive_int(head_dim, "model_config.head_size"),
+        max_model_len=_required_positive_int(
+            getattr(model_config, "max_model_len", None),
+            "model_config.max_model_len",
+        ),
+        max_num_seqs=_required_positive_int(
+            getattr(scheduler_config, "max_num_seqs", None),
+            "scheduler_config.max_num_seqs",
+        ),
+        max_num_batched_tokens=int(max_num_batched_tokens),
+        tensor_parallel_size=_required_positive_int(
+            getattr(parallel_config, "tensor_parallel_size", None),
+            "parallel_config.tensor_parallel_size",
+        ),
+        pipeline_parallel_size=pipeline_parallel_size,
+        cache_dtype=str(getattr(cache_config, "cache_dtype", "unknown")),
+        model_dtype=str(getattr(model_config, "dtype", "unknown")),
+        use_v2_block_manager=bool(
+            getattr(scheduler_config, "use_v2_block_manager", False)
+        ),
+        enforce_eager=bool(getattr(model_config, "enforce_eager", False)),
+        enable_prefix_caching=bool(
+            getattr(cache_config, "enable_prefix_caching", False)
+        ),
+    )
 
 
 def _run_vllm(vllm_args: Sequence[str]) -> int:
@@ -93,15 +204,66 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     config = ObserverConfig.from_namespace(namespace)
+    try:
+        config.validate()
+    except Exception as exc:
+        print(f"Invalid KCMM launcher configuration: {exc}", file=sys.stderr)
+        return 2
+
+    if config.pool_mode == "runtime":
+        if config.observer_only:
+            print(
+                "KCMM runtime pool mode requires a vLLM engine; "
+                "use --kcmm-pool-mode fixed with --kcmm-observer-only.",
+                file=sys.stderr,
+            )
+            return 2
+        if config.destroy_before_vllm:
+            print(
+                "KCMM runtime pool mode is incompatible with "
+                "--kcmm-destroy-before-vllm.",
+                file=sys.stderr,
+            )
+            return 2
+        if "--disable-frontend-multiprocessing" not in vllm_args:
+            print(
+                "KCMM runtime pool mode requires vLLM "
+                "--disable-frontend-multiprocessing so monkey-patches run in "
+                "the engine process.",
+                file=sys.stderr,
+            )
+            return 2
 
     seam_report = None
     allocator_report = None
+    runtime_pool_report = None
     if config.instrument_allocators:
         allocator_report = apply_allocator_instrumentation(
             trace_path=config.allocator_trace_path,
             require_seams=config.require_allocator_seams,
         )
         _print_json({"vllm_allocator_instrumentation": allocator_report})
+
+    if not config.skip_observer and config.pool_mode == "runtime":
+
+        def create_runtime_pool(engine: Any) -> dict[str, Any]:
+            global _ACTIVE_POOL
+            if _ACTIVE_POOL is not None:
+                return {"skipped": "KCMM runtime pool already active"}
+            runtime_sizing = _runtime_sizing_from_engine(engine)
+            runtime_config = config.with_runtime_sizing(runtime_sizing)
+            pool, report = _create_observer_pool(
+                runtime_config,
+                source="runtime",
+                runtime_sizing=runtime_sizing,
+            )
+            _ACTIVE_POOL = pool
+            atexit.register(_destroy_active_pool)
+            _print_json({"observer": report})
+            return report
+
+        runtime_pool_report = apply_runtime_pool_sizing(create_runtime_pool)
+        _print_json({"kcmm_runtime_pool_sizing": runtime_pool_report})
 
     if config.print_seams:
         seam_report = apply_observer_patches()
@@ -117,7 +279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     observer_report: dict[str, object] | None = None
-    if not config.skip_observer:
+    if not config.skip_observer and config.pool_mode == "fixed":
         try:
             pool, observer_report = _create_observer_pool(config)
         except Exception as exc:
@@ -136,6 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "observer": observer_report,
                 "vllm_seams": seam_report,
                 "vllm_allocator_instrumentation": allocator_report,
+                "kcmm_runtime_pool_sizing": runtime_pool_report,
             },
             stream=sys.stdout,
         )

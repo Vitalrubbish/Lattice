@@ -115,6 +115,18 @@ Instrumentation mode keeps the vLLM engine in the launcher process with
 `--disable-frontend-multiprocessing` so the Python monkey-patches apply to the
 actual block manager and allocator objects.
 
+Run with a Phase II.A runtime-derived KCMM pool:
+
+```bash
+python -m scripts.kcmm.vllm_smoke --runtime-derived-pool
+```
+
+This passes `--kcmm-pool-mode runtime` to the launcher. The KCMM pool is created
+after vLLM has profiled and recorded cache capacity, using vLLM runtime values
+for block size, GPU block budget, attention layer count, KV heads, head
+dimension, max model length, and max sequences. The launcher still leaves vLLM
+allocation behavior unchanged and keeps tiering disabled.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This

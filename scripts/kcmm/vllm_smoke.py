@@ -45,6 +45,7 @@ class SmokeConfig:
     keep_model: bool
     print_seams: bool
     instrument_allocators: bool
+    runtime_derived_pool: bool
     allocator_trace_path: Path
     require_allocator_seams: bool
     log_path: Path
@@ -103,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable observer-only vLLM V2 allocator seam instrumentation.",
     )
     parser.add_argument(
+        "--runtime-derived-pool",
+        action="store_true",
+        help="Size the KCMM pool from vLLM runtime cache/model configuration.",
+    )
+    parser.add_argument(
         "--allocator-trace-path",
         default=None,
         help="Allocator instrumentation JSONL trace path. Defaults to a /tmp file.",
@@ -150,6 +156,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         keep_model=args.keep_model,
         print_seams=args.print_seams,
         instrument_allocators=args.instrument_allocators,
+        runtime_derived_pool=args.runtime_derived_pool,
         allocator_trace_path=allocator_trace_path,
         require_allocator_seams=args.require_allocator_seams,
         log_path=log_path,
@@ -277,6 +284,8 @@ def vllm_command(config: SmokeConfig) -> list[str]:
         command.append("--kcmm-skip-observer")
     else:
         command.extend(["--kcmm-lib-path", str(config.kcmm_lib_path)])
+        if config.runtime_derived_pool:
+            command.extend(["--kcmm-pool-mode", "runtime"])
     if config.instrument_allocators:
         command.extend(
             [
@@ -318,7 +327,7 @@ def vllm_command(config: SmokeConfig) -> list[str]:
             "--use-v2-block-manager",
         ]
     )
-    if config.instrument_allocators:
+    if config.instrument_allocators or config.runtime_derived_pool:
         # Keep vLLM's engine in this Python process so launcher monkey-patches
         # apply to the block manager and allocator objects being exercised.
         command.append("--disable-frontend-multiprocessing")
@@ -471,6 +480,8 @@ def run_completion(config: SmokeConfig) -> dict[str, Any]:
 
 
 def run_smoke(config: SmokeConfig) -> dict[str, Any]:
+    if config.runtime_derived_pool and config.mode != "kcmm":
+        raise SmokeFailure("--runtime-derived-pool requires --mode kcmm")
     ensure_kcmm_library(config)
     generated_model = ensure_tiny_model(config.model_path)
     process: subprocess.Popen[None] | None = None
@@ -493,6 +504,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "models": models,
             "completion": completion,
             "generated_model": generated_model,
+            "runtime_derived_pool": config.runtime_derived_pool,
         }
     finally:
         if process is not None:

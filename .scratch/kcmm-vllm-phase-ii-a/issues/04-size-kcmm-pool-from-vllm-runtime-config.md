@@ -1,6 +1,6 @@
 # Size KCMM pool from vLLM runtime config
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build
@@ -17,13 +17,28 @@ replacement happens.
 
 ## Acceptance criteria
 
-- [ ] KCMM pool creation can use vLLM runtime values for block size, model layer count, KV heads, head dimension, max sequence length, and effective GPU block capacity.
-- [ ] The launcher retains the existing fixed-shape observer mode for quick CUDA probes.
-- [ ] The vLLM server smoke test can run with runtime-derived KCMM sizing and still complete one request.
-- [ ] The observer report includes enough vLLM and KCMM sizing fields to verify capacity alignment.
-- [ ] Tiering remains disabled for this path.
-- [ ] Invalid or unavailable vLLM sizing data fails closed with a clear error message.
-- [ ] Unit or smoke coverage verifies that the runtime-derived config path does not regress the existing observer-only probe.
+- [x] KCMM pool creation can use vLLM runtime values for block size, model layer count, KV heads, head dimension, max sequence length, and effective GPU block capacity.
+- [x] The launcher retains the existing fixed-shape observer mode for quick CUDA probes.
+- [x] The vLLM server smoke test can run with runtime-derived KCMM sizing and still complete one request.
+- [x] The observer report includes enough vLLM and KCMM sizing fields to verify capacity alignment.
+- [x] Tiering remains disabled for this path.
+- [x] Invalid or unavailable vLLM sizing data fails closed with a clear error message.
+- [x] Unit or smoke coverage verifies that the runtime-derived config path does not regress the existing observer-only probe.
+
+## Validation
+
+- `python -m py_compile scripts/kcmm/*.py`
+- `cargo build --features kcmm`
+- `python -m scripts.kcmm --kcmm-observer-only --kcmm-lib-path target/debug/libbaseline_llm_os.so --kcmm-print-seams`
+- `python -m scripts.kcmm.vllm_smoke --runtime-derived-pool`
+- `python -m scripts.kcmm.vllm_smoke`
+- `python -m scripts.kcmm --kcmm-pool-mode runtime --kcmm-observer-only --kcmm-lib-path target/debug/libbaseline_llm_os.so` exits with configuration error
+- `python -m scripts.kcmm --kcmm-pool-mode runtime --kcmm-lib-path target/debug/libbaseline_llm_os.so serve .scratch/nonexistent-model` exits before serving because `--disable-frontend-multiprocessing` is missing
+
+The runtime-derived smoke report recorded `pool_source=runtime`,
+`max_blocks_match=true`, `tiering_disabled=true`, vLLM
+`effective_num_gpu_blocks=134685`, and KCMM `max_blocks=134685` for the local
+tiny OPT smoke model.
 
 ## Blocked by
 

@@ -18,7 +18,7 @@ import threading
 from dataclasses import asdict, dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 SEAMS = (
@@ -102,6 +102,7 @@ _TRACE_COUNTS: dict[str, int] = {}
 _TRACE_SEQUENCE = 0
 _INSTRUMENTED = False
 _REQUIRE_SEAMS = False
+_RUNTIME_POOL_PATCHED = False
 
 
 @dataclass(frozen=True)
@@ -306,6 +307,38 @@ def _wrap_method(class_path: str, cls: type, method_name: str) -> None:
     setattr(cls, method_name, wrapper)
 
 
+def _wrap_llm_engine_init(callback: Callable[[Any], dict[str, Any]]) -> bool:
+    module = importlib.import_module("vllm.engine.llm_engine")
+    cls = getattr(module, "LLMEngine")
+    original = getattr(cls, "__init__")
+    if getattr(original, "_kcmm_runtime_pool_patched", False):
+        return False
+
+    @wraps(original)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        try:
+            report = callback(self)
+        except BaseException as exc:
+            print(
+                "KCMM runtime-derived pool initialization failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        _write_trace(
+            {
+                "event": "runtime_pool_sized",
+                "report": _safe_summary(report),
+            }
+        )
+
+    wrapper._kcmm_runtime_pool_patched = True  # type: ignore[attr-defined]
+    setattr(cls, "__init__", wrapper)
+    return True
+
+
 def inspect_vllm_seams() -> dict[str, object]:
     try:
         import vllm
@@ -362,6 +395,29 @@ def apply_observer_patches() -> dict[str, object]:
     report = inspect_vllm_seams()
     report["reason"] = "observer-only phase; no monkey-patching applied"
     return report
+
+
+def apply_runtime_pool_sizing(
+    callback: Callable[[Any], dict[str, Any]],
+) -> dict[str, object]:
+    """Patch vLLM so KCMM can size its pool from live engine config."""
+
+    global _RUNTIME_POOL_PATCHED
+
+    report = inspect_vllm_seams()
+    patched = False
+    if not _RUNTIME_POOL_PATCHED:
+        patched = _wrap_llm_engine_init(callback)
+        _RUNTIME_POOL_PATCHED = True
+
+    return {
+        "phase": "II.A",
+        "patched": True,
+        "observer_only": True,
+        "target": "vllm.engine.llm_engine.LLMEngine.__init__",
+        "new_patch_installed": patched,
+        "seam_report": report,
+    }
 
 
 def apply_allocator_instrumentation(

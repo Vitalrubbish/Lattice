@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 
 from .bindings import KcmmConfig
 
@@ -14,6 +14,8 @@ EVICTION_POLICY_CODES = {
     "lfu": 1,
     "fifo": 2,
 }
+
+POOL_MODES = ("fixed", "runtime")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -31,6 +33,54 @@ def _env_int(name: str, default: int) -> int:
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     return default if raw in (None, "") else float(raw)
+
+
+@dataclass(frozen=True)
+class VllmRuntimeSizing:
+    """vLLM runtime cache/model sizing values used to shape a KCMM pool."""
+
+    vllm_version: str
+    block_size: int
+    num_gpu_blocks: int
+    num_cpu_blocks: int
+    effective_num_gpu_blocks: int
+    num_layers: int
+    kv_heads: int
+    head_dim: int
+    max_model_len: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    cache_dtype: str
+    model_dtype: str
+    use_v2_block_manager: bool
+    enforce_eager: bool
+    enable_prefix_caching: bool
+
+    def validate(self) -> None:
+        positive_fields = (
+            "block_size",
+            "num_gpu_blocks",
+            "effective_num_gpu_blocks",
+            "num_layers",
+            "kv_heads",
+            "head_dim",
+            "max_model_len",
+            "max_num_seqs",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+        )
+        for field in positive_fields:
+            if getattr(self, field) <= 0:
+                raise ValueError(f"vLLM runtime sizing field {field} must be positive")
+        if not self.use_v2_block_manager:
+            raise ValueError("Phase II.A runtime pool sizing requires --use-v2-block-manager")
+        if not self.enforce_eager:
+            raise ValueError("Phase II.A runtime pool sizing requires --enforce-eager")
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -61,6 +111,7 @@ class ObserverConfig:
     attention_sink_blocks: int = 1
     recent_window_blocks: int = 4
     probe_blocks: int = 1
+    pool_mode: str = "fixed"
     observer_only: bool = False
     skip_observer: bool = False
     destroy_before_vllm: bool = False
@@ -95,6 +146,7 @@ class ObserverConfig:
             attention_sink_blocks=_env_int("KCMM_ATTENTION_SINK_BLOCKS", 1),
             recent_window_blocks=_env_int("KCMM_RECENT_WINDOW_BLOCKS", 4),
             probe_blocks=_env_int("KCMM_PROBE_BLOCKS", 1),
+            pool_mode=os.environ.get("KCMM_POOL_MODE", "fixed"),
             observer_only=_env_bool("KCMM_OBSERVER_ONLY", False),
             skip_observer=_env_bool("KCMM_SKIP_OBSERVER", False),
             destroy_before_vllm=_env_bool("KCMM_DESTROY_BEFORE_VLLM", False),
@@ -144,6 +196,46 @@ class ObserverConfig:
         cfg.recent_window_blocks = self.recent_window_blocks
         return cfg
 
+    def validate(self) -> None:
+        if self.pool_mode not in POOL_MODES:
+            raise ValueError(
+                f"unsupported KCMM pool mode: {self.pool_mode}; "
+                f"expected one of {', '.join(POOL_MODES)}"
+            )
+        if self.enable_tiering and self.pool_mode == "runtime":
+            raise ValueError("Phase II.A runtime-derived KCMM pool requires tiering disabled")
+
+    def with_runtime_sizing(self, sizing: VllmRuntimeSizing) -> "ObserverConfig":
+        sizing.validate()
+        return replace(
+            self,
+            block_size=sizing.block_size,
+            max_blocks=sizing.effective_num_gpu_blocks,
+            num_layers=sizing.num_layers,
+            kv_heads=sizing.kv_heads,
+            head_dim=sizing.head_dim,
+            max_batch=sizing.max_num_seqs,
+            max_seq_len=sizing.max_model_len,
+            enable_tiering=False,
+        )
+
+    def pool_shape_dict(self) -> dict[str, int | float | bool | str | None]:
+        return {
+            "pool_mode": self.pool_mode,
+            "device_ordinal": self.device_ordinal,
+            "block_size": self.block_size,
+            "max_blocks": self.max_blocks,
+            "num_layers": self.num_layers,
+            "kv_heads": self.kv_heads,
+            "head_dim": self.head_dim,
+            "max_batch": self.max_batch,
+            "max_seq_len": self.max_seq_len,
+            "max_batch_blocks": self.max_batch_blocks,
+            "probe_blocks": self.probe_blocks,
+            "enable_tiering": self.enable_tiering,
+            "cpu_cache_path": self.cpu_cache_path,
+        }
+
 
 def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--kcmm-help", action="store_true", default=None)
@@ -176,6 +268,7 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--kcmm-attention-sink-blocks", type=int, default=None)
     parser.add_argument("--kcmm-recent-window-blocks", type=int, default=None)
     parser.add_argument("--kcmm-probe-blocks", type=int, default=None)
+    parser.add_argument("--kcmm-pool-mode", choices=POOL_MODES, default=None)
     parser.add_argument("--kcmm-observer-only", action="store_true", default=None)
     parser.add_argument("--kcmm-skip-observer", action="store_true", default=None)
     parser.add_argument("--kcmm-destroy-before-vllm", action="store_true", default=None)
