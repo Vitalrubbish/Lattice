@@ -214,8 +214,54 @@ class KcmmLibrary:
         ]
         lib.kcmm_free_blocks.restype = ctypes.c_int
 
+        lib.kcmm_register_sequence.argtypes = [
+            pool,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.kcmm_register_sequence.restype = ctypes.c_int
+        lib.kcmm_unregister_sequence.argtypes = [pool, ctypes.c_uint32]
+        lib.kcmm_unregister_sequence.restype = ctypes.c_int
+        lib.kcmm_append_block_to_sequence.argtypes = [
+            pool,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        lib.kcmm_append_block_to_sequence.restype = ctypes.c_int
+        lib.kcmm_get_block_table.argtypes = [
+            pool,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.kcmm_get_block_table.restype = ctypes.c_int
+        lib.kcmm_get_block_table_va_offsets.argtypes = [
+            pool,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.kcmm_get_block_table_va_offsets.restype = ctypes.c_int
+
         lib.kcmm_get_block_va_offset.argtypes = [pool, ctypes.c_uint32]
         lib.kcmm_get_block_va_offset.restype = ctypes.c_uint64
+        lib.kcmm_get_va_k.argtypes = [pool, ctypes.c_uint32]
+        lib.kcmm_get_va_k.restype = ctypes.c_uint64
+        lib.kcmm_get_va_v.argtypes = [pool, ctypes.c_uint32]
+        lib.kcmm_get_va_v.restype = ctypes.c_uint64
+        lib.kcmm_append_kv_step.argtypes = [
+            pool,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        lib.kcmm_append_kv_step.restype = ctypes.c_int
         lib.kcmm_get_block_location.argtypes = [
             pool,
             ctypes.c_uint32,
@@ -284,10 +330,102 @@ class KcmmPool:
         rc = self.library.lib.kcmm_free_blocks(self.handle, arr, len(blocks))
         self._check(rc, "kcmm_free_blocks")
 
+    def register_sequence(self, block_table: list[int]) -> int:
+        arr = (ctypes.c_uint32 * len(block_table))(*block_table)
+        out = ctypes.c_uint32()
+        rc = self.library.lib.kcmm_register_sequence(
+            self.handle,
+            arr,
+            len(block_table),
+            ctypes.byref(out),
+        )
+        self._check(rc, "kcmm_register_sequence")
+        return int(out.value)
+
+    def unregister_sequence(self, seq_idx: int) -> None:
+        rc = self.library.lib.kcmm_unregister_sequence(self.handle, seq_idx)
+        self._check(rc, "kcmm_unregister_sequence")
+
+    def append_block_to_sequence(self, seq_idx: int, block_idx: int) -> None:
+        rc = self.library.lib.kcmm_append_block_to_sequence(
+            self.handle,
+            seq_idx,
+            block_idx,
+        )
+        self._check(rc, "kcmm_append_block_to_sequence")
+
+    def block_table(self, seq_idx: int, max_blocks: int) -> list[int]:
+        if max_blocks <= 0:
+            return []
+        out = (ctypes.c_uint32 * max_blocks)()
+        count = ctypes.c_uint32()
+        rc = self.library.lib.kcmm_get_block_table(
+            self.handle,
+            seq_idx,
+            out,
+            max_blocks,
+            ctypes.byref(count),
+        )
+        self._check(rc, "kcmm_get_block_table")
+        return [int(out[i]) for i in range(int(count.value))]
+
+    def block_table_va_offsets(self, seq_idx: int, max_blocks: int) -> list[int]:
+        if max_blocks <= 0:
+            return []
+        out = (ctypes.c_uint64 * max_blocks)()
+        count = ctypes.c_uint32()
+        rc = self.library.lib.kcmm_get_block_table_va_offsets(
+            self.handle,
+            seq_idx,
+            out,
+            max_blocks,
+            ctypes.byref(count),
+        )
+        self._check(rc, "kcmm_get_block_table_va_offsets")
+        return [int(out[i]) for i in range(int(count.value))]
+
     def block_va_offset(self, block_idx: int) -> int:
         return int(
             self.library.lib.kcmm_get_block_va_offset(self.handle, block_idx)
         )
+
+    def va_k(self, layer: int) -> int:
+        value = int(self.library.lib.kcmm_get_va_k(self.handle, layer))
+        if value == 0:
+            raise KcmmError(f"kcmm_get_va_k returned 0 for layer {layer}")
+        return value
+
+    def va_v(self, layer: int) -> int:
+        value = int(self.library.lib.kcmm_get_va_v(self.handle, layer))
+        if value == 0:
+            raise KcmmError(f"kcmm_get_va_v returned 0 for layer {layer}")
+        return value
+
+    def append_kv_step(
+        self,
+        layer_idx: int,
+        seq_indices: list[int],
+        positions: list[int],
+        k_src_ptr: int,
+        v_src_ptr: int,
+    ) -> None:
+        if len(seq_indices) != len(positions):
+            raise ValueError("seq_indices and positions must have equal length")
+        batch = len(seq_indices)
+        if batch <= 0:
+            raise ValueError("batch must be positive")
+        seq_arr = (ctypes.c_uint32 * batch)(*seq_indices)
+        pos_arr = (ctypes.c_uint32 * batch)(*positions)
+        rc = self.library.lib.kcmm_append_kv_step(
+            self.handle,
+            layer_idx,
+            seq_arr,
+            pos_arr,
+            batch,
+            int(k_src_ptr),
+            int(v_src_ptr),
+        )
+        self._check(rc, "kcmm_append_kv_step")
 
     def block_location(self, block_idx: int) -> str:
         out = ctypes.c_uint32()

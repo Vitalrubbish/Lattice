@@ -71,6 +71,7 @@ Phase II-A — Allocator replacement (intercepts 1, 8)
   └─ Gate: stock/observer/shadow/KCMM-backed A/B smoke report before Phase II-B
 
 Phase II-B — KV write path (intercept 2)
+  ├─ Preflight: bind and gate kcmm_append_kv_step from Python with D2H read-back
   ├─ Replace reshape_and_cache with stream-aware kcmm_append_kv_step
   ├─ D2D copy must run on the current PyTorch/vLLM CUDA stream or synchronize by event
   └─ Gate: D2H read-back byte-level K/V comparison vs reference computation
@@ -154,6 +155,10 @@ kernel-internal address computation that varies across vLLM versions.
 `kcmm_append_kv_step` bypasses both by doing D2D copies directly via CUDA driver
 API, but it must be stream-aware before it is safe inside a PyTorch/vLLM forward
 pass.
+
+Before patching vLLM, `python -m scripts.kcmm.kv_write_ffi_smoke` must pass. This
+preflight gate proves the Python launcher can call `kcmm_append_kv_step`, read
+back KCMM VA bytes, and detect K/V mismatches independently of vLLM scheduling.
 
 ### Why A1 over A2 for VA remapping (intercept 3)
 

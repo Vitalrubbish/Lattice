@@ -184,6 +184,29 @@ Latest local Phase II.A gate result on 2026-06-19:
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs and port `8001` was free
   after the run.
 
+## Phase II.B KV write preflight gate
+
+Run the KCMM KV write FFI gate before patching vLLM's
+`vllm._custom_ops.reshape_and_cache` write path:
+
+```bash
+python -m scripts.kcmm.kv_write_ffi_smoke
+```
+
+The gate creates a tiny KCMM pool, registers a sequence backed by two KCMM
+blocks, writes known FP16 K/V rows through `kcmm_append_kv_step`, then reads the
+destination KCMM VA bytes back to host and compares them with the source CUDA
+tensors. This verifies the C ABI, VA accessors, D2D write path, and D2H
+byte-level comparison without downloading a model or starting vLLM.
+
+Latest local Phase II.B preflight result on 2026-06-19:
+
+- Command: `python -m scripts.kcmm.kv_write_ffi_smoke`
+- Result: `passed=true`
+- Compared two K rows and two V rows at positions `0` and `5`.
+- The smoke wrote into two KCMM blocks through a registered sequence.
+- Final KCMM stats recorded `blocks_in_use=0`.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This
