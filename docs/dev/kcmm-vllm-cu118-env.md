@@ -380,6 +380,54 @@ path:
 - KCMM write verified rows: `10`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 
+## Phase II.C A2 read offset-table plan
+
+After the read contract rejected A1 at the Python custom-op seam, the next
+Phase II.C slice is an A2 side-table prototype:
+
+```bash
+python -m scripts.kcmm.vllm_smoke \
+  --backed-allocations \
+  --kv-write-mirror \
+  --instrument-kv-reads \
+  --kv-read-offset-table
+```
+
+This keeps `block_tables` as native vLLM block ids, requires the KCMM-backed
+allocator so vLLM block ids and KCMM block ids are identical, and builds a CUDA
+side table at every paged-attention read seam:
+
+```text
+offset_table[block_id] = kcmm_f16_va_offset
+```
+
+This is still a planning/prototype mode. The native vLLM paged-attention kernel
+continues to execute, and the report records `kernel_replaced=false`.
+
+Latest local Phase II.C A2 offset-table result on 2026-06-19:
+
+- Command:
+  `python -m scripts.kcmm.vllm_smoke --backed-allocations --kv-write-mirror --instrument-kv-reads --kv-read-offset-table`
+- Result: `passed=true`
+- Read seam: `vllm._custom_ops.paged_attention_v1`
+- Read calls observed: `6`
+- Offset table builds: `6`
+- Offset table dtype: `torch.int64`
+- Offset table device: `cuda:0`
+- Last offset table shape: `[1]`
+- Max block id seen: `0`
+- Offset f16 sample: `{ "0": 1046528 }`
+- Kernel replaced: `false`
+- Read path: `native_vllm_paged_attention`
+- KCMM-backed allocator allocations/frees: `1/1`
+- KCMM KV write mirror verified rows: `10`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
+The next Phase II.C step is to replace the native read kernel with a custom
+attention backend or kernel entrypoint that consumes the KCMM K/V base addresses
+and the A2 offset table.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This

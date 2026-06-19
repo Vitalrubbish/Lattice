@@ -82,7 +82,8 @@ Phase II-B — KV write path (intercept 2)
 Phase II-C — KV read path (intercept 3)
   ├─ Trace paged_attention_v1/v2 block_tables and KV cache tensor contract
   ├─ A1 decision: Python custom-op seam expects block ids plus native KV tensor base
-  ├─ Prototype A2/custom attention backend for KCMM VA indirection
+  ├─ Prototype A2 block_id → KCMM f16 VA offset side table
+  ├─ Replace native read kernel with custom attention backend for KCMM VA indirection
   └─ Gate: token-exact match vs stock vLLM (same prompt → same completion)
 
 Phase III  — Tiering (intercepts 4, 6, 7)
@@ -207,6 +208,28 @@ entries with KCMM VA offsets would exceed the KV cache block-id range while the
 kernel still receives the native tensor base. Phase II.C must therefore continue
 with A2 or a custom attention backend that explicitly resolves block ids to KCMM
 addresses.
+
+### A2 prototype boundary for the vLLM Python custom-op seam
+
+A2 keeps `block_tables` as the native vLLM physical block-id table and adds a
+separate side table:
+
+```text
+offset_table[block_id] = kcmm_f16_va_offset
+```
+
+The first A2 prototype builds this side table at the
+`vllm._custom_ops.paged_attention_v1/v2` seam under the KCMM-backed allocator.
+That allocator mode is required because it guarantees that vLLM block ids and
+KCMM block ids are identical. The prototype validates that every observed
+`block_tables` entry exists in KCMM and materializes a CUDA
+`torch.int64[f16_va_offset_by_block_id]` tensor.
+
+This is still not end-to-end read replacement: `kernel_replaced=false`, and the
+native vLLM paged-attention kernel remains the read path. The next Phase II.C
+step must introduce a custom attention backend or kernel entrypoint that
+consumes the KCMM K/V base addresses plus this offset table instead of using
+the native vLLM `key_cache`/`value_cache` tensor storage.
 
 ### CUDA context sharing risk
 

@@ -245,6 +245,13 @@ class KcmmLibrary:
             ctypes.POINTER(ctypes.c_uint32),
         ]
         lib.kcmm_get_block_table_va_offsets.restype = ctypes.c_int
+        lib.kcmm_get_all_block_offsets_f16.argtypes = [
+            pool,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.kcmm_get_all_block_offsets_f16.restype = ctypes.c_int
 
         lib.kcmm_get_block_va_offset.argtypes = [pool, ctypes.c_uint32]
         lib.kcmm_get_block_va_offset.restype = ctypes.c_uint64
@@ -391,6 +398,25 @@ class KcmmPool:
             ctypes.byref(count),
         )
         self._check(rc, "kcmm_get_block_table_va_offsets")
+        return [int(out[i]) for i in range(int(count.value))]
+
+    def all_block_offsets_f16(self, min_entries: int = 0) -> list[int]:
+        stats = self.stats()
+        max_blocks = max(
+            int(stats.get("total_blocks", 0)),
+            int(stats.get("blocks_in_use", 0)),
+            int(min_entries),
+            1,
+        )
+        out = (ctypes.c_uint64 * max_blocks)()
+        count = ctypes.c_uint32()
+        rc = self.library.lib.kcmm_get_all_block_offsets_f16(
+            self.handle,
+            out,
+            max_blocks,
+            ctypes.byref(count),
+        )
+        self._check(rc, "kcmm_get_all_block_offsets_f16")
         return [int(out[i]) for i in range(int(count.value))]
 
     def block_va_offset(self, block_idx: int) -> int:

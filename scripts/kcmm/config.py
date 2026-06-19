@@ -128,6 +128,8 @@ class ObserverConfig:
     instrument_kv_reads: bool = False
     kv_read_trace_path: str | None = None
     require_kv_read_seams: bool = False
+    kv_read_offset_table: bool = False
+    kv_read_offset_table_report_path: str | None = None
     shadow_allocations: bool = False
     shadow_report_path: str | None = None
     backed_allocations: bool = False
@@ -180,6 +182,10 @@ class ObserverConfig:
             instrument_kv_reads=_env_bool("KCMM_INSTRUMENT_KV_READS", False),
             kv_read_trace_path=os.environ.get("KCMM_KV_READ_TRACE_PATH") or None,
             require_kv_read_seams=_env_bool("KCMM_REQUIRE_KV_READ_SEAMS", False),
+            kv_read_offset_table=_env_bool("KCMM_KV_READ_OFFSET_TABLE", False),
+            kv_read_offset_table_report_path=(
+                os.environ.get("KCMM_KV_READ_OFFSET_TABLE_REPORT_PATH") or None
+            ),
             shadow_allocations=_env_bool("KCMM_SHADOW_ALLOCATIONS", False),
             shadow_report_path=os.environ.get("KCMM_SHADOW_REPORT_PATH") or None,
             backed_allocations=_env_bool("KCMM_BACKED_ALLOCATIONS", False),
@@ -265,6 +271,18 @@ class ObserverConfig:
         if self.kv_write_replace_candidate and not self.backed_allocations:
             raise ValueError(
                 "KCMM KV write replacement candidate requires --kcmm-backed-allocations"
+            )
+        if self.kv_read_offset_table and self.pool_mode != "runtime":
+            raise ValueError(
+                "KCMM KV read offset-table planning requires --kcmm-pool-mode runtime"
+            )
+        if self.kv_read_offset_table and self.skip_observer:
+            raise ValueError(
+                "KCMM KV read offset-table planning requires the KCMM observer pool"
+            )
+        if self.kv_read_offset_table and not self.backed_allocations:
+            raise ValueError(
+                "KCMM KV read offset-table planning requires --kcmm-backed-allocations"
             )
 
     def with_runtime_sizing(self, sizing: VllmRuntimeSizing) -> "ObserverConfig":
@@ -379,6 +397,12 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         default=None,
     )
+    parser.add_argument(
+        "--kcmm-kv-read-offset-table",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--kcmm-kv-read-offset-table-report-path", default=None)
     parser.add_argument(
         "--kcmm-shadow-allocations",
         action="store_true",

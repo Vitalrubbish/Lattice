@@ -121,6 +121,7 @@ _KV_READ_COUNTS: dict[str, int] = {}
 _KV_READ_SEQUENCE = 0
 _KV_READ_INSTRUMENTED = False
 _REQUIRE_KV_READ_SEAMS = False
+_KV_READ_OFFSET_TABLE_PATCHED = False
 
 KV_WRITE_FUNCTIONS = {
     "vllm._custom_ops": (
@@ -871,6 +872,27 @@ def _wrap_kv_read_function(module: Any, function_name: str) -> None:
     setattr(module, function_name, wrapper)
 
 
+def _wrap_kv_read_offset_table_function(
+    module: Any,
+    function_name: str,
+    planner: Any,
+) -> None:
+    original = getattr(module, function_name)
+    if getattr(original, "_kcmm_kv_read_offset_table_patched", False):
+        return
+    call_key = f"{module.__name__}.{function_name}"
+    signature = inspect.signature(original)
+
+    @wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(*args, **kwargs)
+        planner.plan_call(call_key, function_name, bound.arguments)
+        return original(*args, **kwargs)
+
+    wrapper._kcmm_kv_read_offset_table_patched = True  # type: ignore[attr-defined]
+    setattr(module, function_name, wrapper)
+
+
 def _wrap_kv_write_mirror_function(
     module: Any,
     function_name: str,
@@ -1434,4 +1456,33 @@ def apply_kv_read_instrumentation(
         "require_seams": require_seams,
         "patched_functions": patched,
         "required_groups": REQUIRED_KV_READ_GROUPS,
+    }
+
+
+def apply_kv_read_offset_table(planner: Any) -> dict[str, object]:
+    """Patch vLLM read calls to build the KCMM A2 offset table candidate."""
+
+    global _KV_READ_OFFSET_TABLE_PATCHED
+
+    patched: list[str] = []
+    if not _KV_READ_OFFSET_TABLE_PATCHED:
+        for module_name, function_names in KV_READ_FUNCTIONS.items():
+            module = importlib.import_module(module_name)
+            for function_name in function_names:
+                if hasattr(module, function_name):
+                    _wrap_kv_read_offset_table_function(module, function_name, planner)
+                    patched.append(f"{module_name}.{function_name}")
+        _KV_READ_OFFSET_TABLE_PATCHED = True
+
+    return {
+        "phase": "II.C",
+        "patched": True,
+        "observer_only": True,
+        "candidate": "A2",
+        "kernel_replaced": False,
+        "target": "vLLM KV read custom ops",
+        "read_path": "native_vllm_paged_attention",
+        "offset_table_contract": "torch.int64[f16_va_offset_by_block_id]",
+        "patched_functions": patched,
+        "required_allocator_mode": "kcmm_backed_allocator",
     }

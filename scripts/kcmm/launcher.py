@@ -11,10 +11,12 @@ from typing import Any, Sequence
 from .backed_allocator import KcmmBackedAllocationTracker
 from .bindings import KcmmError, KcmmLibrary, KcmmPool, result_to_dict
 from .config import ObserverConfig, VllmRuntimeSizing, add_kcmm_args
+from .kv_read_plan import KcmmKvReadOffsetTableTracker
 from .kv_write_mirror import KcmmKvWriteMirrorTracker
 from .patch_vllm import (
     apply_allocator_instrumentation,
     apply_kcmm_backed_allocator,
+    apply_kv_read_offset_table,
     apply_kv_read_instrumentation,
     apply_kv_write_mirror,
     apply_kv_write_instrumentation,
@@ -29,6 +31,7 @@ _ACTIVE_POOL: KcmmPool | None = None
 _SHADOW_TRACKER: ShadowAllocationTracker | None = None
 _BACKED_TRACKER: KcmmBackedAllocationTracker | None = None
 _KV_WRITE_MIRROR_TRACKER: KcmmKvWriteMirrorTracker | None = None
+_KV_READ_OFFSET_TABLE_TRACKER: KcmmKvReadOffsetTableTracker | None = None
 
 
 def _print_json(payload: object, *, stream: object = sys.stderr) -> None:
@@ -83,6 +86,14 @@ def _write_kv_write_mirror_report() -> None:
     if _KV_WRITE_MIRROR_TRACKER is not None:
         _KV_WRITE_MIRROR_TRACKER.write_report()
         _print_json({"kcmm_kv_write_mirror": _KV_WRITE_MIRROR_TRACKER.report()})
+
+
+def _write_kv_read_offset_table_report() -> None:
+    if _KV_READ_OFFSET_TABLE_TRACKER is not None:
+        _KV_READ_OFFSET_TABLE_TRACKER.write_report()
+        _print_json(
+            {"kcmm_kv_read_offset_table": _KV_READ_OFFSET_TABLE_TRACKER.report()}
+        )
 
 
 def _create_observer_pool(
@@ -217,7 +228,8 @@ def _run_vllm(vllm_args: Sequence[str]) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    global _ACTIVE_POOL, _SHADOW_TRACKER, _BACKED_TRACKER, _KV_WRITE_MIRROR_TRACKER
+    global _ACTIVE_POOL, _SHADOW_TRACKER, _BACKED_TRACKER
+    global _KV_WRITE_MIRROR_TRACKER, _KV_READ_OFFSET_TABLE_TRACKER
 
     args = list(argv if argv is not None else sys.argv[1:])
     parser = argparse.ArgumentParser(
@@ -267,6 +279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     allocator_report = None
     kv_write_report = None
     kv_read_report = None
+    kv_read_offset_table_report = None
     kv_write_mirror_report = None
     runtime_pool_report = None
     shadow_report = None
@@ -310,6 +323,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _print_json({"vllm_kv_read_instrumentation": kv_read_report})
 
+    if config.kv_read_offset_table:
+        _KV_READ_OFFSET_TABLE_TRACKER = KcmmKvReadOffsetTableTracker(
+            config.kv_read_offset_table_report_path
+        )
+        kv_read_offset_table_report = apply_kv_read_offset_table(
+            _KV_READ_OFFSET_TABLE_TRACKER
+        )
+        _print_json({"kcmm_kv_read_offset_table_patch": kv_read_offset_table_report})
+
     if not config.skip_observer and config.pool_mode == "runtime":
 
         def create_runtime_pool(engine: Any) -> dict[str, Any]:
@@ -335,6 +357,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if _KV_WRITE_MIRROR_TRACKER is not None:
                 _KV_WRITE_MIRROR_TRACKER.attach_pool(pool)
                 atexit.register(_write_kv_write_mirror_report)
+            if _KV_READ_OFFSET_TABLE_TRACKER is not None:
+                _KV_READ_OFFSET_TABLE_TRACKER.validate_runtime(runtime_sizing)
+                _KV_READ_OFFSET_TABLE_TRACKER.attach_pool(pool)
+                atexit.register(_write_kv_read_offset_table_report)
             _print_json({"observer": report})
             return report
 
@@ -376,6 +402,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "vllm_allocator_instrumentation": allocator_report,
                 "vllm_kv_write_instrumentation": kv_write_report,
                 "vllm_kv_read_instrumentation": kv_read_report,
+                "kcmm_kv_read_offset_table_patch": kv_read_offset_table_report,
                 "kcmm_kv_write_mirror_patch": kv_write_mirror_report,
                 "kcmm_runtime_pool_sizing": runtime_pool_report,
                 "kcmm_shadow_allocator_patch": shadow_report,

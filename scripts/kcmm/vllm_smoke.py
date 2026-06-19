@@ -48,6 +48,7 @@ class SmokeConfig:
     instrument_allocators: bool
     instrument_kv_writes: bool
     instrument_kv_reads: bool
+    kv_read_offset_table: bool
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
     runtime_derived_pool: bool
@@ -56,6 +57,7 @@ class SmokeConfig:
     allocator_trace_path: Path
     kv_write_trace_path: Path
     kv_read_trace_path: Path
+    kv_read_offset_table_report_path: Path
     kv_write_mirror_report_path: Path
     shadow_report_path: Path
     backed_report_path: Path
@@ -133,6 +135,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable observer-only paged_attention KV read instrumentation.",
     )
     parser.add_argument(
+        "--kv-read-offset-table",
+        action="store_true",
+        help=(
+            "Build the Phase II.C A2 KCMM block_id->offset table at "
+            "paged_attention read seams without replacing the native kernel."
+        ),
+    )
+    parser.add_argument(
         "--kv-write-mirror",
         action="store_true",
         help="Mirror reshape_and_cache writes into KCMM after native vLLM writes.",
@@ -176,6 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--kv-read-trace-path",
         default=None,
         help="KV read instrumentation JSONL trace path. Defaults to a /tmp file.",
+    )
+    parser.add_argument(
+        "--kv-read-offset-table-report-path",
+        default=None,
+        help="KCMM KV read offset-table JSON report path. Defaults to a /tmp file.",
     )
     parser.add_argument(
         "--kv-write-mirror-report-path",
@@ -228,6 +243,12 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         else Path(tempfile.gettempdir())
         / f"kcmm-vllm-kv-read-trace-{int(time.time() * 1000)}.jsonl"
     )
+    kv_read_offset_table_report_path = (
+        Path(args.kv_read_offset_table_report_path)
+        if args.kv_read_offset_table_report_path
+        else Path(tempfile.gettempdir())
+        / f"kcmm-vllm-kv-read-offset-table-{int(time.time() * 1000)}.json"
+    )
     kv_write_mirror_report_path = (
         Path(args.kv_write_mirror_report_path)
         if args.kv_write_mirror_report_path
@@ -259,6 +280,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         instrument_allocators=args.instrument_allocators,
         instrument_kv_writes=args.instrument_kv_writes,
         instrument_kv_reads=args.instrument_kv_reads,
+        kv_read_offset_table=args.kv_read_offset_table,
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
         runtime_derived_pool=(
@@ -267,12 +289,14 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
             or args.backed_allocations
             or args.kv_write_mirror
             or args.kv_write_replace_candidate
+            or args.kv_read_offset_table
         ),
         shadow_allocations=args.shadow_allocations,
         backed_allocations=args.backed_allocations,
         allocator_trace_path=allocator_trace_path,
         kv_write_trace_path=kv_write_trace_path,
         kv_read_trace_path=kv_read_trace_path,
+        kv_read_offset_table_report_path=kv_read_offset_table_report_path,
         kv_write_mirror_report_path=kv_write_mirror_report_path,
         shadow_report_path=shadow_report_path,
         backed_report_path=backed_report_path,
@@ -521,6 +545,14 @@ def vllm_command(config: SmokeConfig) -> list[str]:
                     str(config.kv_write_mirror_report_path),
                 ]
             )
+        if config.kv_read_offset_table:
+            command.extend(
+                [
+                    "--kcmm-kv-read-offset-table",
+                    "--kcmm-kv-read-offset-table-report-path",
+                    str(config.kv_read_offset_table_report_path),
+                ]
+            )
     if config.instrument_allocators:
         command.extend(
             [
@@ -586,6 +618,7 @@ def vllm_command(config: SmokeConfig) -> list[str]:
         config.instrument_allocators
         or config.instrument_kv_writes
         or config.instrument_kv_reads
+        or config.kv_read_offset_table
         or config.kv_write_mirror
         or config.kv_write_replace_candidate
         or config.runtime_derived_pool
@@ -758,6 +791,51 @@ def read_kv_write_mirror_report(path: Path) -> dict[str, Any]:
     if report.get("verified_rows", 0) <= 0:
         raise SmokeFailure(
             "KCMM KV write report did not verify any rows: "
+            + json.dumps(report, sort_keys=True)
+        )
+    return {"path": str(path), **report}
+
+
+def read_kv_read_offset_table_report(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise SmokeFailure(
+            f"KCMM KV read offset-table report was not written: {path}"
+        )
+    with path.open("r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    if report.get("error_count", 0):
+        raise SmokeFailure(
+            "KCMM KV read offset-table report recorded errors: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if not report.get("pool_attached", False):
+        raise SmokeFailure(
+            "KCMM KV read offset-table planner never attached to a pool: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if report.get("kernel_replaced", True):
+        raise SmokeFailure(
+            "KCMM KV read offset-table planner unexpectedly replaced the kernel: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if report.get("read_calls", 0) <= 0:
+        raise SmokeFailure(
+            "KCMM KV read offset-table planner saw no read calls: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if report.get("planned_calls", 0) <= 0:
+        raise SmokeFailure(
+            "KCMM KV read offset-table planner built no read plans: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if report.get("offset_table_builds", 0) <= 0:
+        raise SmokeFailure(
+            "KCMM KV read offset-table planner built no offset tables: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if not report.get("recent_calls"):
+        raise SmokeFailure(
+            "KCMM KV read offset-table planner recorded no recent calls: "
             + json.dumps(report, sort_keys=True)
         )
     return {"path": str(path), **report}
@@ -964,6 +1042,8 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         )
     if config.kv_write_replace_candidate and not config.backed_allocations:
         raise SmokeFailure("--kv-write-replace-candidate requires --backed-allocations")
+    if config.kv_read_offset_table and not config.backed_allocations:
+        raise SmokeFailure("--kv-read-offset-table requires --backed-allocations")
     ensure_kcmm_library(config)
     generated_model = ensure_tiny_model(config.model_path)
     process: subprocess.Popen[None] | None = None
@@ -992,6 +1072,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "runtime_derived_pool": config.runtime_derived_pool,
             "instrument_kv_writes": config.instrument_kv_writes,
             "instrument_kv_reads": config.instrument_kv_reads,
+            "kv_read_offset_table": config.kv_read_offset_table,
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,
             "shadow_allocations": config.shadow_allocations,
@@ -1022,6 +1103,10 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             result["kv_write_replace_candidate_report"] = report
         else:
             result["kv_write_mirror"] = report
+    if config.kv_read_offset_table:
+        result["kv_read_offset_table_report"] = read_kv_read_offset_table_report(
+            config.kv_read_offset_table_report_path
+        )
     if config.shadow_allocations:
         result["shadow_allocator"] = read_shadow_report(config.shadow_report_path)
     if config.backed_allocations:
@@ -1051,6 +1136,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(
                 config.kv_write_mirror_report_path.read_text(encoding="utf-8"),
+                file=sys.stderr,
+            )
+        if (
+            config.kv_read_offset_table
+            and config.kv_read_offset_table_report_path.exists()
+        ):
+            print(
+                "\nKCMM KV read offset-table report "
+                f"({config.kv_read_offset_table_report_path}):",
+                file=sys.stderr,
+            )
+            print(
+                config.kv_read_offset_table_report_path.read_text(encoding="utf-8"),
                 file=sys.stderr,
             )
         if config.log_path.exists():
