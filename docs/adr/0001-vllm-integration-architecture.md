@@ -83,7 +83,8 @@ Phase II-C — KV read path (intercept 3)
   ├─ Trace paged_attention_v1/v2 block_tables and KV cache tensor contract
   ├─ A1 decision: Python custom-op seam expects block ids plus native KV tensor base
   ├─ Prototype A2 block_id → KCMM f16 VA offset side table
-  ├─ Replace native read kernel with custom attention backend for KCMM VA indirection
+  ├─ Replace native read kernel with KCMM reference attention candidate
+  ├─ Replace CPU-staged reference path with CUDA kernel/compiled extension
   └─ Gate: token-exact match vs stock vLLM (same prompt → same completion)
 
 Phase III  — Tiering (intercepts 4, 6, 7)
@@ -230,6 +231,24 @@ native vLLM paged-attention kernel remains the read path. The next Phase II.C
 step must introduce a custom attention backend or kernel entrypoint that
 consumes the KCMM K/V base addresses plus this offset table instead of using
 the native vLLM `key_cache`/`value_cache` tensor storage.
+
+### Reference read replacement candidate
+
+The first read replacement candidate is correctness-oriented rather than
+performance-oriented. Under the KCMM-backed allocator and KCMM KV write path, it
+patches `paged_attention_v1/v2`, reconstructs the K/V sequence from
+`block_tables` and `seq_lens`, reads KCMM K/V rows via CUDA D2H copies, computes
+scaled dot-product attention with PyTorch, writes the result into the provided
+`out` tensor, and returns without calling the native vLLM paged-attention
+kernel.
+
+This establishes the storage-of-record transition for the tiny vLLM smoke:
+native `reshape_and_cache` writes can be skipped, native paged-attention reads
+can be skipped, and the same-model stock-vs-KCMM A/B run produced identical
+completion text. It is not an acceptable performance implementation because it
+uses CPU staging and Python loops. The next Phase II.C step is to replace this
+reference path with a CUDA kernel or compiled extension that consumes the KCMM
+K/V bases and the A2 offset table directly on GPU.
 
 ### CUDA context sharing risk
 

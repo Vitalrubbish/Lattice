@@ -49,6 +49,7 @@ class SmokeConfig:
     instrument_kv_writes: bool
     instrument_kv_reads: bool
     kv_read_offset_table: bool
+    kv_read_replace_candidate: bool
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
     runtime_derived_pool: bool
@@ -140,6 +141,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Build the Phase II.C A2 KCMM block_id->offset table at "
             "paged_attention read seams without replacing the native kernel."
+        ),
+    )
+    parser.add_argument(
+        "--kv-read-replace-candidate",
+        action="store_true",
+        help=(
+            "Skip native paged_attention and fill output with a KCMM-backed "
+            "reference attention implementation."
         ),
     )
     parser.add_argument(
@@ -281,6 +290,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         instrument_kv_writes=args.instrument_kv_writes,
         instrument_kv_reads=args.instrument_kv_reads,
         kv_read_offset_table=args.kv_read_offset_table,
+        kv_read_replace_candidate=args.kv_read_replace_candidate,
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
         runtime_derived_pool=(
@@ -290,6 +300,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
             or args.kv_write_mirror
             or args.kv_write_replace_candidate
             or args.kv_read_offset_table
+            or args.kv_read_replace_candidate
         ),
         shadow_allocations=args.shadow_allocations,
         backed_allocations=args.backed_allocations,
@@ -545,10 +556,15 @@ def vllm_command(config: SmokeConfig) -> list[str]:
                     str(config.kv_write_mirror_report_path),
                 ]
             )
-        if config.kv_read_offset_table:
+        if config.kv_read_offset_table or config.kv_read_replace_candidate:
+            mode_flag = (
+                "--kcmm-kv-read-replace-candidate"
+                if config.kv_read_replace_candidate
+                else "--kcmm-kv-read-offset-table"
+            )
             command.extend(
                 [
-                    "--kcmm-kv-read-offset-table",
+                    mode_flag,
                     "--kcmm-kv-read-offset-table-report-path",
                     str(config.kv_read_offset_table_report_path),
                 ]
@@ -619,6 +635,7 @@ def vllm_command(config: SmokeConfig) -> list[str]:
         or config.instrument_kv_writes
         or config.instrument_kv_reads
         or config.kv_read_offset_table
+        or config.kv_read_replace_candidate
         or config.kv_write_mirror
         or config.kv_write_replace_candidate
         or config.runtime_derived_pool
@@ -796,7 +813,11 @@ def read_kv_write_mirror_report(path: Path) -> dict[str, Any]:
     return {"path": str(path), **report}
 
 
-def read_kv_read_offset_table_report(path: Path) -> dict[str, Any]:
+def read_kv_read_offset_table_report(
+    path: Path,
+    *,
+    expect_replacement: bool,
+) -> dict[str, Any]:
     if not path.exists():
         raise SmokeFailure(
             f"KCMM KV read offset-table report was not written: {path}"
@@ -813,9 +834,9 @@ def read_kv_read_offset_table_report(path: Path) -> dict[str, Any]:
             "KCMM KV read offset-table planner never attached to a pool: "
             + json.dumps(report, sort_keys=True)
         )
-    if report.get("kernel_replaced", True):
+    if bool(report.get("kernel_replaced", False)) != expect_replacement:
         raise SmokeFailure(
-            "KCMM KV read offset-table planner unexpectedly replaced the kernel: "
+            "KCMM KV read report had unexpected kernel replacement state: "
             + json.dumps(report, sort_keys=True)
         )
     if report.get("read_calls", 0) <= 0:
@@ -833,6 +854,17 @@ def read_kv_read_offset_table_report(path: Path) -> dict[str, Any]:
             "KCMM KV read offset-table planner built no offset tables: "
             + json.dumps(report, sort_keys=True)
         )
+    if expect_replacement:
+        if report.get("replacement_calls", 0) <= 0:
+            raise SmokeFailure(
+                "KCMM KV read replacement candidate replaced no calls: "
+                + json.dumps(report, sort_keys=True)
+            )
+        if report.get("reference_read_bytes", 0) <= 0:
+            raise SmokeFailure(
+                "KCMM KV read replacement candidate read no KCMM bytes: "
+                + json.dumps(report, sort_keys=True)
+            )
     if not report.get("recent_calls"):
         raise SmokeFailure(
             "KCMM KV read offset-table planner recorded no recent calls: "
@@ -1044,6 +1076,19 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         raise SmokeFailure("--kv-write-replace-candidate requires --backed-allocations")
     if config.kv_read_offset_table and not config.backed_allocations:
         raise SmokeFailure("--kv-read-offset-table requires --backed-allocations")
+    if config.kv_read_replace_candidate and config.kv_read_offset_table:
+        raise SmokeFailure(
+            "--kv-read-replace-candidate cannot be combined with --kv-read-offset-table"
+        )
+    if config.kv_read_replace_candidate and not config.backed_allocations:
+        raise SmokeFailure("--kv-read-replace-candidate requires --backed-allocations")
+    if config.kv_read_replace_candidate and not (
+        config.kv_write_mirror or config.kv_write_replace_candidate
+    ):
+        raise SmokeFailure(
+            "--kv-read-replace-candidate requires --kv-write-mirror or "
+            "--kv-write-replace-candidate"
+        )
     ensure_kcmm_library(config)
     generated_model = ensure_tiny_model(config.model_path)
     process: subprocess.Popen[None] | None = None
@@ -1073,6 +1118,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "instrument_kv_writes": config.instrument_kv_writes,
             "instrument_kv_reads": config.instrument_kv_reads,
             "kv_read_offset_table": config.kv_read_offset_table,
+            "kv_read_replace_candidate": config.kv_read_replace_candidate,
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,
             "shadow_allocations": config.shadow_allocations,
@@ -1103,9 +1149,10 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             result["kv_write_replace_candidate_report"] = report
         else:
             result["kv_write_mirror"] = report
-    if config.kv_read_offset_table:
+    if config.kv_read_offset_table or config.kv_read_replace_candidate:
         result["kv_read_offset_table_report"] = read_kv_read_offset_table_report(
-            config.kv_read_offset_table_report_path
+            config.kv_read_offset_table_report_path,
+            expect_replacement=config.kv_read_replace_candidate,
         )
     if config.shadow_allocations:
         result["shadow_allocator"] = read_shadow_report(config.shadow_report_path)
@@ -1139,7 +1186,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
         if (
-            config.kv_read_offset_table
+            (config.kv_read_offset_table or config.kv_read_replace_candidate)
             and config.kv_read_offset_table_report_path.exists()
         ):
             print(

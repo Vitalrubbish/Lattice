@@ -886,6 +886,9 @@ def _wrap_kv_read_offset_table_function(
     @wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         bound = signature.bind(*args, **kwargs)
+        if getattr(planner, "replace_native", False):
+            planner.replace_call(call_key, function_name, bound.arguments)
+            return None
         planner.plan_call(call_key, function_name, bound.arguments)
         return original(*args, **kwargs)
 
@@ -1400,7 +1403,7 @@ def apply_kv_write_mirror(mirror: Any) -> dict[str, object]:
         "write_path": "kcmm_append_kv_slots",
         "native_write_mode": getattr(mirror, "native_write_mode", "unknown"),
         "storage_of_record": (
-            "kcmm_write_candidate_without_kv_read_replacement"
+            "kcmm_kv_storage_candidate"
             if getattr(mirror, "replace_native", False)
             else "native_vllm_kv_tensors"
         ),
@@ -1479,9 +1482,13 @@ def apply_kv_read_offset_table(planner: Any) -> dict[str, object]:
         "patched": True,
         "observer_only": True,
         "candidate": "A2",
-        "kernel_replaced": False,
+        "kernel_replaced": bool(getattr(planner, "replace_native", False)),
         "target": "vLLM KV read custom ops",
-        "read_path": "native_vllm_paged_attention",
+        "read_path": (
+            "kcmm_reference_attention"
+            if getattr(planner, "replace_native", False)
+            else "native_vllm_paged_attention"
+        ),
         "offset_table_contract": "torch.int64[f16_va_offset_by_block_id]",
         "patched_functions": patched,
         "required_allocator_mode": "kcmm_backed_allocator",

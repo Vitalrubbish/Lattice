@@ -428,6 +428,54 @@ The next Phase II.C step is to replace the native read kernel with a custom
 attention backend or kernel entrypoint that consumes the KCMM K/V base addresses
 and the A2 offset table.
 
+## Phase II.C read replacement candidate
+
+The first read replacement mode is a correctness/reference path, not the final
+performance implementation:
+
+```bash
+python -m scripts.kcmm.vllm_smoke \
+  --backed-allocations \
+  --kv-write-replace-candidate \
+  --instrument-kv-reads \
+  --kv-read-replace-candidate
+```
+
+This mode skips native `reshape_and_cache` writes, skips native
+`paged_attention_v1/v2` reads, reads K/V rows from KCMM-managed memory via CUDA
+D2H copies, computes scaled dot-product attention with PyTorch, writes the
+result into vLLM's `out` tensor, and returns without calling the native vLLM
+paged-attention kernel.
+
+Latest local Phase II.C read replacement result on 2026-06-19:
+
+- Command:
+  `python -m scripts.kcmm.vllm_smoke --backed-allocations --kv-write-replace-candidate --instrument-kv-reads --kv-read-replace-candidate`
+- Result: `passed=true`
+- Native KV write calls skipped: `8`
+- Native paged-attention calls replaced: `6`
+- Read path: `kcmm_reference_attention`
+- Kernel replaced: `true`
+- Reference KCMM read bytes: `12288`
+- Offset table builds: `6`
+- Observed read seam: `vllm._custom_ops.paged_attention_v1`
+- KCMM write verified rows: `10`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
+Same-model A/B check:
+
+- Stock command:
+  `python -m scripts.kcmm.vllm_smoke --mode stock --keep-model --no-build-kcmm`
+- KCMM command:
+  `python -m scripts.kcmm.vllm_smoke --backed-allocations --kv-write-replace-candidate --instrument-kv-reads --kv-read-replace-candidate --keep-model --no-build-kcmm`
+- Stock completion text: `" 80 80 80 80"`
+- KCMM replacement completion text: `" 80 80 80 80"`
+
+The next implementation step is to remove the CPU-staged reference path and use
+a CUDA kernel or compiled extension that consumes KCMM K/V base addresses and
+the A2 offset table directly on GPU.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This

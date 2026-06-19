@@ -316,21 +316,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _print_json({"vllm_kv_write_instrumentation": kv_write_report})
 
+    if config.kv_read_offset_table or config.kv_read_replace_candidate:
+        _KV_READ_OFFSET_TABLE_TRACKER = KcmmKvReadOffsetTableTracker(
+            config.kv_read_offset_table_report_path,
+            replace_native=config.kv_read_replace_candidate,
+        )
+        kv_read_offset_table_report = apply_kv_read_offset_table(
+            _KV_READ_OFFSET_TABLE_TRACKER
+        )
+        _print_json({"kcmm_kv_read_offset_table_patch": kv_read_offset_table_report})
+
     if config.instrument_kv_reads:
         kv_read_report = apply_kv_read_instrumentation(
             trace_path=config.kv_read_trace_path,
             require_seams=config.require_kv_read_seams,
         )
         _print_json({"vllm_kv_read_instrumentation": kv_read_report})
-
-    if config.kv_read_offset_table:
-        _KV_READ_OFFSET_TABLE_TRACKER = KcmmKvReadOffsetTableTracker(
-            config.kv_read_offset_table_report_path
-        )
-        kv_read_offset_table_report = apply_kv_read_offset_table(
-            _KV_READ_OFFSET_TABLE_TRACKER
-        )
-        _print_json({"kcmm_kv_read_offset_table_patch": kv_read_offset_table_report})
 
     if not config.skip_observer and config.pool_mode == "runtime":
 

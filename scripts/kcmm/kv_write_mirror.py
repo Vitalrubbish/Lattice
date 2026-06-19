@@ -399,7 +399,7 @@ class KcmmKvWriteMirrorTracker:
                 ),
                 "native_write_mode": self.native_write_mode,
                 "storage_of_record": (
-                    "kcmm_write_candidate_without_kv_read_replacement"
+                    "kcmm_kv_storage_candidate"
                     if self._replace_native
                     else "native_vllm_kv_tensors"
                 ),
