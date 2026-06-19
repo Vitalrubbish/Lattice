@@ -47,8 +47,10 @@ class SmokeConfig:
     instrument_allocators: bool
     runtime_derived_pool: bool
     shadow_allocations: bool
+    backed_allocations: bool
     allocator_trace_path: Path
     shadow_report_path: Path
+    backed_report_path: Path
     require_allocator_seams: bool
     log_path: Path
 
@@ -116,6 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mirror vLLM GPU block allocations into KCMM shadow allocator.",
     )
     parser.add_argument(
+        "--backed-allocations",
+        action="store_true",
+        help="Let KCMM choose vLLM GPU block IDs behind an opt-in flag.",
+    )
+    parser.add_argument(
         "--allocator-trace-path",
         default=None,
         help="Allocator instrumentation JSONL trace path. Defaults to a /tmp file.",
@@ -152,6 +159,10 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         Path(tempfile.gettempdir())
         / f"kcmm-vllm-shadow-report-{int(time.time() * 1000)}.json"
     )
+    backed_report_path = (
+        Path(tempfile.gettempdir())
+        / f"kcmm-vllm-backed-report-{int(time.time() * 1000)}.json"
+    )
     return SmokeConfig(
         mode=args.mode,
         host=args.host,
@@ -167,10 +178,16 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         keep_model=args.keep_model,
         print_seams=args.print_seams,
         instrument_allocators=args.instrument_allocators,
-        runtime_derived_pool=args.runtime_derived_pool or args.shadow_allocations,
+        runtime_derived_pool=(
+            args.runtime_derived_pool
+            or args.shadow_allocations
+            or args.backed_allocations
+        ),
         shadow_allocations=args.shadow_allocations,
+        backed_allocations=args.backed_allocations,
         allocator_trace_path=allocator_trace_path,
         shadow_report_path=shadow_report_path,
+        backed_report_path=backed_report_path,
         require_allocator_seams=args.require_allocator_seams,
         log_path=log_path,
     )
@@ -307,6 +324,14 @@ def vllm_command(config: SmokeConfig) -> list[str]:
                     str(config.shadow_report_path),
                 ]
             )
+        if config.backed_allocations:
+            command.extend(
+                [
+                    "--kcmm-backed-allocations",
+                    "--kcmm-backed-report-path",
+                    str(config.backed_report_path),
+                ]
+            )
     if config.instrument_allocators:
         command.extend(
             [
@@ -352,6 +377,7 @@ def vllm_command(config: SmokeConfig) -> list[str]:
         config.instrument_allocators
         or config.runtime_derived_pool
         or config.shadow_allocations
+        or config.backed_allocations
     ):
         # Keep vLLM's engine in this Python process so launcher monkey-patches
         # apply to the block manager and allocator objects being exercised.
@@ -410,6 +436,45 @@ def read_shadow_report(path: Path) -> dict[str, Any]:
     if report.get("kcmm_allocations") != report.get("kcmm_frees"):
         raise SmokeFailure(
             "shadow allocator KCMM allocation/free count mismatch: "
+            + json.dumps(report, sort_keys=True)
+        )
+    return {"path": str(path), **report}
+
+
+def read_backed_report(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise SmokeFailure(f"KCMM-backed allocator report was not written: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    if report.get("stop_condition"):
+        raise SmokeFailure(
+            "KCMM-backed allocator stopped before completion: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if report.get("error_count", 0):
+        raise SmokeFailure(
+            "KCMM-backed allocator reported errors: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if report.get("outstanding_mappings", 0):
+        raise SmokeFailure(
+            "KCMM-backed allocator leaked mappings: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if report.get("native_gpu_allocations", 0) <= 0:
+        raise SmokeFailure(
+            "KCMM-backed allocator did not observe GPU allocations: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if report.get("kcmm_allocations") != report.get("kcmm_frees"):
+        raise SmokeFailure(
+            "KCMM-backed allocator KCMM allocation/free count mismatch: "
+            + json.dumps(report, sort_keys=True)
+        )
+    pool_stats = report.get("pool_stats") or {}
+    if pool_stats.get("blocks_in_use", 0) != 0:
+        raise SmokeFailure(
+            "KCMM-backed allocator left KCMM blocks in use: "
             + json.dumps(report, sort_keys=True)
         )
     return {"path": str(path), **report}
@@ -533,10 +598,14 @@ def run_completion(config: SmokeConfig) -> dict[str, Any]:
 
 
 def run_smoke(config: SmokeConfig) -> dict[str, Any]:
-    if config.runtime_derived_pool and config.mode != "kcmm":
-        raise SmokeFailure("--runtime-derived-pool requires --mode kcmm")
     if config.shadow_allocations and config.mode != "kcmm":
         raise SmokeFailure("--shadow-allocations requires --mode kcmm")
+    if config.backed_allocations and config.mode != "kcmm":
+        raise SmokeFailure("--backed-allocations requires --mode kcmm")
+    if config.runtime_derived_pool and config.mode != "kcmm":
+        raise SmokeFailure("--runtime-derived-pool requires --mode kcmm")
+    if config.backed_allocations and config.shadow_allocations:
+        raise SmokeFailure("--backed-allocations cannot be combined with --shadow-allocations")
     ensure_kcmm_library(config)
     generated_model = ensure_tiny_model(config.model_path)
     process: subprocess.Popen[None] | None = None
@@ -561,6 +630,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "generated_model": generated_model,
             "runtime_derived_pool": config.runtime_derived_pool,
             "shadow_allocations": config.shadow_allocations,
+            "backed_allocations": config.backed_allocations,
         }
     finally:
         if process is not None:
@@ -574,6 +644,8 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         result["allocator_trace"] = read_allocator_trace(config.allocator_trace_path)
     if config.shadow_allocations:
         result["shadow_allocator"] = read_shadow_report(config.shadow_report_path)
+    if config.backed_allocations:
+        result["backed_allocator"] = read_backed_report(config.backed_report_path)
     return result
 
 
@@ -583,6 +655,12 @@ def main(argv: list[str] | None = None) -> int:
         result = run_smoke(config)
     except SmokeFailure as exc:
         print(f"KCMM vLLM smoke failed: {exc}", file=sys.stderr)
+        if config.backed_allocations and config.backed_report_path.exists():
+            print(
+                f"\nKCMM-backed allocator report ({config.backed_report_path}):",
+                file=sys.stderr,
+            )
+            print(config.backed_report_path.read_text(encoding="utf-8"), file=sys.stderr)
         if config.log_path.exists():
             print(f"\nLog tail ({config.log_path}):", file=sys.stderr)
             print(tail_file(config.log_path), file=sys.stderr)

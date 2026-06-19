@@ -109,6 +109,7 @@ _INSTRUMENTED = False
 _REQUIRE_SEAMS = False
 _RUNTIME_POOL_PATCHED = False
 _SHADOW_ALLOCATOR_PATCHED = False
+_KCMM_BACKED_ALLOCATOR_PATCHED = False
 
 
 @dataclass(frozen=True)
@@ -453,6 +454,67 @@ def _wrap_shadow_allocator_method(cls: type, method_name: str, shadow: Any) -> N
     setattr(cls, method_name, wrapper)
 
 
+def _wrap_kcmm_backed_cpu_gpu_init(tracker: Any) -> None:
+    module = importlib.import_module("vllm.core.block.cpu_gpu_block_allocator")
+    cls = getattr(module, "CpuGpuBlockAllocator")
+    original = getattr(cls, "__init__")
+    if getattr(original, "_kcmm_backed_allocator_patched", False):
+        return
+
+    @wraps(original)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        from vllm.core.block.interfaces import Device
+
+        tracker.bind_vllm_gpu_allocator(self._allocators[Device.GPU])
+
+    wrapper._kcmm_backed_allocator_patched = True  # type: ignore[attr-defined]
+    setattr(cls, "__init__", wrapper)
+
+
+def _wrap_kcmm_backed_naive_allocator_methods(tracker: Any) -> None:
+    module = importlib.import_module("vllm.core.block.naive_block")
+    cls = getattr(module, "NaiveBlockAllocator")
+
+    original_alloc = getattr(cls, "_allocate_block_id")
+    if not getattr(original_alloc, "_kcmm_backed_allocator_patched", False):
+
+        @wraps(original_alloc)
+        def allocate_block_id(self: Any) -> Any:
+            active_tracker = getattr(self, "_kcmm_backed_tracker", None)
+            if active_tracker is None:
+                return original_alloc(self)
+            return active_tracker.allocate_block_id(
+                self,
+                f"{cls.__module__}.{cls.__qualname__}._allocate_block_id",
+            )
+
+        allocate_block_id._kcmm_backed_allocator_patched = True  # type: ignore[attr-defined]
+        setattr(cls, "_allocate_block_id", allocate_block_id)
+
+    original_free = getattr(cls, "_free_block_id")
+    if not getattr(original_free, "_kcmm_backed_allocator_patched", False):
+
+        @wraps(original_free)
+        def free_block_id(self: Any, block: Any) -> Any:
+            active_tracker = getattr(self, "_kcmm_backed_tracker", None)
+            if active_tracker is None:
+                return original_free(self, block)
+
+            block_id = _block_id(block)
+            refcount_before = int(self._refcounter.get(block_id))
+            result = original_free(self, block)
+            active_tracker.free_block_id(
+                block_id,
+                released=refcount_before == 1,
+                source=f"{cls.__module__}.{cls.__qualname__}._free_block_id",
+            )
+            return result
+
+        free_block_id._kcmm_backed_allocator_patched = True  # type: ignore[attr-defined]
+        setattr(cls, "_free_block_id", free_block_id)
+
+
 def inspect_vllm_seams() -> dict[str, object]:
     try:
         import vllm
@@ -562,6 +624,33 @@ def apply_shadow_allocator(shadow: Any) -> dict[str, object]:
         "observer_only": True,
         "target": "vllm.core.block.cpu_gpu_block_allocator.CpuGpuBlockAllocator",
         "patched_methods": patched,
+        "seam_report": inspect_vllm_seams(),
+    }
+
+
+def apply_kcmm_backed_allocator(tracker: Any) -> dict[str, object]:
+    """Patch vLLM so KCMM chooses GPU block IDs for the V2 allocator."""
+
+    global _KCMM_BACKED_ALLOCATOR_PATCHED
+
+    patched: list[str] = []
+    if not _KCMM_BACKED_ALLOCATOR_PATCHED:
+        _wrap_kcmm_backed_cpu_gpu_init(tracker)
+        _wrap_kcmm_backed_naive_allocator_methods(tracker)
+        patched = [
+            "vllm.core.block.cpu_gpu_block_allocator.CpuGpuBlockAllocator.__init__",
+            "vllm.core.block.naive_block.NaiveBlockAllocator._allocate_block_id",
+            "vllm.core.block.naive_block.NaiveBlockAllocator._free_block_id",
+        ]
+        _KCMM_BACKED_ALLOCATOR_PATCHED = True
+
+    return {
+        "phase": "II.A",
+        "patched": True,
+        "observer_only": False,
+        "target": "vLLM V2 GPU NaiveBlockAllocator",
+        "patched_methods": patched,
+        "storage_of_record": "native_vllm_kv_tensors",
         "seam_report": inspect_vllm_seams(),
     }
 

@@ -8,12 +8,14 @@ import json
 import sys
 from typing import Any, Sequence
 
+from .backed_allocator import KcmmBackedAllocationTracker
 from .bindings import KcmmError, KcmmLibrary, KcmmPool, result_to_dict
 from .config import ObserverConfig, VllmRuntimeSizing, add_kcmm_args
 from .patch_vllm import (
-    apply_shadow_allocator,
     apply_allocator_instrumentation,
+    apply_kcmm_backed_allocator,
     apply_observer_patches,
+    apply_shadow_allocator,
     apply_runtime_pool_sizing,
 )
 from .shadow_allocator import ShadowAllocationTracker
@@ -21,6 +23,7 @@ from .shadow_allocator import ShadowAllocationTracker
 
 _ACTIVE_POOL: KcmmPool | None = None
 _SHADOW_TRACKER: ShadowAllocationTracker | None = None
+_BACKED_TRACKER: KcmmBackedAllocationTracker | None = None
 
 
 def _print_json(payload: object, *, stream: object = sys.stderr) -> None:
@@ -63,6 +66,12 @@ def _write_shadow_report() -> None:
     if _SHADOW_TRACKER is not None:
         _SHADOW_TRACKER.write_report()
         _print_json({"kcmm_shadow_allocator": _SHADOW_TRACKER.report()})
+
+
+def _write_backed_report() -> None:
+    if _BACKED_TRACKER is not None:
+        _BACKED_TRACKER.write_report()
+        _print_json({"kcmm_backed_allocator": _BACKED_TRACKER.report()})
 
 
 def _create_observer_pool(
@@ -197,7 +206,7 @@ def _run_vllm(vllm_args: Sequence[str]) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    global _ACTIVE_POOL, _SHADOW_TRACKER
+    global _ACTIVE_POOL, _SHADOW_TRACKER, _BACKED_TRACKER
 
     args = list(argv if argv is not None else sys.argv[1:])
     parser = argparse.ArgumentParser(
@@ -247,10 +256,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     allocator_report = None
     runtime_pool_report = None
     shadow_report = None
+    backed_report = None
     if config.shadow_allocations:
         _SHADOW_TRACKER = ShadowAllocationTracker(config.shadow_report_path)
         shadow_report = apply_shadow_allocator(_SHADOW_TRACKER)
         _print_json({"kcmm_shadow_allocator_patch": shadow_report})
+
+    if config.backed_allocations:
+        _BACKED_TRACKER = KcmmBackedAllocationTracker(config.backed_report_path)
+        backed_report = apply_kcmm_backed_allocator(_BACKED_TRACKER)
+        _print_json({"kcmm_backed_allocator_patch": backed_report})
 
     if config.instrument_allocators:
         allocator_report = apply_allocator_instrumentation(
@@ -277,6 +292,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if _SHADOW_TRACKER is not None:
                 _SHADOW_TRACKER.attach_pool(pool)
                 atexit.register(_write_shadow_report)
+            if _BACKED_TRACKER is not None:
+                _BACKED_TRACKER.validate_runtime(runtime_sizing)
+                _BACKED_TRACKER.attach_pool(pool)
+                atexit.register(_write_backed_report)
             _print_json({"observer": report})
             return report
 
@@ -318,6 +337,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "vllm_allocator_instrumentation": allocator_report,
                 "kcmm_runtime_pool_sizing": runtime_pool_report,
                 "kcmm_shadow_allocator_patch": shadow_report,
+                "kcmm_backed_allocator_patch": backed_report,
             },
             stream=sys.stdout,
         )

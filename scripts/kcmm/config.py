@@ -121,6 +121,8 @@ class ObserverConfig:
     require_allocator_seams: bool = False
     shadow_allocations: bool = False
     shadow_report_path: str | None = None
+    backed_allocations: bool = False
+    backed_report_path: str | None = None
 
     @classmethod
     def from_env(cls) -> "ObserverConfig":
@@ -158,6 +160,8 @@ class ObserverConfig:
             require_allocator_seams=_env_bool("KCMM_REQUIRE_ALLOCATOR_SEAMS", False),
             shadow_allocations=_env_bool("KCMM_SHADOW_ALLOCATIONS", False),
             shadow_report_path=os.environ.get("KCMM_SHADOW_REPORT_PATH") or None,
+            backed_allocations=_env_bool("KCMM_BACKED_ALLOCATIONS", False),
+            backed_report_path=os.environ.get("KCMM_BACKED_REPORT_PATH") or None,
         )
 
     @classmethod
@@ -212,6 +216,12 @@ class ObserverConfig:
             raise ValueError("KCMM shadow allocation mode requires --kcmm-pool-mode runtime")
         if self.shadow_allocations and self.skip_observer:
             raise ValueError("KCMM shadow allocation mode requires the KCMM observer pool")
+        if self.backed_allocations and self.pool_mode != "runtime":
+            raise ValueError("KCMM-backed allocation mode requires --kcmm-pool-mode runtime")
+        if self.backed_allocations and self.skip_observer:
+            raise ValueError("KCMM-backed allocation mode requires the KCMM observer pool")
+        if self.backed_allocations and self.shadow_allocations:
+            raise ValueError("KCMM-backed allocation mode cannot be combined with shadow mode")
 
     def with_runtime_sizing(self, sizing: VllmRuntimeSizing) -> "ObserverConfig":
         sizing.validate()
@@ -298,4 +308,10 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--kcmm-shadow-report-path", default=None)
+    parser.add_argument(
+        "--kcmm-backed-allocations",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--kcmm-backed-report-path", default=None)
     return parser

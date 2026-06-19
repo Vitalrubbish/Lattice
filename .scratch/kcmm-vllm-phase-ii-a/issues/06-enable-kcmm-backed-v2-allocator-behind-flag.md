@@ -1,6 +1,6 @@
 # Enable KCMM-backed V2 allocator behind a flag
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build
@@ -17,13 +17,29 @@ replacement from being correct.
 
 ## Acceptance criteria
 
-- [ ] A launcher flag selects KCMM-backed allocator mode; the default remains observer-only or stock behavior.
-- [ ] KCMM owns allocation/free decisions for the targeted V2 allocator seam when the flag is enabled.
-- [ ] The implementation respects the storage-of-record decision from issue 03.
-- [ ] A smoke completion either succeeds end-to-end or exits with a documented stop condition that points to the required Phase II.B/II.C work.
-- [ ] Allocation/free metrics show no leaked KCMM blocks after the smoke request completes and the server shuts down.
-- [ ] The mode is incompatible with unsupported vLLM versions or flags and fails before serving traffic.
-- [ ] Existing observer-only and shadow modes continue to pass.
+- [x] A launcher flag selects KCMM-backed allocator mode; the default remains observer-only or stock behavior.
+- [x] KCMM owns allocation/free decisions for the targeted V2 allocator seam when the flag is enabled.
+- [x] The implementation respects the storage-of-record decision from issue 03.
+- [x] A smoke completion either succeeds end-to-end or exits with a documented stop condition that points to the required Phase II.B/II.C work.
+- [x] Allocation/free metrics show no leaked KCMM blocks after the smoke request completes and the server shuts down.
+- [x] The mode is incompatible with unsupported vLLM versions or flags and fails before serving traffic.
+- [x] Existing observer-only and shadow modes continue to pass.
+
+## Validation
+
+- `python -m py_compile scripts/kcmm/*.py`
+- `python -m scripts.kcmm.vllm_smoke --backed-allocations`
+- `python -m scripts.kcmm.vllm_smoke --shadow-allocations`
+- `python -m scripts.kcmm --kcmm-observer-only --kcmm-lib-path target/debug/libbaseline_llm_os.so --kcmm-print-seams`
+- `python -m scripts.kcmm --kcmm-backed-allocations --kcmm-lib-path target/debug/libbaseline_llm_os.so --kcmm-observer-only` exits with configuration error
+- `python -m scripts.kcmm.vllm_smoke --mode stock --backed-allocations` exits with configuration error
+- `python -m scripts.kcmm.vllm_smoke --shadow-allocations --backed-allocations` exits with configuration error
+
+The local KCMM-backed smoke report recorded `decision_source=kcmm_alloc_blocks`,
+`storage_of_record=native_vllm_kv_tensors`, `native_gpu_allocations=1`,
+`native_gpu_frees=1`, `kcmm_allocations=1`, `kcmm_frees=1`,
+`outstanding_mappings=0`, `error_count=0`, `stop_condition=null`, and KCMM pool
+`blocks_in_use=0` after the request and shutdown path completed.
 
 ## Blocked by
 

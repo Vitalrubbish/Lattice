@@ -139,6 +139,19 @@ storage. The smoke runner fails if the shadow report records errors, leaked
 shadow mappings, zero observed GPU allocations, or mismatched KCMM alloc/free
 counts.
 
+Run with the Phase II.A KCMM-backed allocator:
+
+```bash
+python -m scripts.kcmm.vllm_smoke --backed-allocations
+```
+
+This enables runtime-derived pool sizing and lets KCMM choose vLLM GPU block IDs
+through `kcmm_alloc_blocks`. vLLM native KV tensors remain the storage of record:
+the KCMM-selected block ID is accepted only if it is also a free native vLLM GPU
+block ID. The smoke runner fails if the backed report records a stop condition,
+errors, leaked mappings, zero observed GPU allocations, mismatched KCMM
+alloc/free counts, or KCMM blocks still in use after shutdown.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This
