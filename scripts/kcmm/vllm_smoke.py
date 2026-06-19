@@ -47,6 +47,7 @@ class SmokeConfig:
     print_seams: bool
     instrument_allocators: bool
     instrument_kv_writes: bool
+    instrument_kv_reads: bool
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
     runtime_derived_pool: bool
@@ -54,11 +55,13 @@ class SmokeConfig:
     backed_allocations: bool
     allocator_trace_path: Path
     kv_write_trace_path: Path
+    kv_read_trace_path: Path
     kv_write_mirror_report_path: Path
     shadow_report_path: Path
     backed_report_path: Path
     require_allocator_seams: bool
     require_kv_write_seams: bool
+    require_kv_read_seams: bool
     log_path: Path
 
     @property
@@ -125,6 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable observer-only reshape_and_cache KV write instrumentation.",
     )
     parser.add_argument(
+        "--instrument-kv-reads",
+        action="store_true",
+        help="Enable observer-only paged_attention KV read instrumentation.",
+    )
+    parser.add_argument(
         "--kv-write-mirror",
         action="store_true",
         help="Mirror reshape_and_cache writes into KCMM after native vLLM writes.",
@@ -165,6 +173,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="KV write instrumentation JSONL trace path. Defaults to a /tmp file.",
     )
     parser.add_argument(
+        "--kv-read-trace-path",
+        default=None,
+        help="KV read instrumentation JSONL trace path. Defaults to a /tmp file.",
+    )
+    parser.add_argument(
         "--kv-write-mirror-report-path",
         default=None,
         help="KCMM KV write mirror JSON report path. Defaults to a /tmp file.",
@@ -174,6 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Fail when KV write instrumentation does not observe reshape_and_cache.",
+    )
+    parser.add_argument(
+        "--require-kv-read-seams",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail when KV read instrumentation does not observe paged_attention.",
     )
     parser.add_argument(
         "--log-path",
@@ -202,6 +221,12 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         if args.kv_write_trace_path
         else Path(tempfile.gettempdir())
         / f"kcmm-vllm-kv-write-trace-{int(time.time() * 1000)}.jsonl"
+    )
+    kv_read_trace_path = (
+        Path(args.kv_read_trace_path)
+        if args.kv_read_trace_path
+        else Path(tempfile.gettempdir())
+        / f"kcmm-vllm-kv-read-trace-{int(time.time() * 1000)}.jsonl"
     )
     kv_write_mirror_report_path = (
         Path(args.kv_write_mirror_report_path)
@@ -233,6 +258,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         print_seams=args.print_seams,
         instrument_allocators=args.instrument_allocators,
         instrument_kv_writes=args.instrument_kv_writes,
+        instrument_kv_reads=args.instrument_kv_reads,
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
         runtime_derived_pool=(
@@ -246,11 +272,13 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         backed_allocations=args.backed_allocations,
         allocator_trace_path=allocator_trace_path,
         kv_write_trace_path=kv_write_trace_path,
+        kv_read_trace_path=kv_read_trace_path,
         kv_write_mirror_report_path=kv_write_mirror_report_path,
         shadow_report_path=shadow_report_path,
         backed_report_path=backed_report_path,
         require_allocator_seams=args.require_allocator_seams,
         require_kv_write_seams=args.require_kv_write_seams,
+        require_kv_read_seams=args.require_kv_read_seams,
         log_path=log_path,
     )
 
@@ -513,6 +541,16 @@ def vllm_command(config: SmokeConfig) -> list[str]:
         )
         if config.require_kv_write_seams:
             command.append("--kcmm-require-kv-write-seams")
+    if config.instrument_kv_reads:
+        command.extend(
+            [
+                "--kcmm-instrument-kv-reads",
+                "--kcmm-kv-read-trace-path",
+                str(config.kv_read_trace_path),
+            ]
+        )
+        if config.require_kv_read_seams:
+            command.append("--kcmm-require-kv-read-seams")
     if config.print_seams:
         command.append("--kcmm-print-seams")
     command.extend(
@@ -547,6 +585,7 @@ def vllm_command(config: SmokeConfig) -> list[str]:
     if (
         config.instrument_allocators
         or config.instrument_kv_writes
+        or config.instrument_kv_reads
         or config.kv_write_mirror
         or config.kv_write_replace_candidate
         or config.runtime_derived_pool
@@ -636,6 +675,58 @@ def read_kv_write_trace(path: Path) -> dict[str, Any]:
         "first_slot_mapping_contract": write_events[0]
         .get("args", {})
         .get("slot_mapping_contract", {}),
+    }
+
+
+def read_kv_read_trace(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise SmokeFailure(f"KV read trace was not written: {path}")
+    events: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                events.append(json.loads(line))
+    summary = next(
+        (event for event in reversed(events) if event.get("event") == "summary"),
+        None,
+    )
+    if summary is None:
+        raise SmokeFailure(f"KV read trace has no summary event: {path}")
+    missing = summary.get("missing_required_groups") or {}
+    if missing:
+        raise SmokeFailure(
+            "KV read instrumentation did not observe required seams: "
+            + json.dumps(missing, sort_keys=True)
+        )
+    read_events = [event for event in events if event.get("event") == "kv_read_call"]
+    if not read_events:
+        raise SmokeFailure(f"KV read trace has no read events: {path}")
+    invalid_contracts: list[dict[str, Any]] = []
+    for event in read_events:
+        contract = event.get("args", {}).get("block_tables_contract", {})
+        if not contract.get("valid", False):
+            invalid_contracts.append(
+                {
+                    "seq": event.get("seq"),
+                    "key": event.get("key"),
+                    "contract": contract,
+                }
+            )
+    if invalid_contracts:
+        raise SmokeFailure(
+            "KV read block_tables contract validation failed: "
+            + json.dumps(invalid_contracts, sort_keys=True)
+        )
+    return {
+        "path": str(path),
+        "event_count": len(events),
+        "read_event_count": len(read_events),
+        "counts": summary.get("counts", {}),
+        "missing_required_groups": missing,
+        "first_read": read_events[0],
+        "first_block_tables_contract": read_events[0]
+        .get("args", {})
+        .get("block_tables_contract", {}),
     }
 
 
@@ -900,6 +991,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "generated_model": generated_model,
             "runtime_derived_pool": config.runtime_derived_pool,
             "instrument_kv_writes": config.instrument_kv_writes,
+            "instrument_kv_reads": config.instrument_kv_reads,
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,
             "shadow_allocations": config.shadow_allocations,
@@ -922,6 +1014,8 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         result["allocator_trace"] = read_allocator_trace(config.allocator_trace_path)
     if config.instrument_kv_writes:
         result["kv_write_trace"] = read_kv_write_trace(config.kv_write_trace_path)
+    if config.instrument_kv_reads:
+        result["kv_read_trace"] = read_kv_read_trace(config.kv_read_trace_path)
     if config.kv_write_mirror or config.kv_write_replace_candidate:
         report = read_kv_write_mirror_report(config.kv_write_mirror_report_path)
         if config.kv_write_replace_candidate:

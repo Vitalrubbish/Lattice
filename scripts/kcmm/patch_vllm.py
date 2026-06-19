@@ -116,6 +116,11 @@ _KV_WRITE_SEQUENCE = 0
 _KV_WRITE_INSTRUMENTED = False
 _REQUIRE_KV_WRITE_SEAMS = False
 _KV_WRITE_MIRROR_PATCHED = False
+_KV_READ_TRACE_PATH: Path | None = None
+_KV_READ_COUNTS: dict[str, int] = {}
+_KV_READ_SEQUENCE = 0
+_KV_READ_INSTRUMENTED = False
+_REQUIRE_KV_READ_SEAMS = False
 
 KV_WRITE_FUNCTIONS = {
     "vllm._custom_ops": (
@@ -127,6 +132,20 @@ KV_WRITE_FUNCTIONS = {
 REQUIRED_KV_WRITE_GROUPS = {
     "kv_write_function_called": tuple(
         f"vllm._custom_ops.{name}" for name in KV_WRITE_FUNCTIONS["vllm._custom_ops"]
+    ),
+}
+
+
+KV_READ_FUNCTIONS = {
+    "vllm._custom_ops": (
+        "paged_attention_v1",
+        "paged_attention_v2",
+    )
+}
+
+REQUIRED_KV_READ_GROUPS = {
+    "kv_read_function_called": tuple(
+        f"vllm._custom_ops.{name}" for name in KV_READ_FUNCTIONS["vllm._custom_ops"]
     ),
 }
 
@@ -423,6 +442,151 @@ def _kv_write_args_summary(
     }
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _block_tables_contract(
+    block_tables: Any,
+    key_cache: Any,
+    value_cache: Any,
+    block_size: Any,
+    max_seq_len: Any,
+    seq_lens: Any,
+) -> dict[str, Any]:
+    layout = _infer_kv_cache_layout(key_cache, value_cache)
+    inferred_block_size = layout.get("block_size")
+    num_blocks = layout.get("num_blocks")
+    block_size_value = _safe_int(block_size)
+    max_seq_len_value = _safe_int(max_seq_len)
+    block_shape = _shape_list(block_tables)
+    block_values = _tensor_values_sample(block_tables, max_items=128)
+    seq_lens_values = _tensor_values_sample(seq_lens, max_items=32)
+
+    valid = True
+    reasons: list[str] = []
+    if not isinstance(inferred_block_size, int) or not isinstance(num_blocks, int):
+        valid = False
+        reasons.append("could not infer KV cache block size and block count")
+    if block_size_value is None or block_size_value <= 0:
+        valid = False
+        reasons.append("invalid paged-attention block_size argument")
+    elif isinstance(inferred_block_size, int) and block_size_value != inferred_block_size:
+        valid = False
+        reasons.append(
+            "paged-attention block_size argument does not match KV cache layout"
+        )
+    if isinstance(num_blocks, int) and num_blocks <= 0:
+        valid = False
+        reasons.append("invalid KV cache num_blocks")
+
+    decoded: list[dict[str, Any]] = []
+    invalid_block_ids: list[int] = []
+    sample = block_values.get("sample", []) if isinstance(block_values, dict) else []
+    columns = block_shape[1] if block_shape is not None and len(block_shape) >= 2 else None
+    for flat_index, raw_block_id in enumerate(sample):
+        block_id = int(raw_block_id)
+        row = flat_index // columns if isinstance(columns, int) and columns > 0 else None
+        column = flat_index % columns if isinstance(columns, int) and columns > 0 else None
+        block_valid = isinstance(num_blocks, int) and 0 <= block_id < num_blocks
+        if not block_valid:
+            invalid_block_ids.append(block_id)
+        decoded.append(
+            {
+                "flat_index": flat_index,
+                "row": row,
+                "column": column,
+                "block_id": block_id,
+                "valid": block_valid,
+            }
+        )
+
+    if invalid_block_ids:
+        valid = False
+        reasons.append("sampled block table contains block ids outside KV cache")
+
+    max_blocks_needed = None
+    if block_size_value and max_seq_len_value:
+        max_blocks_needed = (max_seq_len_value + block_size_value - 1) // block_size_value
+
+    return {
+        **layout,
+        "valid": valid,
+        "reasons": reasons,
+        "block_id_semantics": "block_tables entries are physical KV block indices",
+        "block_tables_shape": block_shape,
+        "block_tables_dtype": str(getattr(block_tables, "dtype", "unknown")),
+        "block_tables_sample": block_values,
+        "decoded_sample": decoded,
+        "invalid_block_ids": invalid_block_ids,
+        "seq_lens_sample": seq_lens_values,
+        "block_size_arg": block_size_value,
+        "max_seq_len_arg": max_seq_len_value,
+        "max_blocks_needed_for_max_seq_len": max_blocks_needed,
+        "a1_python_custom_op_assessment": {
+            "safe_to_replace_block_tables_with_va_offsets": False,
+            "reason": (
+                "This seam passes key_cache/value_cache tensors plus integer "
+                "block table entries. The observed contract is block ids, not "
+                "raw addresses or offsets; replacing entries with KCMM VA "
+                "offsets would exceed the KV cache block-id range unless the "
+                "attention kernel address calculation is also changed."
+            ),
+        },
+    }
+
+
+def _kv_read_args_summary(function_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    block_tables = arguments["block_tables"]
+    seq_lens = arguments["seq_lens"]
+    key_cache = arguments["key_cache"]
+    value_cache = arguments["value_cache"]
+    summary = {
+        "function": function_name,
+        "out": _tensor_summary(arguments["out"]),
+        "query": _tensor_summary(arguments["query"]),
+        "key_cache": _tensor_summary(key_cache),
+        "value_cache": _tensor_summary(value_cache),
+        "block_tables": _tensor_summary(block_tables, include_values=True),
+        "seq_lens": _tensor_summary(seq_lens, include_values=True),
+        "block_tables_contract": _block_tables_contract(
+            block_tables,
+            key_cache,
+            value_cache,
+            arguments["block_size"],
+            arguments["max_seq_len"],
+            seq_lens,
+        ),
+        "num_kv_heads": _safe_summary(arguments["num_kv_heads"]),
+        "scale": _safe_summary(arguments["scale"]),
+        "block_size": _safe_summary(arguments["block_size"]),
+        "max_seq_len": _safe_summary(arguments["max_seq_len"]),
+        "alibi_slopes": _tensor_summary(arguments["alibi_slopes"]),
+        "kv_cache_dtype": _safe_summary(arguments["kv_cache_dtype"]),
+        "k_scale": _safe_summary(arguments["k_scale"]),
+        "v_scale": _safe_summary(arguments["v_scale"]),
+        "tp_rank": _safe_summary(arguments.get("tp_rank")),
+        "blocksparse_local_blocks": _safe_summary(
+            arguments.get("blocksparse_local_blocks")
+        ),
+        "blocksparse_vert_stride": _safe_summary(
+            arguments.get("blocksparse_vert_stride")
+        ),
+        "blocksparse_block_size": _safe_summary(arguments.get("blocksparse_block_size")),
+        "blocksparse_head_sliding_step": _safe_summary(
+            arguments.get("blocksparse_head_sliding_step")
+        ),
+    }
+    if function_name == "paged_attention_v2":
+        summary["exp_sum"] = _tensor_summary(arguments["exp_sum"])
+        summary["max_logits"] = _tensor_summary(arguments["max_logits"])
+        summary["tmp_out"] = _tensor_summary(arguments["tmp_out"])
+    return summary
+
+
 def _bound_arguments(
     fn: Any,
     args: tuple[Any, ...],
@@ -463,6 +627,18 @@ def _write_kv_write_trace(event: dict[str, Any]) -> None:
     with _TRACE_LOCK:
         _KV_WRITE_SEQUENCE += 1
         payload = {"seq": _KV_WRITE_SEQUENCE, **event}
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _write_kv_read_trace(event: dict[str, Any]) -> None:
+    global _KV_READ_SEQUENCE
+    path = _KV_READ_TRACE_PATH
+    if path is None:
+        return
+    with _TRACE_LOCK:
+        _KV_READ_SEQUENCE += 1
+        payload = {"seq": _KV_READ_SEQUENCE, **event}
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
@@ -514,6 +690,26 @@ def _record_kv_write_call(
     _write_kv_write_trace(event)
 
 
+def _record_kv_read_call(
+    key: str,
+    args_summary: dict[str, Any],
+    error: BaseException | None = None,
+) -> None:
+    _KV_READ_COUNTS[key] = _KV_READ_COUNTS.get(key, 0) + 1
+    event: dict[str, Any] = {
+        "event": "kv_read_call",
+        "key": key,
+        "count": _KV_READ_COUNTS[key],
+        "args": args_summary,
+    }
+    if error is not None:
+        event["error"] = {
+            "type": f"{type(error).__module__}.{type(error).__qualname__}",
+            "message": str(error),
+        }
+    _write_kv_read_trace(event)
+
+
 def _missing_required_groups() -> dict[str, list[str]]:
     missing: dict[str, list[str]] = {}
     for group, keys in REQUIRED_ALLOCATOR_GROUPS.items():
@@ -526,6 +722,14 @@ def _missing_required_kv_write_groups() -> dict[str, list[str]]:
     missing: dict[str, list[str]] = {}
     for group, keys in REQUIRED_KV_WRITE_GROUPS.items():
         if not any(_KV_WRITE_COUNTS.get(key, 0) > 0 for key in keys):
+            missing[group] = list(keys)
+    return missing
+
+
+def _missing_required_kv_read_groups() -> dict[str, list[str]]:
+    missing: dict[str, list[str]] = {}
+    for group, keys in REQUIRED_KV_READ_GROUPS.items():
+        if not any(_KV_READ_COUNTS.get(key, 0) > 0 for key in keys):
             missing[group] = list(keys)
     return missing
 
@@ -562,6 +766,25 @@ def _write_kv_write_trace_summary() -> None:
     if _REQUIRE_KV_WRITE_SEAMS and missing:
         print(
             "KCMM KV write instrumentation missing required seams: "
+            + json.dumps(missing, sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _write_kv_read_trace_summary() -> None:
+    missing = _missing_required_kv_read_groups()
+    _write_kv_read_trace(
+        {
+            "event": "summary",
+            "counts": dict(sorted(_KV_READ_COUNTS.items())),
+            "required_groups": REQUIRED_KV_READ_GROUPS,
+            "missing_required_groups": missing,
+        }
+    )
+    if _REQUIRE_KV_READ_SEAMS and missing:
+        print(
+            "KCMM KV read instrumentation missing required seams: "
             + json.dumps(missing, sort_keys=True),
             file=sys.stderr,
             flush=True,
@@ -622,6 +845,29 @@ def _wrap_kv_write_function(module: Any, function_name: str) -> None:
         return result
 
     wrapper._kcmm_kv_write_instrumented = True  # type: ignore[attr-defined]
+    setattr(module, function_name, wrapper)
+
+
+def _wrap_kv_read_function(module: Any, function_name: str) -> None:
+    original = getattr(module, function_name)
+    if getattr(original, "_kcmm_kv_read_instrumented", False):
+        return
+    call_key = f"{module.__name__}.{function_name}"
+    signature = inspect.signature(original)
+
+    @wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(*args, **kwargs)
+        args_summary = _kv_read_args_summary(function_name, bound.arguments)
+        try:
+            result = original(*args, **kwargs)
+        except BaseException as exc:
+            _record_kv_read_call(call_key, args_summary, error=exc)
+            raise
+        _record_kv_read_call(call_key, args_summary)
+        return result
+
+    wrapper._kcmm_kv_read_instrumented = True  # type: ignore[attr-defined]
     setattr(module, function_name, wrapper)
 
 
@@ -1138,4 +1384,54 @@ def apply_kv_write_mirror(mirror: Any) -> dict[str, object]:
         ),
         "patched_functions": patched,
         "required_allocator_mode": "kcmm_backed_allocator",
+    }
+
+
+def apply_kv_read_instrumentation(
+    trace_path: str | None = None,
+    require_seams: bool = False,
+) -> dict[str, object]:
+    """Patch vLLM paged-attention custom-op wrappers to record read contracts."""
+
+    global _KV_READ_INSTRUMENTED, _REQUIRE_KV_READ_SEAMS, _KV_READ_TRACE_PATH
+
+    _REQUIRE_KV_READ_SEAMS = require_seams
+    if trace_path is None:
+        trace_path = os.environ.get("KCMM_KV_READ_TRACE_PATH")
+    if trace_path is None:
+        trace_path = str(Path(tempfile.gettempdir()) / "kcmm-vllm-kv-read-trace.jsonl")
+
+    _KV_READ_TRACE_PATH = Path(trace_path)
+    _KV_READ_TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _KV_READ_TRACE_PATH.write_text("", encoding="utf-8")
+
+    patched: list[str] = []
+    if not _KV_READ_INSTRUMENTED:
+        for module_name, function_names in KV_READ_FUNCTIONS.items():
+            module = importlib.import_module(module_name)
+            for function_name in function_names:
+                if hasattr(module, function_name):
+                    _wrap_kv_read_function(module, function_name)
+                    patched.append(f"{module_name}.{function_name}")
+        atexit.register(_write_kv_read_trace_summary)
+        _KV_READ_INSTRUMENTED = True
+
+    _write_kv_read_trace(
+        {
+            "event": "kv_read_instrumentation_enabled",
+            "trace_path": str(_KV_READ_TRACE_PATH),
+            "require_seams": require_seams,
+            "patched": patched,
+            "required_groups": REQUIRED_KV_READ_GROUPS,
+        }
+    )
+
+    return {
+        "phase": "II.C",
+        "patched": True,
+        "observer_only": True,
+        "trace_path": str(_KV_READ_TRACE_PATH),
+        "require_seams": require_seams,
+        "patched_functions": patched,
+        "required_groups": REQUIRED_KV_READ_GROUPS,
     }

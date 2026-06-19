@@ -125,6 +125,9 @@ class ObserverConfig:
     kv_write_mirror: bool = False
     kv_write_replace_candidate: bool = False
     kv_write_mirror_report_path: str | None = None
+    instrument_kv_reads: bool = False
+    kv_read_trace_path: str | None = None
+    require_kv_read_seams: bool = False
     shadow_allocations: bool = False
     shadow_report_path: str | None = None
     backed_allocations: bool = False
@@ -174,6 +177,9 @@ class ObserverConfig:
             kv_write_mirror_report_path=(
                 os.environ.get("KCMM_KV_WRITE_MIRROR_REPORT_PATH") or None
             ),
+            instrument_kv_reads=_env_bool("KCMM_INSTRUMENT_KV_READS", False),
+            kv_read_trace_path=os.environ.get("KCMM_KV_READ_TRACE_PATH") or None,
+            require_kv_read_seams=_env_bool("KCMM_REQUIRE_KV_READ_SEAMS", False),
             shadow_allocations=_env_bool("KCMM_SHADOW_ALLOCATIONS", False),
             shadow_report_path=os.environ.get("KCMM_SHADOW_REPORT_PATH") or None,
             backed_allocations=_env_bool("KCMM_BACKED_ALLOCATIONS", False),
@@ -362,6 +368,17 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--kcmm-kv-write-mirror-report-path", default=None)
+    parser.add_argument(
+        "--kcmm-instrument-kv-reads",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--kcmm-kv-read-trace-path", default=None)
+    parser.add_argument(
+        "--kcmm-require-kv-read-seams",
+        action="store_true",
+        default=None,
+    )
     parser.add_argument(
         "--kcmm-shadow-allocations",
         action="store_true",

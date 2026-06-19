@@ -79,9 +79,10 @@ Phase II-B — KV write path (intercept 2)
   ├─ D2D copy must run on the current PyTorch/vLLM CUDA stream or synchronize by event
   └─ Gate: D2H read-back byte-level K/V comparison vs reference computation
 
-Phase II-C — KV read path (intercept 3, A1 approach)
-  ├─ Prototype A1: replace block_tables values with KCMM VA offsets, base=0
-  ├─ If A1 violates kernel assumptions, fall back to A2/custom attention backend
+Phase II-C — KV read path (intercept 3)
+  ├─ Trace paged_attention_v1/v2 block_tables and KV cache tensor contract
+  ├─ A1 decision: Python custom-op seam expects block ids plus native KV tensor base
+  ├─ Prototype A2/custom attention backend for KCMM VA indirection
   └─ Gate: token-exact match vs stock vLLM (same prompt → same completion)
 
 Phase III  — Tiering (intercepts 4, 6, 7)
@@ -191,18 +192,21 @@ This validates the Phase II.B seam but still does not establish end-to-end
 correctness, because vLLM attention reads continue to use native KV tensors
 until Phase II.C replaces the read path.
 
-### Why A1 over A2 for VA remapping (intercept 3)
+### Why A1 is not valid at the vLLM Python custom-op seam (intercept 3)
 
 A1: replace `block_tables` values with f16-unit VA offsets, set kernel `kv_cache_base=0`.
 A2: maintain a separate GPU-side offset table indexed by block_id, replace all
 Python-side `block_tables` reads with KCMM offset queries.
 
-A1 is simpler to prototype because it reuses the existing `block_tables` tensor
-channel and only changes what values flow through it. The Rust engine does not
-prove A1: its paged-attention kernel keeps `block_tables` as block indices and
-uses a separate `block_offsets_f16` table. If vLLM kernels assume `base +
-block_id * stride`, A1 is invalid and Phase II-C must use A2 or a custom
-attention backend.
+A1 was the simpler hypothesis because it reused the existing `block_tables`
+tensor channel. Phase II.C read instrumentation rejects A1 at the Python
+custom-op seam for vLLM `0.6.1.post1+cu118`: `paged_attention_v1` receives
+native `key_cache`/`value_cache` tensors plus `torch.int32` `block_tables`
+entries whose observed semantics are physical KV block ids. Replacing those
+entries with KCMM VA offsets would exceed the KV cache block-id range while the
+kernel still receives the native tensor base. Phase II.C must therefore continue
+with A2 or a custom attention backend that explicitly resolves block ids to KCMM
+addresses.
 
 ### CUDA context sharing risk
 

@@ -330,6 +330,56 @@ The mirror gate was also rerun after the patch-order change:
 - KCMM mirror calls: `8`
 - D2H verified rows: `10`
 
+## Phase II.C vLLM KV read contract trace
+
+Run the observer-only paged-attention read instrumentation before attempting to
+replace vLLM attention reads:
+
+```bash
+python -m scripts.kcmm.vllm_smoke --instrument-kv-reads
+```
+
+The smoke patches `vllm._custom_ops.paged_attention_v1` and
+`vllm._custom_ops.paged_attention_v2` without changing behavior. It records the
+tensor contract for `query`, `key_cache`, `value_cache`, `block_tables`, and
+`seq_lens`, validates sampled block table entries against the observed KV cache
+block count, and records whether A1 can safely replace `block_tables` entries
+with KCMM VA offsets.
+
+Latest local Phase II.C read contract result on 2026-06-19:
+
+- Command: `python -m scripts.kcmm.vllm_smoke --instrument-kv-reads`
+- Result: `passed=true`
+- Observed read seam: `vllm._custom_ops.paged_attention_v1`
+- Read calls observed: `6`
+- Required KV read seam groups missing: `{}`
+- First `block_tables` dtype: `torch.int32`
+- First `block_tables` shape: `[1, 1]`
+- First `block_tables` sample: `[0]`
+- First `seq_lens` sample: `[3]`
+- First `key_cache` shape: `[134685, 2, 8, 16, 8]`
+- First `value_cache` shape: `[134685, 2, 64, 16]`
+- A1 assessment at the Python custom-op seam:
+  `safe_to_replace_block_tables_with_va_offsets=false`
+- Reason: this seam passes native `key_cache`/`value_cache` tensor bases plus
+  integer block ids. Replacing `block_tables` with KCMM VA offsets would exceed
+  the KV cache block-id range unless the attention kernel address calculation is
+  also changed.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
+The read trace was also run with the Phase II.B replacement-candidate write
+path:
+
+- Command:
+  `python -m scripts.kcmm.vllm_smoke --backed-allocations --instrument-kv-writes --instrument-kv-reads --kv-write-replace-candidate`
+- Result: `passed=true`
+- Write calls observed: `8`
+- Read calls observed: `6`
+- Native write passthrough calls: `0`
+- Native write skipped calls: `8`
+- KCMM write verified rows: `10`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This
