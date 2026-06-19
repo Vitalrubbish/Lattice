@@ -262,6 +262,15 @@ class KcmmLibrary:
             ctypes.c_uint64,
         ]
         lib.kcmm_append_kv_step.restype = ctypes.c_int
+        lib.kcmm_append_kv_slots.argtypes = [
+            pool,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        lib.kcmm_append_kv_slots.restype = ctypes.c_int
         lib.kcmm_get_block_location.argtypes = [
             pool,
             ctypes.c_uint32,
@@ -426,6 +435,27 @@ class KcmmPool:
             int(v_src_ptr),
         )
         self._check(rc, "kcmm_append_kv_step")
+
+    def append_kv_slots(
+        self,
+        layer_idx: int,
+        slot_mapping: list[int],
+        k_src_ptr: int,
+        v_src_ptr: int,
+    ) -> None:
+        batch = len(slot_mapping)
+        if batch <= 0:
+            raise ValueError("batch must be positive")
+        slot_arr = (ctypes.c_int64 * batch)(*slot_mapping)
+        rc = self.library.lib.kcmm_append_kv_slots(
+            self.handle,
+            layer_idx,
+            slot_arr,
+            batch,
+            int(k_src_ptr),
+            int(v_src_ptr),
+        )
+        self._check(rc, "kcmm_append_kv_slots")
 
     def block_location(self, block_idx: int) -> str:
         out = ctypes.c_uint32()

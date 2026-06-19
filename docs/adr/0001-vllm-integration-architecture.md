@@ -72,7 +72,8 @@ Phase II-A — Allocator replacement (intercepts 1, 8)
 
 Phase II-B — KV write path (intercept 2)
   ├─ Preflight: bind and gate kcmm_append_kv_step from Python with D2H read-back
-  ├─ Replace reshape_and_cache with stream-aware kcmm_append_kv_step
+  ├─ Bind and gate kcmm_append_kv_slots for reshape_and_cache slot_mapping writes
+  ├─ Replace reshape_and_cache with stream-aware direct-slot KCMM writes
   ├─ D2D copy must run on the current PyTorch/vLLM CUDA stream or synchronize by event
   └─ Gate: D2H read-back byte-level K/V comparison vs reference computation
 
@@ -146,27 +147,33 @@ execution. `--enforce-eager` disables CUDA graphs and keeps execution step-wise,
 which is the safest mode for Phase I.C and early interception experiments.
 Attention backend selection must still be pinned and verified per vLLM version.
 
-### Why `kcmm_append_kv_step` over slot_mapping modification (intercept 2)
+### Why direct KCMM D2D writes over slot_mapping modification (intercept 2)
 
 `reshape_and_cache` is a compiled CUDA kernel. Modifying `key_cache`/`value_cache`
 tensors to point at KCMM VA regions requires PyTorch to accept `cuMemMap`-backed
 memory as tensor storage. Modifying `slot_mapping` values depends on
 kernel-internal address computation that varies across vLLM versions.
-`kcmm_append_kv_step` bypasses both by doing D2D copies directly via CUDA driver
-API, but it must be stream-aware before it is safe inside a PyTorch/vLLM forward
-pass.
+KCMM D2D write APIs bypass both by copying into KCMM-managed VA directly via the
+CUDA driver API, but they must be stream-aware before they are safe inside a
+PyTorch/vLLM forward pass.
 
 Before patching vLLM, `python -m scripts.kcmm.kv_write_ffi_smoke` must pass. This
-preflight gate proves the Python launcher can call `kcmm_append_kv_step`, read
+preflight gate proves the Python launcher can call the sequence-position writer
+`kcmm_append_kv_step` and the physical-slot writer `kcmm_append_kv_slots`, read
 back KCMM VA bytes, and detect K/V mismatches independently of vLLM scheduling.
 Then `python -m scripts.kcmm.vllm_smoke --instrument-kv-writes` must pass to
 record the version-pinned `reshape_and_cache` tensor contract that the
 replacement must preserve. The trace decodes `slot_mapping` as
 `block_id = slot // block_size` and `offset_in_block = slot % block_size`,
 which means the `reshape_and_cache` seam exposes physical KV slots but not
-sequence ids. A replacement at this seam therefore needs either a direct-slot
-KCMM write API or an additional metadata-builder patch that reconstructs
-sequence/position inputs for `kcmm_append_kv_step`.
+sequence ids.
+
+The chosen replacement path at this seam is therefore
+`kcmm_append_kv_slots(layer_idx, slot_mapping, batch, k_src, v_src)`.
+`kcmm_append_kv_step` remains useful for lower-level sequence/position tests and
+future metadata-aware integration points, but it is not the direct replacement
+for vLLM `reshape_and_cache` unless a separate metadata-builder patch restores
+sequence/position context.
 
 ### Why A1 over A2 for VA remapping (intercept 3)
 

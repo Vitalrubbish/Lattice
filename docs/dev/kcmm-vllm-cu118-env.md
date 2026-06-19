@@ -194,10 +194,13 @@ python -m scripts.kcmm.kv_write_ffi_smoke
 ```
 
 The gate creates a tiny KCMM pool, registers a sequence backed by two KCMM
-blocks, writes known FP16 K/V rows through `kcmm_append_kv_step`, then reads the
-destination KCMM VA bytes back to host and compares them with the source CUDA
-tensors. This verifies the C ABI, VA accessors, D2D write path, and D2H
-byte-level comparison without downloading a model or starting vLLM.
+blocks, writes known FP16 K/V rows through `kcmm_append_kv_step`, then verifies
+the vLLM-style physical-slot writer `kcmm_append_kv_slots` with
+`slot = block_id * block_size + offset_in_block`. It reads the destination KCMM
+VA bytes back to host and compares them with the source CUDA tensors. This
+verifies the C ABI, VA accessors, D2D write paths, direct-slot decoding, padding
+skip behavior, unallocated-slot failure, and D2H byte-level comparison without
+downloading a model or starting vLLM.
 
 Latest local Phase II.B preflight result on 2026-06-19:
 
@@ -205,6 +208,10 @@ Latest local Phase II.B preflight result on 2026-06-19:
 - Result: `passed=true`
 - Compared two K rows and two V rows at positions `0` and `5`.
 - The smoke wrote into two KCMM blocks through a registered sequence.
+- Direct-slot writes passed for slots `2` and `7` using
+  `slot = block_id * block_size + offset_in_block`.
+- Direct-slot padding slot `-1` was skipped.
+- Invalid direct slot `16` failed with `block_idx 4 from slot 16 not in use`.
 - Final KCMM stats recorded `blocks_in_use=0`.
 
 ## Phase II.B vLLM write contract trace
@@ -225,9 +232,9 @@ contents.
 
 The trace also decodes the bounded `slot_mapping` sample using the vLLM contract
 `slot = block_id * block_size + offset_in_block`. This proves the write seam
-exposes physical KV slots. The next replacement slice must either add a KCMM
-direct-slot write API that consumes this mapping, or patch attention metadata
-construction to recover sequence/position context for `kcmm_append_kv_step`.
+exposes physical KV slots. The replacement path for this seam is the KCMM
+direct-slot writer `kcmm_append_kv_slots`; `kcmm_append_kv_step` remains the
+lower-level sequence/position writer.
 
 Latest local Phase II.B write contract result on 2026-06-19:
 

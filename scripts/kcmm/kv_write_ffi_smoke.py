@@ -237,6 +237,7 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
             assert_bytes_equal(f"v[row={row}]", actual_v, expected_v)
             comparisons.append(
                 {
+                    "mode": "sequence_position",
                     "row": row,
                     "seq_idx": seq_idx,
                     "position": position,
@@ -246,6 +247,85 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
                     "k_addr": k_addr,
                     "v_addr": v_addr,
                 }
+            )
+
+        slot_batch = 3
+        slot_k_src = (
+            torch.arange(slot_batch * step, dtype=torch.float16, device=device) + 2000
+        ).reshape(
+            slot_batch,
+            step,
+        )
+        slot_v_src = (
+            torch.arange(slot_batch * step, dtype=torch.float16, device=device) + 3000
+        ).reshape(
+            slot_batch,
+            step,
+        )
+        slots = [
+            blocks[0] * config.block_size + 2,
+            blocks[1] * config.block_size + 3,
+            -1,
+        ]
+        pool.append_kv_slots(
+            layer_idx=0,
+            slot_mapping=slots,
+            k_src_ptr=int(slot_k_src.data_ptr()),
+            v_src_ptr=int(slot_v_src.data_ptr()),
+        )
+        pool.synchronize()
+        torch.cuda.synchronize(config.device_ordinal)
+
+        for row, slot in enumerate(slots):
+            if slot < 0:
+                comparisons.append(
+                    {
+                        "mode": "physical_slot_padding",
+                        "row": row,
+                        "slot": slot,
+                        "skipped": True,
+                    }
+                )
+                continue
+            block = slot // config.block_size
+            offset_in_block = slot % config.block_size
+            block_offset = pool.block_va_offset(block)
+            token_offset_bytes = offset_in_block * step * 2
+            k_addr = va_k + block_offset + token_offset_bytes
+            v_addr = va_v + block_offset + token_offset_bytes
+            expected_k = tensor_bytes(slot_k_src[row])
+            expected_v = tensor_bytes(slot_v_src[row])
+            actual_k = driver.memcpy_dtoh(k_addr, byte_count)
+            actual_v = driver.memcpy_dtoh(v_addr, byte_count)
+            assert_bytes_equal(f"k[slot_row={row}]", actual_k, expected_k)
+            assert_bytes_equal(f"v[slot_row={row}]", actual_v, expected_v)
+            comparisons.append(
+                {
+                    "mode": "physical_slot",
+                    "row": row,
+                    "slot": slot,
+                    "block": block,
+                    "offset_in_block": offset_in_block,
+                    "byte_count": byte_count,
+                    "k_addr": k_addr,
+                    "v_addr": v_addr,
+                }
+            )
+
+        invalid_slot = config.max_blocks * config.block_size
+        invalid_error = None
+        try:
+            pool.append_kv_slots(
+                layer_idx=0,
+                slot_mapping=[invalid_slot],
+                k_src_ptr=int(slot_k_src[:1].data_ptr()),
+                v_src_ptr=int(slot_v_src[:1].data_ptr()),
+            )
+        except KcmmError as exc:
+            invalid_error = str(exc)
+        if invalid_error is None:
+            raise KvWriteSmokeFailure(
+                f"direct-slot write unexpectedly accepted invalid slot {invalid_slot}"
             )
 
         pool.unregister_sequence(seq_idx)
@@ -277,6 +357,12 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
             "allocated_blocks": blocks,
             "registered_seq_idx": registered_seq_idx,
             "comparisons": comparisons,
+            "direct_slot_writes": {
+                "slot_formula": "slot = block_id * block_size + offset_in_block",
+                "slots": slots,
+                "invalid_slot": invalid_slot,
+                "invalid_slot_error": invalid_error,
+            },
             "stats_after_unregister": stats_after_unregister,
             "elapsed_seconds": round(time.monotonic() - started_at, 3),
         }

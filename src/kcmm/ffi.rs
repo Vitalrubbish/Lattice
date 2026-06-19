@@ -996,6 +996,123 @@ pub unsafe extern "C" fn kcmm_append_kv_step(
     0
 }
 
+/// Write one step of KV data using vLLM-style physical slot ids.
+///
+/// `slot_mapping` is a CPU-side i64 array with `batch` elements. Non-negative
+/// slots are interpreted as `slot = block_idx * block_size + offset_in_block`;
+/// negative slots are padding and are skipped. `k_src_ptr` and `v_src_ptr` are
+/// raw GPU virtual addresses pointing to source rows laid out as
+/// [batch, kv_heads * head_dim] in F16.
+///
+/// Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `pool` must be a valid handle. `slot_mapping` must point to
+/// `batch * sizeof(i64)` bytes. `k_src_ptr` and `v_src_ptr` must be valid GPU
+/// virtual addresses.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_append_kv_slots(
+    pool: *mut kcmm_pool_t,
+    layer_idx: u32,
+    slot_mapping: *const i64,
+    batch: u32,
+    k_src_ptr: u64,
+    v_src_ptr: u64,
+) -> i32 {
+    if pool.is_null() || slot_mapping.is_null() {
+        if !pool.is_null() {
+            pool_from_ptr(pool)
+                .set_error("kcmm_append_kv_slots: null arguments".to_string());
+        }
+        return -1;
+    }
+
+    let handle = pool_from_ptr(pool);
+    let pool = &handle.pool;
+    let slots = std::slice::from_raw_parts(slot_mapping, batch as usize);
+    let batch_usize = batch as usize;
+
+    use cudarc::driver::sys::{self, CUdeviceptr};
+
+    let va_k = match pool.va_k.get(layer_idx as usize) {
+        Some(&v) => v,
+        None => {
+            handle.set_error(format!(
+                "kcmm_append_kv_slots: layer_idx {} out of bounds",
+                layer_idx
+            ));
+            return -1;
+        }
+    };
+    let va_v = match pool.va_v.get(layer_idx as usize) {
+        Some(&v) => v,
+        None => {
+            handle.set_error(format!(
+                "kcmm_append_kv_slots: layer_idx {} out of bounds",
+                layer_idx
+            ));
+            return -1;
+        }
+    };
+
+    let k_src: CUdeviceptr = k_src_ptr;
+    let v_src: CUdeviceptr = v_src_ptr;
+    let eb = std::mem::size_of::<half::f16>();
+    let step = pool.elem_per_block / pool.block_size; // kv_heads * head_dim
+    let nbytes = step * eb;
+
+    let info_lock = pool.block_info.lock();
+
+    for b in 0..batch_usize {
+        let slot = slots[b];
+        if slot < 0 {
+            continue;
+        }
+
+        let slot = slot as usize;
+        let block_idx = slot / pool.block_size;
+        let offset_in_block = slot % pool.block_size;
+
+        let bi = match info_lock.get(block_idx) {
+            Some(bi) if bi.in_use => bi,
+            _ => {
+                handle.set_error(format!(
+                    "kcmm_append_kv_slots: block_idx {} from slot {} not in use",
+                    block_idx, slots[b]
+                ));
+                return -1;
+            }
+        };
+
+        let dst_off = bi.va_offset / eb + offset_in_block * step;
+        let src_off = b * step;
+
+        let dk = va_k + (dst_off * eb) as u64;
+        let dv = va_v + (dst_off * eb) as u64;
+        let sk = k_src + (src_off * eb) as u64;
+        let sv = v_src + (src_off * eb) as u64;
+
+        let r = sys::lib().cuMemcpyDtoDAsync_v2(dk, sk, nbytes, std::ptr::null_mut());
+        if r != sys::CUresult::CUDA_SUCCESS {
+            handle.set_error(format!(
+                "kcmm_append_kv_slots: cuMemcpyDtoDAsync K failed: {:?}",
+                r
+            ));
+            return -1;
+        }
+        let r = sys::lib().cuMemcpyDtoDAsync_v2(dv, sv, nbytes, std::ptr::null_mut());
+        if r != sys::CUresult::CUDA_SUCCESS {
+            handle.set_error(format!(
+                "kcmm_append_kv_slots: cuMemcpyDtoDAsync V failed: {:?}",
+                r
+            ));
+            return -1;
+        }
+    }
+
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Tiering operations
 // ---------------------------------------------------------------------------
