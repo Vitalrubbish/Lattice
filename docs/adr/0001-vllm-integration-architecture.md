@@ -14,21 +14,21 @@ This ADR accepts the near-term goal of proving KCMM can coexist with a vLLM
 process without changing vLLM behavior. It does **not** yet accept the full
 allocator/write/read/tiering replacement as a stable architecture.
 
-The current repository has a working KCMM path in the Rust engine, but the vLLM
-adapter is not implemented yet: `scripts/kcmm/launcher.py`,
-`scripts/kcmm/bindings.py`, and `scripts/kcmm/patch_vllm.py` are planned files,
-not current code. The vLLM integration phases below are therefore validation
-gates, not implementation claims.
+The current repository has a working KCMM path in the Rust engine plus a
+Phase I.C vLLM observer launcher and allocator-seam instrumentation. The full
+allocator/write/read/tiering replacement is still not accepted as stable
+architecture. The vLLM integration phases below are therefore validation gates,
+not implementation claims.
 
 ## Core decisions
 
-1. **Target vLLM 0.6.3.post1 as a controlled baseline** — `BlockSpaceManagerV2`
-   is default (block-level prefix caching baseline), `--enforce-eager` is stable,
-   and the Python-side block allocator path is still accessible for
-   monkey-patching. This is a frozen integration target, not the long-term
-   vLLM architecture target; newer vLLM V1/plugin/KV-offload paths must be
-   re-evaluated after Phase I.C.
-2. **Wrapper script, not source patch** — `scripts/kcmm/launcher.py` will apply
+1. **Target vLLM 0.6.1.post1+cu118 for the current Phase II.A branch** —
+   the local host driver supports CUDA 11.8 wheels, and this version keeps the
+   Python-side V2 block allocator path accessible for monkey-patching. It must
+   run with `--use-v2-block-manager` because V2 is not the default in vLLM
+   0.6.1. vLLM 0.6.3.post1 remains a future re-evaluation target after a host
+   driver/toolkit upgrade, not the target for this branch.
+2. **Wrapper script, not source patch** — `scripts/kcmm/launcher.py` applies
    patches at import time, keeping the vLLM installation pristine for A/B
    comparison.
 3. **Python bindings in `scripts/kcmm/`** via `ctypes` — zero dependencies, simple
@@ -63,10 +63,12 @@ Phase I.C  — Observer (no behavior change)
   └─ Gate: all three pass → Phase II-A
 
 Phase II-A — Allocator replacement (intercepts 1, 8)
+  ├─ Target: vLLM 0.6.1.post1+cu118 with explicit V2 block manager
   ├─ KCMM pool with tiering=OFF, capacity equivalent to vLLM num_gpu_blocks
-  ├─ Gate A: define the storage-of-record model for KV data
-  ├─ Gate B: prove vLLM's native write/read path can address that storage, or stop
-  └─ Gate C: throughput deviation < 5% vs stock vLLM on fragmentation benchmark
+  ├─ Storage of record: native vLLM KV tensors remain canonical in Phase II.A
+  ├─ Shadow allocator mirrors vLLM block lifetimes into KCMM without behavior change
+  ├─ Optional KCMM-backed allocator is gated behind an explicit opt-in flag
+  └─ Gate: stock/observer/shadow/KCMM-backed A/B smoke report before Phase II-B
 
 Phase II-B — KV write path (intercept 2)
   ├─ Replace reshape_and_cache with stream-aware kcmm_append_kv_step
@@ -84,6 +86,53 @@ Phase III  — Tiering (intercepts 4, 6, 7)
 ```
 
 ## Key technical decisions
+
+### Phase II.A target and storage of record
+
+Phase II.A is fixed to the locally verified CUDA 11.8 stack:
+
+- vLLM `0.6.1.post1+cu118`
+- PyTorch `2.4.0+cu118`
+- xFormers `0.0.27.post2+cu118`
+- transformers `4.45.2`
+- tokenizers `0.20.3`
+- huggingface-hub `0.36.2`
+
+The required vLLM runtime flags are:
+
+- `--use-v2-block-manager`
+- `--enforce-eager`
+- `--disable-frontend-multiprocessing` when Python allocator instrumentation or
+  replacement must run in the same process as the engine
+
+The Phase II.A storage-of-record model is staged:
+
+1. Native vLLM KV cache tensors remain the canonical storage for KV bytes.
+2. KCMM may size a pool from vLLM runtime cache configuration.
+3. KCMM may mirror allocation/free lifetimes as a shadow allocator.
+4. KCMM may attempt allocator-backed block ownership only behind an explicit
+   opt-in flag and only if vLLM's native write/read path still addresses valid
+   native KV tensor storage.
+5. KCMM VA does not become the canonical KV storage until Phase II.B/II.C replace
+   the write and read paths.
+
+Phase II.A must stop rather than silently continue if allocator-only replacement
+requires KCMM VA to become the true KV storage. The stop report must identify the
+vLLM invariant being violated, such as a required contiguous native KV tensor
+layout, block-id-to-offset arithmetic inside compiled kernels, or a write/read
+path that cannot address KCMM-managed memory without Phase II.B/II.C changes.
+
+Phase II.A is complete only after these local checks pass:
+
+- stock vLLM smoke completion
+- KCMM observer smoke completion
+- allocator-seam instrumentation smoke completion with required seams observed
+- KCMM runtime-derived pool sizing smoke completion
+- KCMM shadow allocator smoke completion with no leaked or mismatched blocks
+- KCMM-backed allocator smoke completion, or a documented fail-closed stop
+  condition showing why Phase II.B/II.C is required first
+- a single A/B report comparing stock, observer, shadow, and enabled
+  KCMM-backed modes on the same tiny local model and prompt
 
 ### Why `--enforce-eager` is the linchpin
 
@@ -125,13 +174,14 @@ is real and we need separate VA reservation strategies.
 ## Considered options
 
 **vLLM native plugin (rejected for now).** vLLM 0.8+ is working toward a stable
-`BlockAllocator` plugin interface but it's not production-ready. We chose 0.6.3
-monkey-patch for immediate progress, with a clear upgrade path when the plugin
-interface stabilizes.
+`BlockAllocator` plugin interface but it's not production-ready. We chose the
+0.6.x Python monkey-patch path for immediate progress, with a clear upgrade path
+when the plugin interface stabilizes. The current Phase II.A branch is pinned to
+0.6.1.post1+cu118 because that is the locally verified CUDA 11.8 wheel.
 
 **vLLM V1/plugin/KV-offload integration (deferred).** Current vLLM has moved
 toward V1, plugin hooks, hybrid KV cache management, and native KV offloading.
-Those seams may be better long-term targets than monkey-patching v0.6.3, but
+Those seams may be better long-term targets than monkey-patching v0.6.x, but
 they are not the fastest path to a controlled Phase I.C coexistence test.
 
 **Modifying vLLM source directly (rejected).** Would complicate A/B comparison,
@@ -150,10 +200,10 @@ first to validate the CUDA context foundation without touching the forward pass.
 
 ## Constraints
 
-- **A30 GPU (Ampere, sm_80)** — FlashInfer 0.2.x compatible, 24 GB VRAM
-- **CUDA 12.x target environment** — required for the vLLM baseline. Local KCMM
-  Rust tests can run against older compatible driver/toolkit combinations, but
-  vLLM validation must use a host driver that supports the selected CUDA wheel.
+- **Local RTX 3080 GPUs (Ampere, sm_86)** — current Phase II.A validation host.
+- **CUDA 11.8 wheel target for the current host** — the local NVIDIA 515.48.07
+  driver cannot run current CUDA 12.x vLLM wheels, so Phase II.A uses the
+  verified cu118 stack until a host-driver upgrade changes the baseline.
 - **No modification to vLLM installation** — reproducible A/B comparison
 - **`--enforce-eager` always on** — non-negotiable for interception
 - **Prefix sharing (intercept 5) deferred to Step 4** — KCMM SharingManager is

@@ -1,7 +1,7 @@
 # KCMM vLLM CUDA 11.8 Conda Environment
 
-This is the known-good environment for the Phase I.C vLLM observer smoke test on
-the local RTX 3080 host.
+This is the known-good environment for the Phase I.C vLLM observer smoke test
+and the current Phase II.A allocator work on the local RTX 3080 host.
 
 ## Create the environment
 
@@ -52,6 +52,34 @@ transformers==4.45.2
 tokenizers==0.20.3
 huggingface-hub==0.36.2
 ```
+
+## Phase II.A target
+
+The current Phase II.A branch targets this exact local stack:
+
+- vLLM `0.6.1.post1+cu118`
+- PyTorch `2.4.0+cu118`
+- xFormers `0.0.27.post2+cu118`
+- transformers `4.45.2`
+- tokenizers `0.20.3`
+- huggingface-hub `0.36.2`
+
+This replaces the earlier ADR target of vLLM `0.6.3.post1` for the current
+branch because the local NVIDIA 515.48.07 host driver needs CUDA 11.8 wheels.
+Revisit the vLLM target after a host-driver upgrade.
+
+Required runtime flags for Phase II.A:
+
+- `--use-v2-block-manager`
+- `--enforce-eager`
+- `--disable-frontend-multiprocessing` for allocator instrumentation or
+  replacement modes that must patch engine objects in-process
+
+Phase II.A keeps native vLLM KV tensors as the storage of record. KCMM may size a
+pool from vLLM runtime cache configuration, mirror allocation/free events, and
+try allocator-backed ownership behind an opt-in flag. KCMM VA does not become
+canonical KV storage until the Phase II.B write path and Phase II.C read path are
+implemented.
 
 ## KCMM observer smoke test
 
