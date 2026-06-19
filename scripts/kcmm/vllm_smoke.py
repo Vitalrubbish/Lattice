@@ -48,6 +48,7 @@ class SmokeConfig:
     instrument_allocators: bool
     instrument_kv_writes: bool
     kv_write_mirror: bool
+    kv_write_replace_candidate: bool
     runtime_derived_pool: bool
     shadow_allocations: bool
     backed_allocations: bool
@@ -127,6 +128,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--kv-write-mirror",
         action="store_true",
         help="Mirror reshape_and_cache writes into KCMM after native vLLM writes.",
+    )
+    parser.add_argument(
+        "--kv-write-replace-candidate",
+        action="store_true",
+        help=(
+            "Skip native reshape_and_cache writes and write only to KCMM. "
+            "This validates the Phase II.B write candidate only; Phase II.C "
+            "read replacement is still required for correctness."
+        ),
     )
     parser.add_argument(
         "--shadow-allocations",
@@ -224,11 +234,13 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         instrument_allocators=args.instrument_allocators,
         instrument_kv_writes=args.instrument_kv_writes,
         kv_write_mirror=args.kv_write_mirror,
+        kv_write_replace_candidate=args.kv_write_replace_candidate,
         runtime_derived_pool=(
             args.runtime_derived_pool
             or args.shadow_allocations
             or args.backed_allocations
             or args.kv_write_mirror
+            or args.kv_write_replace_candidate
         ),
         shadow_allocations=args.shadow_allocations,
         backed_allocations=args.backed_allocations,
@@ -468,10 +480,15 @@ def vllm_command(config: SmokeConfig) -> list[str]:
                     str(config.backed_report_path),
                 ]
             )
-        if config.kv_write_mirror:
+        if config.kv_write_mirror or config.kv_write_replace_candidate:
+            flag = (
+                "--kcmm-kv-write-replace-candidate"
+                if config.kv_write_replace_candidate
+                else "--kcmm-kv-write-mirror"
+            )
             command.extend(
                 [
-                    "--kcmm-kv-write-mirror",
+                    flag,
                     "--kcmm-kv-write-mirror-report-path",
                     str(config.kv_write_mirror_report_path),
                 ]
@@ -531,6 +548,7 @@ def vllm_command(config: SmokeConfig) -> list[str]:
         config.instrument_allocators
         or config.instrument_kv_writes
         or config.kv_write_mirror
+        or config.kv_write_replace_candidate
         or config.runtime_derived_pool
         or config.shadow_allocations
         or config.backed_allocations
@@ -628,7 +646,7 @@ def read_kv_write_mirror_report(path: Path) -> dict[str, Any]:
         report = json.load(handle)
     if report.get("error_count", 0):
         raise SmokeFailure(
-            "KCMM KV write mirror reported errors: "
+            "KCMM KV write report recorded errors: "
             + json.dumps(report, sort_keys=True)
         )
     if not report.get("pool_attached", False):
@@ -638,17 +656,17 @@ def read_kv_write_mirror_report(path: Path) -> dict[str, Any]:
         )
     if report.get("mirror_calls", 0) <= 0:
         raise SmokeFailure(
-            "KCMM KV write mirror did not mirror any calls: "
+            "KCMM KV write report did not record any KCMM write calls: "
             + json.dumps(report, sort_keys=True)
         )
     if report.get("mirrored_rows", 0) <= 0:
         raise SmokeFailure(
-            "KCMM KV write mirror did not mirror any rows: "
+            "KCMM KV write report did not write any rows: "
             + json.dumps(report, sort_keys=True)
         )
     if report.get("verified_rows", 0) <= 0:
         raise SmokeFailure(
-            "KCMM KV write mirror did not verify any rows: "
+            "KCMM KV write report did not verify any rows: "
             + json.dumps(report, sort_keys=True)
         )
     return {"path": str(path), **report}
@@ -849,6 +867,12 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         raise SmokeFailure("--backed-allocations cannot be combined with --shadow-allocations")
     if config.kv_write_mirror and not config.backed_allocations:
         raise SmokeFailure("--kv-write-mirror requires --backed-allocations")
+    if config.kv_write_replace_candidate and config.kv_write_mirror:
+        raise SmokeFailure(
+            "--kv-write-replace-candidate cannot be combined with --kv-write-mirror"
+        )
+    if config.kv_write_replace_candidate and not config.backed_allocations:
+        raise SmokeFailure("--kv-write-replace-candidate requires --backed-allocations")
     ensure_kcmm_library(config)
     generated_model = ensure_tiny_model(config.model_path)
     process: subprocess.Popen[None] | None = None
@@ -877,6 +901,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "runtime_derived_pool": config.runtime_derived_pool,
             "instrument_kv_writes": config.instrument_kv_writes,
             "kv_write_mirror": config.kv_write_mirror,
+            "kv_write_replace_candidate": config.kv_write_replace_candidate,
             "shadow_allocations": config.shadow_allocations,
             "backed_allocations": config.backed_allocations,
         }
@@ -897,10 +922,12 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         result["allocator_trace"] = read_allocator_trace(config.allocator_trace_path)
     if config.instrument_kv_writes:
         result["kv_write_trace"] = read_kv_write_trace(config.kv_write_trace_path)
-    if config.kv_write_mirror:
-        result["kv_write_mirror"] = read_kv_write_mirror_report(
-            config.kv_write_mirror_report_path
-        )
+    if config.kv_write_mirror or config.kv_write_replace_candidate:
+        report = read_kv_write_mirror_report(config.kv_write_mirror_report_path)
+        if config.kv_write_replace_candidate:
+            result["kv_write_replace_candidate_report"] = report
+        else:
+            result["kv_write_mirror"] = report
     if config.shadow_allocations:
         result["shadow_allocator"] = read_shadow_report(config.shadow_report_path)
     if config.backed_allocations:
@@ -920,7 +947,10 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             print(config.backed_report_path.read_text(encoding="utf-8"), file=sys.stderr)
-        if config.kv_write_mirror and config.kv_write_mirror_report_path.exists():
+        if (
+            (config.kv_write_mirror or config.kv_write_replace_candidate)
+            and config.kv_write_mirror_report_path.exists()
+        ):
             print(
                 f"\nKCMM KV write mirror report ({config.kv_write_mirror_report_path}):",
                 file=sys.stderr,

@@ -639,6 +639,18 @@ def _wrap_kv_write_mirror_function(
     @wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         bound = signature.bind(*args, **kwargs)
+        if getattr(mirror, "replace_native", False):
+            mirror.mirror_call(
+                call_key,
+                bound.arguments["key"],
+                bound.arguments["value"],
+                bound.arguments["key_cache"],
+                bound.arguments["value_cache"],
+                bound.arguments["slot_mapping"],
+                native_written=False,
+            )
+            return None
+
         result = original(*args, **kwargs)
         mirror.mirror_call(
             call_key,
@@ -647,6 +659,7 @@ def _wrap_kv_write_mirror_function(
             bound.arguments["key_cache"],
             bound.arguments["value_cache"],
             bound.arguments["slot_mapping"],
+            native_written=True,
         )
         return result
 
@@ -1117,7 +1130,12 @@ def apply_kv_write_mirror(mirror: Any) -> dict[str, object]:
         "observer_only": False,
         "target": "vLLM KV write custom ops",
         "write_path": "kcmm_append_kv_slots",
-        "storage_of_record": "native_vllm_kv_tensors",
+        "native_write_mode": getattr(mirror, "native_write_mode", "unknown"),
+        "storage_of_record": (
+            "kcmm_write_candidate_without_kv_read_replacement"
+            if getattr(mirror, "replace_native", False)
+            else "native_vllm_kv_tensors"
+        ),
         "patched_functions": patched,
         "required_allocator_mode": "kcmm_backed_allocator",
     }

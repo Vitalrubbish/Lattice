@@ -74,6 +74,7 @@ Phase II-B — KV write path (intercept 2)
   ├─ Preflight: bind and gate kcmm_append_kv_step from Python with D2H read-back
   ├─ Bind and gate kcmm_append_kv_slots for reshape_and_cache slot_mapping writes
   ├─ Shadow mirror reshape_and_cache into KCMM behind KCMM-backed allocation mode
+  ├─ Replacement-candidate mode skips native writes and writes only to KCMM
   ├─ Replace reshape_and_cache with stream-aware direct-slot KCMM writes
   ├─ D2D copy must run on the current PyTorch/vLLM CUDA stream or synchronize by event
   └─ Gate: D2H read-back byte-level K/V comparison vs reference computation
@@ -183,6 +184,12 @@ read-back. This mirror mode requires KCMM-backed allocation mode so vLLM
 physical block ids and KCMM block ids are the same ids. Allocator shadow mode is
 not sufficient for direct-slot mirroring because its KCMM block ids are separate
 from vLLM's native block ids.
+
+The next write-path slice is a replacement candidate behind a stronger opt-in
+flag: native `reshape_and_cache` is skipped and KCMM is the only write target.
+This validates the Phase II.B seam but still does not establish end-to-end
+correctness, because vLLM attention reads continue to use native KV tensors
+until Phase II.C replaces the read path.
 
 ### Why A1 over A2 for VA remapping (intercept 3)
 

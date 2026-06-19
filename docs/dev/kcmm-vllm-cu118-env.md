@@ -285,6 +285,51 @@ Latest local Phase II.B KV write mirror result on 2026-06-19:
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
+## Phase II.B vLLM KV write replacement candidate
+
+Run the replacement-candidate mode only after the mirror gate passes:
+
+```bash
+python -m scripts.kcmm.vllm_smoke \
+  --backed-allocations \
+  --instrument-kv-writes \
+  --kv-write-replace-candidate
+```
+
+This mode skips native vLLM `reshape_and_cache` writes and writes only to KCMM
+through `kcmm_append_kv_slots`. It is a Phase II.B write-path candidate, not an
+end-to-end correctness mode: native vLLM attention still reads native KV tensors
+until Phase II.C replaces the read path. The report must therefore be interpreted
+as write-path validation only.
+
+Latest local Phase II.B KV write replacement-candidate result on 2026-06-19:
+
+- Command:
+  `python -m scripts.kcmm.vllm_smoke --backed-allocations --instrument-kv-writes --kv-write-replace-candidate`
+- Result: `passed=true`
+- Observed write seam: `vllm._custom_ops.reshape_and_cache`
+- Write calls observed: `8`
+- Native passthrough calls: `0`
+- Native skipped calls: `8`
+- KCMM write calls: `8`
+- D2H verified rows: `10`
+- Verification bytes: `5120`
+- Cache layers mapped: `2`
+- KCMM-backed allocator recorded `kcmm_allocations=1`, `kcmm_frees=1`,
+  `outstanding_mappings=0`, and `error_count=0`.
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
+The mirror gate was also rerun after the patch-order change:
+
+- Command:
+  `python -m scripts.kcmm.vllm_smoke --backed-allocations --instrument-kv-writes --kv-write-mirror`
+- Result: `passed=true`
+- Native passthrough calls: `8`
+- Native skipped calls: `0`
+- KCMM mirror calls: `8`
+- D2H verified rows: `10`
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This

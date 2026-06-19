@@ -123,6 +123,7 @@ class ObserverConfig:
     kv_write_trace_path: str | None = None
     require_kv_write_seams: bool = False
     kv_write_mirror: bool = False
+    kv_write_replace_candidate: bool = False
     kv_write_mirror_report_path: str | None = None
     shadow_allocations: bool = False
     shadow_report_path: str | None = None
@@ -167,6 +168,9 @@ class ObserverConfig:
             kv_write_trace_path=os.environ.get("KCMM_KV_WRITE_TRACE_PATH") or None,
             require_kv_write_seams=_env_bool("KCMM_REQUIRE_KV_WRITE_SEAMS", False),
             kv_write_mirror=_env_bool("KCMM_KV_WRITE_MIRROR", False),
+            kv_write_replace_candidate=_env_bool(
+                "KCMM_KV_WRITE_REPLACE_CANDIDATE", False
+            ),
             kv_write_mirror_report_path=(
                 os.environ.get("KCMM_KV_WRITE_MIRROR_REPORT_PATH") or None
             ),
@@ -240,6 +244,22 @@ class ObserverConfig:
             raise ValueError("KCMM KV write mirror requires the KCMM observer pool")
         if self.kv_write_mirror and not self.backed_allocations:
             raise ValueError("KCMM KV write mirror requires --kcmm-backed-allocations")
+        if self.kv_write_replace_candidate and self.kv_write_mirror:
+            raise ValueError(
+                "KCMM KV write replacement candidate cannot be combined with mirror mode"
+            )
+        if self.kv_write_replace_candidate and self.pool_mode != "runtime":
+            raise ValueError(
+                "KCMM KV write replacement candidate requires --kcmm-pool-mode runtime"
+            )
+        if self.kv_write_replace_candidate and self.skip_observer:
+            raise ValueError(
+                "KCMM KV write replacement candidate requires the KCMM observer pool"
+            )
+        if self.kv_write_replace_candidate and not self.backed_allocations:
+            raise ValueError(
+                "KCMM KV write replacement candidate requires --kcmm-backed-allocations"
+            )
 
     def with_runtime_sizing(self, sizing: VllmRuntimeSizing) -> "ObserverConfig":
         sizing.validate()
@@ -333,6 +353,11 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kcmm-kv-write-mirror",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--kcmm-kv-write-replace-candidate",
         action="store_true",
         default=None,
     )

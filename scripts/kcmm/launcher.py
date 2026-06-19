@@ -286,19 +286,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _print_json({"vllm_allocator_instrumentation": allocator_report})
 
+    if config.kv_write_mirror or config.kv_write_replace_candidate:
+        _KV_WRITE_MIRROR_TRACKER = KcmmKvWriteMirrorTracker(
+            config.kv_write_mirror_report_path,
+            replace_native=config.kv_write_replace_candidate,
+        )
+        kv_write_mirror_report = apply_kv_write_mirror(_KV_WRITE_MIRROR_TRACKER)
+        _print_json({"kcmm_kv_write_mirror_patch": kv_write_mirror_report})
+
     if config.instrument_kv_writes:
         kv_write_report = apply_kv_write_instrumentation(
             trace_path=config.kv_write_trace_path,
             require_seams=config.require_kv_write_seams,
         )
         _print_json({"vllm_kv_write_instrumentation": kv_write_report})
-
-    if config.kv_write_mirror:
-        _KV_WRITE_MIRROR_TRACKER = KcmmKvWriteMirrorTracker(
-            config.kv_write_mirror_report_path
-        )
-        kv_write_mirror_report = apply_kv_write_mirror(_KV_WRITE_MIRROR_TRACKER)
-        _print_json({"kcmm_kv_write_mirror_patch": kv_write_mirror_report})
 
     if not config.skip_observer and config.pool_mode == "runtime":
 

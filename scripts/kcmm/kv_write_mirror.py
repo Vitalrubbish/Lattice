@@ -101,14 +101,18 @@ class KcmmKvWriteMirrorTracker:
         report_path: str | None = None,
         *,
         verify_rows_per_call: int = 4,
+        replace_native: bool = False,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
         self._verify_rows_per_call = max(0, int(verify_rows_per_call))
+        self._replace_native = bool(replace_native)
         self._lock = threading.RLock()
         self._cache_layers: dict[tuple[int, int], CacheLayer] = {}
         self._driver: _CudaDriver | None = None
-        self._native_calls = 0
+        self._write_calls = 0
+        self._native_passthrough_calls = 0
+        self._native_skipped_calls = 0
         self._skipped_no_pool_calls = 0
         self._skipped_empty_batches = 0
         self._mirror_calls = 0
@@ -120,6 +124,16 @@ class KcmmKvWriteMirrorTracker:
         self._recent_calls: list[dict[str, Any]] = []
         self._error_count = 0
         self._last_error: str | None = None
+
+    @property
+    def replace_native(self) -> bool:
+        return self._replace_native
+
+    @property
+    def native_write_mode(self) -> str:
+        if self._replace_native:
+            return "replace_native_write"
+        return "mirror_after_native"
 
     def attach_pool(self, pool: KcmmPool) -> None:
         with self._lock:
@@ -267,17 +281,30 @@ class KcmmKvWriteMirrorTracker:
         key_cache: Any,
         value_cache: Any,
         slot_mapping: Any,
+        *,
+        native_written: bool,
     ) -> None:
         with self._lock:
-            self._native_calls += 1
+            self._write_calls += 1
+            if native_written:
+                self._native_passthrough_calls += 1
+            else:
+                self._native_skipped_calls += 1
             self._counts_by_function[call_key] = (
                 self._counts_by_function.get(call_key, 0) + 1
             )
 
             if self._pool is None:
-                self._skipped_no_pool_calls += 1
-                self.write_report()
-                return
+                if native_written:
+                    self._skipped_no_pool_calls += 1
+                    self.write_report()
+                    return
+                exc = KcmmError(
+                    "KCMM KV write replacement cannot skip native write before "
+                    "a KCMM pool is attached"
+                )
+                self._record_error(exc)
+                raise exc
 
             try:
                 self._validate_dtype(key, value)
@@ -340,6 +367,7 @@ class KcmmKvWriteMirrorTracker:
                         "function": call_key,
                         "layer_idx": layer_idx,
                         "batch": batch,
+                        "native_written": native_written,
                         "mirrored_rows": mirrored_rows,
                         "padding_slots": padding_slots,
                         "verified_rows": verified_rows,
@@ -364,12 +392,24 @@ class KcmmKvWriteMirrorTracker:
                     pool_stats = {"error": str(exc)}
             return {
                 "phase": "II.B",
-                "mode": "kv_write_mirror",
-                "storage_of_record": "native_vllm_kv_tensors",
+                "mode": (
+                    "kv_write_replace_candidate"
+                    if self._replace_native
+                    else "kv_write_mirror"
+                ),
+                "native_write_mode": self.native_write_mode,
+                "storage_of_record": (
+                    "kcmm_write_candidate_without_kv_read_replacement"
+                    if self._replace_native
+                    else "native_vllm_kv_tensors"
+                ),
                 "write_path": "kcmm_append_kv_slots",
                 "slot_formula": "slot = block_id * block_size + offset_in_block",
                 "pool_attached": self._pool is not None,
-                "native_calls": self._native_calls,
+                "write_calls": self._write_calls,
+                "native_calls": self._native_passthrough_calls,
+                "native_passthrough_calls": self._native_passthrough_calls,
+                "native_skipped_calls": self._native_skipped_calls,
                 "skipped_no_pool_calls": self._skipped_no_pool_calls,
                 "skipped_empty_batches": self._skipped_empty_batches,
                 "mirror_calls": self._mirror_calls,
