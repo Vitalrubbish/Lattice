@@ -152,6 +152,38 @@ block ID. The smoke runner fails if the backed report records a stop condition,
 errors, leaked mappings, zero observed GPU allocations, mismatched KCMM
 alloc/free counts, or KCMM blocks still in use after shutdown.
 
+## Phase II.A A/B gate
+
+Run the stock-vs-KCMM gate before starting Phase II.B work:
+
+```bash
+python -m scripts.kcmm.vllm_ab_gate
+```
+
+The gate runs stock vLLM, KCMM observer, KCMM shadow allocator, and KCMM-backed
+allocator modes sequentially on the same tiny local OPT model, prompt, and
+generation parameters. The JSON report records startup time, request latency,
+generated tokens, token throughput, GPU memory footprint, and KCMM allocation
+stats where applicable. Correctness failures fail the command; performance
+regressions are reported as warnings and do not fail the gate.
+
+Phase II.B must not start until this gate produces `passed: true` for the branch
+and local environment being promoted.
+
+Latest local Phase II.A gate result on 2026-06-19:
+
+- Command: `python -m scripts.kcmm.vllm_ab_gate`
+- Result: `passed=true`
+- Correctness failures: `[]`
+- Performance warnings: `[]`
+- Modes completed: `stock`, `observer`, `shadow`, `backed`
+- Each mode generated 4 completion tokens on the tiny local model.
+- Shadow and backed reports recorded `kcmm_allocations=1`, `kcmm_frees=1`,
+  `outstanding_mappings=0`, and `error_count=0`.
+- Backed mode recorded `blocks_in_use=0` after shutdown.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs and port `8001` was free
+  after the run.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This

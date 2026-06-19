@@ -134,6 +134,10 @@ Phase II.A is complete only after these local checks pass:
 - a single A/B report comparing stock, observer, shadow, and enabled
   KCMM-backed modes on the same tiny local model and prompt
 
+The A/B gate is operationalized by `python -m scripts.kcmm.vllm_ab_gate`.
+Phase II.B must not start until this command produces `passed: true` for the
+branch and local environment being promoted.
+
 ### Why `--enforce-eager` is the linchpin
 
 vLLM with CUDA graphs can bake attention metadata and addresses into captured

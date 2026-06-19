@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -248,6 +249,92 @@ def wait_process_exit(process: subprocess.Popen[None], timeout_seconds: float) -
         return True
     except subprocess.TimeoutExpired:
         return process.poll() is not None
+
+
+def gpu_memory_used_mib() -> list[int] | None:
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is None:
+        return None
+    result = subprocess.run(
+        [
+            nvidia_smi,
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    values: list[int] = []
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            values.append(int(text.split()[0]))
+        except (IndexError, ValueError):
+            return None
+    return values or None
+
+
+class GpuMemoryMonitor:
+    def __init__(self, interval_seconds: float = 0.5) -> None:
+        self.interval_seconds = interval_seconds
+        self.before: list[int] | None = None
+        self.after: list[int] | None = None
+        self.samples: list[list[int]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.before = gpu_memory_used_mib()
+        if self.before is None:
+            return
+        self.samples.append(self.before)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> dict[str, Any]:
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=2.0)
+        self.after = gpu_memory_used_mib()
+        if self.after is not None:
+            self.samples.append(self.after)
+
+        if not self.samples:
+            return {
+                "available": False,
+                "reason": "nvidia-smi unavailable or unreadable",
+            }
+
+        totals = [sum(sample) for sample in self.samples]
+        peak_index = max(range(len(self.samples)), key=lambda index: totals[index])
+        before_total = sum(self.before) if self.before is not None else None
+        after_total = sum(self.after) if self.after is not None else None
+        peak_total = totals[peak_index]
+        return {
+            "available": True,
+            "unit": "MiB",
+            "sample_count": len(self.samples),
+            "before_per_gpu_mib": self.before,
+            "after_per_gpu_mib": self.after,
+            "peak_per_gpu_mib": self.samples[peak_index],
+            "before_total_mib": before_total,
+            "after_total_mib": after_total,
+            "peak_total_mib": peak_total,
+            "peak_delta_mib": (
+                peak_total - before_total if before_total is not None else None
+            ),
+        }
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            sample = gpu_memory_used_mib()
+            if sample is not None:
+                self.samples.append(sample)
 
 
 def http_json(
@@ -609,6 +696,9 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
     ensure_kcmm_library(config)
     generated_model = ensure_tiny_model(config.model_path)
     process: subprocess.Popen[None] | None = None
+    gpu_monitor = GpuMemoryMonitor()
+    gpu_monitor.start()
+    gpu_memory: dict[str, Any] | None = None
     started_at = time.monotonic()
     result: dict[str, Any] | None = None
     try:
@@ -633,13 +723,18 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "backed_allocations": config.backed_allocations,
         }
     finally:
-        if process is not None:
-            terminate_server(process, config)
-        if generated_model and not config.keep_model:
-            shutil.rmtree(config.model_path, ignore_errors=True)
+        try:
+            if process is not None:
+                terminate_server(process, config)
+        finally:
+            gpu_memory = gpu_monitor.stop()
+            if generated_model and not config.keep_model:
+                shutil.rmtree(config.model_path, ignore_errors=True)
 
     if result is None:
         raise SmokeFailure("smoke run exited without a result")
+    if gpu_memory is not None:
+        result["gpu_memory"] = gpu_memory
     if config.instrument_allocators:
         result["allocator_trace"] = read_allocator_trace(config.allocator_trace_path)
     if config.shadow_allocations:
