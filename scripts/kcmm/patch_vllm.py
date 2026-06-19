@@ -37,6 +37,11 @@ SEAMS = (
         "vllm.core.block.prefix_caching_block",
         "PrefixCachingBlockAllocator",
     ),
+    (
+        "CpuGpuBlockAllocator",
+        "vllm.core.block.cpu_gpu_block_allocator",
+        "CpuGpuBlockAllocator",
+    ),
 )
 
 ALLOCATOR_METHODS = {
@@ -103,6 +108,7 @@ _TRACE_SEQUENCE = 0
 _INSTRUMENTED = False
 _REQUIRE_SEAMS = False
 _RUNTIME_POOL_PATCHED = False
+_SHADOW_ALLOCATOR_PATCHED = False
 
 
 @dataclass(frozen=True)
@@ -339,6 +345,114 @@ def _wrap_llm_engine_init(callback: Callable[[Any], dict[str, Any]]) -> bool:
     return True
 
 
+def _is_gpu_device(device: Any) -> bool:
+    try:
+        from vllm.core.block.interfaces import Device
+
+        return device == Device.GPU
+    except Exception:
+        return str(device).endswith("GPU") or getattr(device, "name", None) == "GPU"
+
+
+def _is_gpu_block(cpu_gpu_allocator: Any, block_id: int) -> bool:
+    try:
+        from vllm.core.block.interfaces import Device
+
+        allocator = cpu_gpu_allocator._block_ids_to_allocator[block_id]
+        return allocator is cpu_gpu_allocator._allocators[Device.GPU]
+    except Exception:
+        return False
+
+
+def _block_id(block: Any) -> int:
+    value = getattr(block, "block_id", None)
+    if value is None:
+        raise RuntimeError("vLLM block has no block_id")
+    return int(value)
+
+
+def _wrap_shadow_allocator_method(cls: type, method_name: str, shadow: Any) -> None:
+    original = getattr(cls, method_name)
+    if getattr(original, "_kcmm_shadow_allocator_patched", False):
+        return
+
+    @wraps(original)
+    def allocate_one(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original(self, *args, **kwargs)
+        device = kwargs.get("device")
+        if device is None and args:
+            device = args[-1]
+        if _is_gpu_device(device):
+            shadow.mirror_allocated_block(
+                _block_id(result),
+                f"{cls.__module__}.{cls.__qualname__}.{method_name}",
+            )
+        return result
+
+    @wraps(original)
+    def allocate_many(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original(self, *args, **kwargs)
+        device = kwargs.get("device")
+        if device is None and args:
+            device = args[-1]
+        if _is_gpu_device(device):
+            shadow.mirror_allocated_blocks(
+                list(result),
+                f"{cls.__module__}.{cls.__qualname__}.{method_name}",
+            )
+        return result
+
+    @wraps(original)
+    def free_one(self: Any, block: Any, *args: Any, **kwargs: Any) -> Any:
+        module = importlib.import_module("vllm.core.block.cpu_gpu_block_allocator")
+        null_block = getattr(module, "NullBlock")
+        if isinstance(block, null_block):
+            return original(self, block, *args, **kwargs)
+
+        block_id = _block_id(block)
+        should_mirror = _is_gpu_block(self, block_id)
+        result = original(self, block, *args, **kwargs)
+        if should_mirror:
+            shadow.mirror_freed_block(
+                block_id,
+                f"{cls.__module__}.{cls.__qualname__}.{method_name}",
+            )
+        return result
+
+    @wraps(original)
+    def clear_copy_on_writes(self: Any, *args: Any, **kwargs: Any) -> Any:
+        mappings = original(self, *args, **kwargs)
+        source = f"{cls.__module__}.{cls.__qualname__}.{method_name}"
+        for src_block_id, dst_block_id in mappings:
+            shadow.mirror_freed_block(int(src_block_id), source)
+            shadow.mirror_allocated_block(int(dst_block_id), source)
+        return mappings
+
+    @wraps(original)
+    def fork(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original(self, *args, **kwargs)
+        for block in result:
+            block_id = _block_id(block)
+            if _is_gpu_block(self, block_id):
+                shadow.mirror_allocated_block(
+                    block_id,
+                    f"{cls.__module__}.{cls.__qualname__}.{method_name}",
+                )
+        return result
+
+    wrapper_by_method = {
+        "allocate_mutable_block": allocate_one,
+        "allocate_immutable_block": allocate_one,
+        "allocate_immutable_blocks": allocate_many,
+        "free": free_one,
+        "clear_copy_on_writes": clear_copy_on_writes,
+        "fork": fork,
+    }
+    wrapper = wrapper_by_method[method_name]
+    wrapper._kcmm_shadow_allocator_patched = True  # type: ignore[attr-defined]
+    setattr(cls, method_name, wrapper)
+
+
 def inspect_vllm_seams() -> dict[str, object]:
     try:
         import vllm
@@ -417,6 +531,38 @@ def apply_runtime_pool_sizing(
         "target": "vllm.engine.llm_engine.LLMEngine.__init__",
         "new_patch_installed": patched,
         "seam_report": report,
+    }
+
+
+def apply_shadow_allocator(shadow: Any) -> dict[str, object]:
+    """Patch vLLM's device-aware allocator to mirror GPU block lifetimes."""
+
+    global _SHADOW_ALLOCATOR_PATCHED
+
+    module = importlib.import_module("vllm.core.block.cpu_gpu_block_allocator")
+    cls = getattr(module, "CpuGpuBlockAllocator")
+    patched: list[str] = []
+    if not _SHADOW_ALLOCATOR_PATCHED:
+        for method_name in (
+            "allocate_mutable_block",
+            "allocate_immutable_block",
+            "allocate_immutable_blocks",
+            "free",
+            "clear_copy_on_writes",
+            "fork",
+        ):
+            if hasattr(cls, method_name):
+                _wrap_shadow_allocator_method(cls, method_name, shadow)
+                patched.append(method_name)
+        _SHADOW_ALLOCATOR_PATCHED = True
+
+    return {
+        "phase": "II.A",
+        "patched": True,
+        "observer_only": True,
+        "target": "vllm.core.block.cpu_gpu_block_allocator.CpuGpuBlockAllocator",
+        "patched_methods": patched,
+        "seam_report": inspect_vllm_seams(),
     }
 
 

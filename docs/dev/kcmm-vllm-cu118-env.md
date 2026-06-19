@@ -127,6 +127,18 @@ for block size, GPU block budget, attention layer count, KV heads, head
 dimension, max model length, and max sequences. The launcher still leaves vLLM
 allocation behavior unchanged and keeps tiering disabled.
 
+Run with the Phase II.A KCMM shadow allocator:
+
+```bash
+python -m scripts.kcmm.vllm_smoke --shadow-allocations
+```
+
+This enables runtime-derived pool sizing and mirrors vLLM GPU block
+allocation/free events into KCMM without changing vLLM block IDs or KV tensor
+storage. The smoke runner fails if the shadow report records errors, leaked
+shadow mappings, zero observed GPU allocations, or mismatched KCMM alloc/free
+counts.
+
 The manual steps below are the expanded form of the same check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This

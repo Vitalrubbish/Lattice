@@ -119,6 +119,8 @@ class ObserverConfig:
     instrument_allocators: bool = False
     allocator_trace_path: str | None = None
     require_allocator_seams: bool = False
+    shadow_allocations: bool = False
+    shadow_report_path: str | None = None
 
     @classmethod
     def from_env(cls) -> "ObserverConfig":
@@ -154,6 +156,8 @@ class ObserverConfig:
             instrument_allocators=_env_bool("KCMM_INSTRUMENT_ALLOCATORS", False),
             allocator_trace_path=os.environ.get("KCMM_ALLOCATOR_TRACE_PATH") or None,
             require_allocator_seams=_env_bool("KCMM_REQUIRE_ALLOCATOR_SEAMS", False),
+            shadow_allocations=_env_bool("KCMM_SHADOW_ALLOCATIONS", False),
+            shadow_report_path=os.environ.get("KCMM_SHADOW_REPORT_PATH") or None,
         )
 
     @classmethod
@@ -204,6 +208,10 @@ class ObserverConfig:
             )
         if self.enable_tiering and self.pool_mode == "runtime":
             raise ValueError("Phase II.A runtime-derived KCMM pool requires tiering disabled")
+        if self.shadow_allocations and self.pool_mode != "runtime":
+            raise ValueError("KCMM shadow allocation mode requires --kcmm-pool-mode runtime")
+        if self.shadow_allocations and self.skip_observer:
+            raise ValueError("KCMM shadow allocation mode requires the KCMM observer pool")
 
     def with_runtime_sizing(self, sizing: VllmRuntimeSizing) -> "ObserverConfig":
         sizing.validate()
@@ -284,4 +292,10 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         default=None,
     )
+    parser.add_argument(
+        "--kcmm-shadow-allocations",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--kcmm-shadow-report-path", default=None)
     return parser

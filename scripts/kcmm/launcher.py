@@ -11,13 +11,16 @@ from typing import Any, Sequence
 from .bindings import KcmmError, KcmmLibrary, KcmmPool, result_to_dict
 from .config import ObserverConfig, VllmRuntimeSizing, add_kcmm_args
 from .patch_vllm import (
+    apply_shadow_allocator,
     apply_allocator_instrumentation,
     apply_observer_patches,
     apply_runtime_pool_sizing,
 )
+from .shadow_allocator import ShadowAllocationTracker
 
 
 _ACTIVE_POOL: KcmmPool | None = None
+_SHADOW_TRACKER: ShadowAllocationTracker | None = None
 
 
 def _print_json(payload: object, *, stream: object = sys.stderr) -> None:
@@ -54,6 +57,12 @@ def _destroy_active_pool() -> None:
     if _ACTIVE_POOL is not None:
         _ACTIVE_POOL.destroy()
         _ACTIVE_POOL = None
+
+
+def _write_shadow_report() -> None:
+    if _SHADOW_TRACKER is not None:
+        _SHADOW_TRACKER.write_report()
+        _print_json({"kcmm_shadow_allocator": _SHADOW_TRACKER.report()})
 
 
 def _create_observer_pool(
@@ -188,7 +197,7 @@ def _run_vllm(vllm_args: Sequence[str]) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    global _ACTIVE_POOL
+    global _ACTIVE_POOL, _SHADOW_TRACKER
 
     args = list(argv if argv is not None else sys.argv[1:])
     parser = argparse.ArgumentParser(
@@ -237,6 +246,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     seam_report = None
     allocator_report = None
     runtime_pool_report = None
+    shadow_report = None
+    if config.shadow_allocations:
+        _SHADOW_TRACKER = ShadowAllocationTracker(config.shadow_report_path)
+        shadow_report = apply_shadow_allocator(_SHADOW_TRACKER)
+        _print_json({"kcmm_shadow_allocator_patch": shadow_report})
+
     if config.instrument_allocators:
         allocator_report = apply_allocator_instrumentation(
             trace_path=config.allocator_trace_path,
@@ -259,6 +274,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _ACTIVE_POOL = pool
             atexit.register(_destroy_active_pool)
+            if _SHADOW_TRACKER is not None:
+                _SHADOW_TRACKER.attach_pool(pool)
+                atexit.register(_write_shadow_report)
             _print_json({"observer": report})
             return report
 
@@ -299,6 +317,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "vllm_seams": seam_report,
                 "vllm_allocator_instrumentation": allocator_report,
                 "kcmm_runtime_pool_sizing": runtime_pool_report,
+                "kcmm_shadow_allocator_patch": shadow_report,
             },
             stream=sys.stdout,
         )
