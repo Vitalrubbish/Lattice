@@ -283,9 +283,17 @@ model directory, and compares completion text, finish reason, and token counts
 for every configured coverage case. The local tiny-model gate has passed with
 the default `hello`, `math`, and `long_context` cases. It also records startup
 latency, request latency, generated-token throughput, peak GPU memory delta,
-and warning classifications for KCMM-vs-stock regressions. The remaining work
-before treating this as a stable read path is broader shape, model, batch, and
-concurrency coverage and performance optimization.
+and warning classifications for KCMM-vs-stock regressions.
+
+`python -m scripts.kcmm.vllm_gpu_read_shape_gate` now broadens that gate across
+two tiny OPT shape variants inside the currently supported local envelope:
+`head64_layers2` and `head64_heads4_layers3`. The shape gate is intentionally
+restricted to `head_dim=64`: this CUDA 11.8 vLLM/XFormers stack supports
+paged-attention head sizes `64`, `80`, `96`, `112`, `120`, `128`, `192`, and
+`256`, while the current KCMM GPU read kernel is limited to `head_dim <= 64`.
+The remaining work before treating this as a stable read path is batch and
+concurrency coverage, tensor parallel coverage, non-64 head dimensions after
+backend/kernel support is broadened, and performance optimization.
 
 The vLLM-integrated GPU read path now uses the stream-aware C ABI
 `kcmm_paged_attn_decode_f16_on_stream`, passing PyTorch's current CUDA stream
@@ -296,8 +304,9 @@ compatibility wrapper. The write replacement path likewise uses
 patched write and read paths report stream handle `0`, the legacy default
 stream. Future non-default-stream scheduling must still validate that write and
 read seams are ordered by the framework stream graph or explicit CUDA events.
-The remaining Phase II.C work is broader shape, model, batch, and concurrency
-coverage and performance optimization beyond the tiny local OPT gate.
+The remaining Phase II.C work is broader batch and concurrency coverage,
+non-default-stream coverage, tensor parallel coverage, and performance
+optimization beyond the tiny local OPT shape gate.
 
 ### CUDA context sharing risk
 

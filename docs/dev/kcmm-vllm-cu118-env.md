@@ -647,10 +647,83 @@ Latest local performance characterization on 2026-06-20:
 - Tokens per second: stock `6.239`, KCMM `5.578`, ratio `0.894`
 - Peak GPU memory delta MiB: stock `3417`, KCMM `3425`, ratio `1.002`
 
-The next Phase II.C work is broader shape, model, batch, and concurrency
-coverage and performance optimization beyond this tiny local OPT gate.
+## Phase II.C GPU read-kernel shape coverage gate
 
-The manual steps below are the expanded form of the same check.
+Run the shape coverage gate for the GPU read-kernel path:
+
+```bash
+python -m scripts.kcmm.vllm_gpu_read_shape_gate --no-build-kcmm
+```
+
+The gate generates each tiny OPT variant under
+`.scratch/kcmm-vllm/shape-gate/`, then runs the stock-vs-KCMM GPU read A/B gate
+for every variant with the same completion coverage cases. By default it runs:
+
+- `head64_layers2`: hidden size `128`, heads `2`, layers `2`, FFN dimension
+  `256`.
+- `head64_heads4_layers3`: hidden size `256`, heads `4`, layers `3`, FFN
+  dimension `512`.
+
+The current CUDA 11.8 vLLM/XFormers stack supports paged-attention head sizes
+`64`, `80`, `96`, `112`, `120`, `128`, `192`, and `256`. The current KCMM GPU
+read kernel is limited to `head_dim <= 64`, so the local shape gate rejects
+variants outside the overlap: `head_dim=64`.
+
+Latest local shape coverage result on 2026-06-20:
+
+- Command:
+  `python -m scripts.kcmm.vllm_gpu_read_shape_gate --no-build-kcmm --no-print-seams`
+- Result: `passed=true`
+- Failed variants: `[]`
+- Correctness failures: `[]`
+- Performance warnings: `[]`
+- Aggregate report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1781964629065.json`
+- Per-variant reports:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1781964629065-reports/`
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+- Temporary shape model directories were removed after the gate.
+
+`head64_layers2` result:
+
+- `hello` completion: `" pioneer pioneer pioneer pioneer"`
+- `math` completion: `"gallgallgall"`
+- `long_context` completion: `" radar radar radar radar"`
+- GPU read kernel calls: `16`
+- Stream-aware read kernel calls: `16`
+- Native KV write calls skipped: `22`
+- KCMM write verified rows: `36`
+- Stream-aware KV write calls: `22`
+- Reference KCMM read bytes: `0`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- Startup seconds: stock `13.537`, KCMM `10.532`, ratio `0.778`
+- Request latency seconds: stock `1.784`, KCMM `1.951`, ratio `1.094`
+- Tokens per second: stock `6.166`, KCMM `5.638`, ratio `0.914`
+- Peak GPU memory delta MiB: stock `3417`, KCMM `3425`, ratio `1.002`
+
+`head64_heads4_layers3` result:
+
+- `hello` completion: `" playoff playoff playoff playoff"`
+- `math` completion: `" MORE MORE MORE"`
+- `long_context` completion: `" belts belts belts belts"`
+- GPU read kernel calls: `24`
+- Stream-aware read kernel calls: `24`
+- Native KV write calls skipped: `33`
+- KCMM write verified rows: `54`
+- Stream-aware KV write calls: `33`
+- Reference KCMM read bytes: `0`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- Startup seconds: stock `11.546`, KCMM `8.525`, ratio `0.738`
+- Request latency seconds: stock `1.787`, KCMM `1.808`, ratio `1.012`
+- Tokens per second: stock `6.156`, KCMM `6.084`, ratio `0.988`
+- Peak GPU memory delta MiB: stock `3443`, KCMM `3455`, ratio `1.003`
+
+The next Phase II.C work is broader batch and concurrency coverage under the
+supported `head_dim=64` envelope, plus non-64 head-dimension support after the
+vLLM/backend/kernel constraints are broadened.
+
+The manual steps below are the expanded form of the single-model GPU
+read-kernel check.
 
 Generate a tiny local OPT model with a vLLM-supported attention head size. This
 avoids downloading `facebook/opt-125m` during environment validation.

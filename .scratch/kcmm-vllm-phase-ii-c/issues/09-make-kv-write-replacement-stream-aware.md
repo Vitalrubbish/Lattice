@@ -84,10 +84,11 @@ Latest local stream-aware write result on 2026-06-20:
   that write and read seams are ordered by the framework stream graph or CUDA
   events.
 - D2H verification remains intentionally synchronous at stream scope.
-- This does not broaden model shape, batching, concurrency, tensor parallelism,
-  prefix cache, alibi, block-sparse mode, or FP8 cache scale coverage.
+- Broader model shape coverage is tracked separately by issue 10.
+- This does not broaden batching, concurrency, tensor parallelism, prefix
+  cache, alibi, block-sparse mode, or FP8 cache scale coverage.
 
 ## Next step
 
-Broaden Phase II.C from tiny-model prompt coverage to shape, model, batch, and
-concurrency coverage.
+Broaden Phase II.C from shape coverage to batch and concurrency coverage under
+the supported `head_dim=64` envelope.
