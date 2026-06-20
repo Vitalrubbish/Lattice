@@ -89,5 +89,7 @@ Latest local GPU read-kernel smoke result on 2026-06-20:
 
 ## Next step
 
-Add a deterministic stock-vs-KCMM correctness gate for the GPU read-kernel path,
-then make the FFI launch stream-aware and start performance characterization.
+The deterministic stock-vs-KCMM GPU read-kernel gate is tracked by
+`.scratch/kcmm-vllm-phase-ii-c/issues/05-add-gpu-read-kernel-ab-gate.md`.
+After that gate, make the FFI launch stream-aware and start performance
+characterization.

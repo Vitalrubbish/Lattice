@@ -514,9 +514,48 @@ Latest local Phase II.C GPU read-kernel result on 2026-06-20:
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
-The next Phase II.C gate is a deterministic stock-vs-KCMM correctness run for
-the GPU kernel path, followed by stream-aware launch and performance
-characterization.
+## Phase II.C GPU read-kernel A/B gate
+
+Run the deterministic stock-vs-KCMM gate for the GPU read-kernel path:
+
+```bash
+python -m scripts.kcmm.vllm_gpu_read_ab_gate --no-build-kcmm
+```
+
+The gate uses one tiny local OPT model directory for both modes. If the model is
+absent, `create_tiny_opt_model.py` generates it with the default `seed=0`.
+The gate then runs:
+
+- stock vLLM through the same smoke harness,
+- KCMM-backed allocator plus KV write replacement plus
+  `kcmm_paged_attn_decode_f16`,
+- exact comparison of completion text, finish reason, completion tokens, and
+  total tokens.
+
+Latest local Phase II.C GPU read-kernel A/B result on 2026-06-20:
+
+- Command: `python -m scripts.kcmm.vllm_gpu_read_ab_gate --no-build-kcmm`
+- Result: `passed=true`
+- Model existed before gate: `false`
+- Prompt: `"Hello"`
+- Max tokens: `4`
+- Stock completion text: `" pioneer pioneer pioneer pioneer"`
+- KCMM completion text: `" pioneer pioneer pioneer pioneer"`
+- Finish reason: `length`
+- Completion tokens: `4`
+- Total tokens: `6`
+- Read path: `kcmm_paged_attn_decode_f16`
+- Replacement backend: `gpu_kernel`
+- GPU kernel calls: `6`
+- Reference KCMM read bytes: `0`
+- Native KV write calls skipped: `8`
+- KCMM write verified rows: `10`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after both modes.
+
+The next Phase II.C work is stream-aware launch and performance
+characterization, plus broader prompt/shape coverage beyond the tiny local OPT
+gate.
 
 The manual steps below are the expanded form of the same check.
 

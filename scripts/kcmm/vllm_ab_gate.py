@@ -170,15 +170,29 @@ def smoke_config_for_mode(
         print_seams=(config.print_seams and not is_stock),
         instrument_allocators=False,
         instrument_kv_writes=False,
+        instrument_kv_reads=False,
+        kv_read_offset_table=False,
+        kv_read_replace_candidate=False,
+        kv_read_gpu_kernel_candidate=False,
         runtime_derived_pool=(is_shadow or is_backed),
+        kv_write_mirror=False,
+        kv_write_replace_candidate=False,
         shadow_allocations=is_shadow,
         backed_allocations=is_backed,
         allocator_trace_path=run_dir / f"{mode_name}-allocator-trace.jsonl",
         kv_write_trace_path=run_dir / f"{mode_name}-kv-write-trace.jsonl",
+        kv_read_trace_path=run_dir / f"{mode_name}-kv-read-trace.jsonl",
+        kv_read_offset_table_report_path=(
+            run_dir / f"{mode_name}-kv-read-offset-table-report.json"
+        ),
+        kv_write_mirror_report_path=(
+            run_dir / f"{mode_name}-kv-write-mirror-report.json"
+        ),
         shadow_report_path=run_dir / f"{mode_name}-shadow-report.json",
         backed_report_path=run_dir / f"{mode_name}-backed-report.json",
         require_allocator_seams=True,
         require_kv_write_seams=True,
+        require_kv_read_seams=True,
         log_path=run_dir / f"{mode_name}.log",
     )
 

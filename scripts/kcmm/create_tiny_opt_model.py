@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
 from transformers import AutoTokenizer, OPTConfig, OPTForCausalLM
 
 
@@ -22,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--ffn-dim", type=int, default=256)
     parser.add_argument("--max-position-embeddings", type=int, default=8192)
+    parser.add_argument("--seed", type=int, default=0)
     return parser
 
 
@@ -32,6 +34,7 @@ def main() -> int:
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_tokenizer,
@@ -64,6 +67,7 @@ def main() -> int:
     print(f"params={sum(param.numel() for param in model.parameters())}")
     print(f"head_dim={config.hidden_size // config.num_attention_heads}")
     print(f"max_position_embeddings={config.max_position_embeddings}")
+    print(f"seed={args.seed}")
     return 0
 
 

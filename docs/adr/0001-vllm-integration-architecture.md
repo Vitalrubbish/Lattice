@@ -265,9 +265,16 @@ The current kernel is intentionally narrow: FP16 decode attention only,
 `head_dim <= 64`, no alibi, no block-sparse mode, no FP8 cache scales, and a
 synchronous return path. It proves that vLLM can run with KCMM as the only KV
 write target and a GPU-side KCMM read path on the tiny local OPT smoke, but it
-does not yet satisfy the final Phase II.C acceptance gate. The remaining gate is
-a broader deterministic stock-vs-KCMM correctness run plus stream-aware launch
-and performance characterization.
+does not yet satisfy the final Phase II.C acceptance gate.
+
+The first deterministic stock-vs-KCMM GPU read-kernel A/B gate is
+`python -m scripts.kcmm.vllm_gpu_read_ab_gate`. It generates the tiny local OPT
+model with a fixed default seed when the model is absent, runs stock vLLM and
+the KCMM-backed write-replacement plus GPU read-kernel path against the same
+model directory, and compares completion text, finish reason, and token counts.
+The local tiny-model gate has passed. The remaining work before treating this
+as a stable read path is broader prompt/shape coverage, stream-aware launch, and
+performance characterization.
 
 ### CUDA context sharing risk
 
