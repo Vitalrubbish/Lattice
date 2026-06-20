@@ -62,4 +62,5 @@ Latest local performance result on 2026-06-20:
 
 ## Next step
 
-Broaden correctness coverage beyond the single tiny local OPT prompt and shape.
+Continue with
+`.scratch/kcmm-vllm-phase-ii-c/issues/08-broaden-gpu-read-kernel-correctness-coverage.md`.

@@ -271,12 +271,13 @@ The first deterministic stock-vs-KCMM GPU read-kernel A/B gate is
 `python -m scripts.kcmm.vllm_gpu_read_ab_gate`. It generates the tiny local OPT
 model with a fixed default seed when the model is absent, runs stock vLLM and
 the KCMM-backed write-replacement plus GPU read-kernel path against the same
-model directory, and compares completion text, finish reason, and token counts.
-The local tiny-model gate has passed. It also records startup latency, request
-latency, generated-token throughput, peak GPU memory delta, and warning
-classifications for KCMM-vs-stock regressions. The remaining work before
-treating this as a stable read path is broader prompt/shape coverage and
-performance optimization.
+model directory, and compares completion text, finish reason, and token counts
+for every configured coverage case. The local tiny-model gate has passed with
+the default `hello`, `math`, and `long_context` cases. It also records startup
+latency, request latency, generated-token throughput, peak GPU memory delta,
+and warning classifications for KCMM-vs-stock regressions. The remaining work
+before treating this as a stable read path is broader shape, model, batch, and
+concurrency coverage and performance optimization.
 
 The vLLM-integrated GPU read path now uses the stream-aware C ABI
 `kcmm_paged_attn_decode_f16_on_stream`, passing PyTorch's current CUDA stream

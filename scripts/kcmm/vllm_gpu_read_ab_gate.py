@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.kcmm.vllm_smoke import (
+    CompletionCase,
     DEFAULT_KCMM_LIB_PATH,
     DEFAULT_MODEL_NAME,
     DEFAULT_MODEL_PATH,
@@ -26,6 +27,18 @@ from scripts.kcmm.vllm_smoke import (
 
 
 MODE_ORDER = ("stock", "kcmm_gpu_read")
+DEFAULT_COVERAGE_CASES = (
+    CompletionCase(name="hello", prompt="Hello", max_tokens=4),
+    CompletionCase(name="math", prompt="Question: 2 + 2 =", max_tokens=3),
+    CompletionCase(
+        name="long_context",
+        prompt=(
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa "
+            "lambda mu nu xi omicron pi rho sigma tau"
+        ),
+        max_tokens=4,
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +52,7 @@ class GateConfig:
     shutdown_timeout_seconds: float
     prompt: str
     max_tokens: int
+    coverage_cases: tuple[CompletionCase, ...]
     build_kcmm: bool
     keep_model: bool
     print_seams: bool
@@ -60,6 +74,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shutdown-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--max-tokens", type=int, default=4)
+    parser.add_argument(
+        "--coverage-case",
+        action="append",
+        default=None,
+        metavar="NAME:MAX_TOKENS:PROMPT",
+        help=(
+            "Completion case to compare. May be repeated. Defaults to a "
+            "short prompt, a math prompt, and a longer-context prompt. "
+            "Passing --prompt/--max-tokens without --coverage-case keeps "
+            "single-case compatibility."
+        ),
+    )
     parser.add_argument(
         "--build-kcmm",
         action=argparse.BooleanOptionalAction,
@@ -109,8 +135,54 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_coverage_case(value: str) -> CompletionCase:
+    parts = value.split(":", 2)
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            "coverage cases must use NAME:MAX_TOKENS:PROMPT"
+        )
+    name, max_tokens_text, prompt = parts
+    if not name:
+        raise argparse.ArgumentTypeError("coverage case name cannot be empty")
+    if not prompt:
+        raise argparse.ArgumentTypeError("coverage case prompt cannot be empty")
+    try:
+        max_tokens = int(max_tokens_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid coverage case max tokens: {max_tokens_text}"
+        ) from exc
+    if max_tokens <= 0:
+        raise argparse.ArgumentTypeError("coverage case max tokens must be positive")
+    return CompletionCase(name=name, prompt=prompt, max_tokens=max_tokens)
+
+
+def coverage_cases_from_args(args: argparse.Namespace) -> tuple[CompletionCase, ...]:
+    if args.coverage_case:
+        cases = tuple(parse_coverage_case(value) for value in args.coverage_case)
+    elif args.prompt != "Hello" or args.max_tokens != 4:
+        cases = (
+            CompletionCase(
+                name="cli",
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+            ),
+        )
+    else:
+        cases = DEFAULT_COVERAGE_CASES
+    names = [case.name for case in cases]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate coverage case names: {names}")
+    return cases
+
+
 def parse_config(argv: list[str] | None = None) -> GateConfig:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        coverage_cases = coverage_cases_from_args(args)
+    except (argparse.ArgumentTypeError, ValueError) as exc:
+        parser.error(str(exc))
     timestamp_ms = int(time.time() * 1000)
     output_path = (
         Path(args.output)
@@ -128,6 +200,7 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         shutdown_timeout_seconds=args.shutdown_timeout_seconds,
         prompt=args.prompt,
         max_tokens=args.max_tokens,
+        coverage_cases=coverage_cases,
         build_kcmm=args.build_kcmm,
         keep_model=args.keep_model,
         print_seams=args.print_seams,
@@ -193,11 +266,20 @@ def smoke_config_for_mode(
         require_kv_write_seams=True,
         require_kv_read_seams=True,
         log_path=run_dir / f"{mode_name}.log",
+        completion_cases=config.coverage_cases,
     )
 
 
 def completion_text(result: dict[str, Any]) -> str | None:
     choices = (result.get("completion") or {}).get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    text = choices[0].get("text")
+    return text if isinstance(text, str) else None
+
+
+def completion_text_from_payload(completion: dict[str, Any]) -> str | None:
+    choices = completion.get("choices")
     if not isinstance(choices, list) or not choices:
         return None
     text = choices[0].get("text")
@@ -212,6 +294,14 @@ def finish_reason(result: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def finish_reason_from_payload(completion: dict[str, Any]) -> str | None:
+    choices = completion.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    value = choices[0].get("finish_reason")
+    return value if isinstance(value, str) else None
+
+
 def usage_value(result: dict[str, Any], key: str) -> int | None:
     usage = (result.get("completion") or {}).get("usage")
     if not isinstance(usage, dict):
@@ -220,8 +310,53 @@ def usage_value(result: dict[str, Any], key: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def usage_value_from_payload(completion: dict[str, Any], key: str) -> int | None:
+    usage = completion.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get(key)
+    return value if isinstance(value, int) else None
+
+
+def summarize_completion_cases(result: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_cases = result.get("completion_cases")
+    if not isinstance(raw_cases, list):
+        return []
+    cases: list[dict[str, Any]] = []
+    for raw_case in raw_cases:
+        if not isinstance(raw_case, dict):
+            continue
+        completion = raw_case.get("completion")
+        if not isinstance(completion, dict):
+            completion = {}
+        cases.append(
+            {
+                "name": raw_case.get("name"),
+                "prompt": raw_case.get("prompt"),
+                "max_tokens": raw_case.get("max_tokens"),
+                "completion_seconds": raw_case.get("completion_seconds"),
+                "completion_text": completion_text_from_payload(completion),
+                "finish_reason": finish_reason_from_payload(completion),
+                "completion_tokens": usage_value_from_payload(
+                    completion,
+                    "completion_tokens",
+                ),
+                "total_tokens": usage_value_from_payload(completion, "total_tokens"),
+            }
+        )
+    return cases
+
+
+def sum_case_usage(result: dict[str, Any], key: str) -> int | None:
+    cases = summarize_completion_cases(result)
+    values = [case.get(key) for case in cases]
+    if not values or not all(isinstance(value, int) for value in values):
+        return usage_value(result, key)
+    return sum(values)
+
+
 def token_throughput(result: dict[str, Any]) -> float | None:
-    generated_tokens = usage_value(result, "completion_tokens")
+    generated_tokens = sum_case_usage(result, "completion_tokens")
     latency = result.get("completion_seconds")
     if not isinstance(generated_tokens, int) or not isinstance(latency, (int, float)):
         return None
@@ -260,8 +395,9 @@ def summarize_success(mode_name: str, result: dict[str, Any]) -> dict[str, Any]:
         "tokens_per_second": token_throughput(result),
         "completion_text": completion_text(result),
         "finish_reason": finish_reason(result),
-        "completion_tokens": usage_value(result, "completion_tokens"),
-        "total_tokens": usage_value(result, "total_tokens"),
+        "completion_tokens": sum_case_usage(result, "completion_tokens"),
+        "total_tokens": sum_case_usage(result, "total_tokens"),
+        "completion_cases": summarize_completion_cases(result),
         "gpu_memory": result.get("gpu_memory"),
         "generated_model": result.get("generated_model"),
         "log_path": result.get("log_path"),
@@ -344,6 +480,46 @@ def add_correctness_failures(modes: dict[str, Any]) -> list[dict[str, Any]]:
                     "kcmm_value": gpu_read.get(key),
                 }
             )
+    stock_cases = {
+        case.get("name"): case
+        for case in stock.get("completion_cases", [])
+        if isinstance(case, dict)
+    }
+    gpu_cases = {
+        case.get("name"): case
+        for case in gpu_read.get("completion_cases", [])
+        if isinstance(case, dict)
+    }
+    if set(stock_cases) != set(gpu_cases):
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "coverage_case_set_mismatch",
+                "stock_cases": sorted(str(key) for key in stock_cases),
+                "kcmm_cases": sorted(str(key) for key in gpu_cases),
+            }
+        )
+        return failures
+    comparison_keys = (
+        "completion_text",
+        "finish_reason",
+        "completion_tokens",
+        "total_tokens",
+    )
+    for case_name in sorted(stock_cases):
+        stock_case = stock_cases[case_name]
+        gpu_case = gpu_cases[case_name]
+        for key in comparison_keys:
+            if stock_case.get(key) != gpu_case.get(key):
+                failures.append(
+                    {
+                        "mode": "kcmm_gpu_read",
+                        "reason": f"coverage_case_{key}_mismatch",
+                        "case": case_name,
+                        "stock_value": stock_case.get(key),
+                        "kcmm_value": gpu_case.get(key),
+                    }
+                )
     return failures
 
 
@@ -552,6 +728,14 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "model_existed_before_gate": model_existed,
         "prompt": config.prompt,
         "max_tokens": config.max_tokens,
+        "coverage_cases": [
+            {
+                "name": case.name,
+                "prompt": case.prompt,
+                "max_tokens": case.max_tokens,
+            }
+            for case in config.coverage_cases
+        ],
         "mode_order": list(MODE_ORDER),
         "modes": modes,
         "correctness_failures": correctness_failures,

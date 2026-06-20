@@ -529,28 +529,33 @@ The gate then runs:
 - stock vLLM through the same smoke harness,
 - KCMM-backed allocator plus KV write replacement plus
   `kcmm_paged_attn_decode_f16`,
-- exact comparison of completion text, finish reason, completion tokens, and
-  total tokens.
+- exact per-case comparison of completion text, finish reason, completion
+  tokens, and total tokens.
+
+By default the gate runs three coverage cases in each server process:
+`hello`, `math`, and `long_context`. Replace the default cases with targeted
+cases by passing repeated `--coverage-case NAME:MAX_TOKENS:PROMPT` flags.
+Passing `--prompt` or `--max-tokens` without `--coverage-case` keeps the older
+single-case behavior.
 
 Latest local Phase II.C GPU read-kernel A/B result on 2026-06-20:
 
 - Command: `python -m scripts.kcmm.vllm_gpu_read_ab_gate --no-build-kcmm`
 - Result: `passed=true`
 - Model existed before gate: `false`
-- Prompt: `"Hello"`
-- Max tokens: `4`
-- Stock completion text: `" pioneer pioneer pioneer pioneer"`
-- KCMM completion text: `" pioneer pioneer pioneer pioneer"`
-- Finish reason: `length`
-- Completion tokens: `4`
-- Total tokens: `6`
+- Coverage cases: `hello`, `math`, `long_context`
+- `hello` completion: `" pioneer pioneer pioneer pioneer"`
+- `math` completion: `"gallgallgall"`
+- `long_context` completion: `" radar radar radar radar"`
+- Aggregate completion tokens: `11`
+- Aggregate total tokens: `53`
 - Read path: `kcmm_paged_attn_decode_f16`
 - Replacement backend: `gpu_kernel`
-- GPU kernel calls: `6`
-- Stream-aware kernel calls: `6`
+- GPU kernel calls: `16`
+- Stream-aware kernel calls: `16`
 - Reference KCMM read bytes: `0`
-- Native KV write calls skipped: `8`
-- KCMM write verified rows: `10`
+- Native KV write calls skipped: `22`
+- KCMM write verified rows: `36`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after both modes.
 - Performance warnings: `[]`
@@ -582,9 +587,9 @@ Latest local stream-aware validation on 2026-06-20:
 - KCMM completion text: `" pioneer pioneer pioneer pioneer"`
 - Read path: `kcmm_paged_attn_decode_f16`
 - Replacement backend: `gpu_kernel`
-- GPU kernel calls: `6`
-- Stream-aware kernel calls: `6`
-- Stream pointer sample: `[0, 0, 0, 0, 0, 0]`
+- GPU kernel calls: `16`
+- Stream-aware kernel calls: `16`
+- Stream pointer sample: all `16` recent calls reported `0`
 - Reference KCMM read bytes: `0`
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after both modes.
 
@@ -618,13 +623,15 @@ Latest local performance characterization on 2026-06-20:
 - Command: `python -m scripts.kcmm.vllm_gpu_read_ab_gate --no-build-kcmm`
 - Result: `passed=true`
 - Performance warnings: `[]`
-- Startup seconds: stock `13.543`, KCMM `10.528`, ratio `0.777`
-- Request latency seconds: stock `1.731`, KCMM `1.908`, ratio `1.102`
-- Tokens per second: stock `2.311`, KCMM `2.096`, ratio `0.907`
+- Coverage cases: `hello`, `math`, `long_context`
+- Aggregate completion tokens: `11`
+- Startup seconds: stock `13.545`, KCMM `10.526`, ratio `0.777`
+- Request latency seconds: stock `1.752`, KCMM `1.958`, ratio `1.118`
+- Tokens per second: stock `6.279`, KCMM `5.618`, ratio `0.895`
 - Peak GPU memory delta MiB: stock `3417`, KCMM `3425`, ratio `1.002`
 
-The next Phase II.C work is broader prompt/shape correctness coverage and
-performance optimization beyond this tiny local OPT gate.
+The next Phase II.C work is broader shape, model, batch, and concurrency
+coverage and performance optimization beyond this tiny local OPT gate.
 
 The manual steps below are the expanded form of the same check.
 

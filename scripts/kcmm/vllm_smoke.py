@@ -31,6 +31,13 @@ class SmokeFailure(RuntimeError):
 
 
 @dataclass(frozen=True)
+class CompletionCase:
+    name: str
+    prompt: str
+    max_tokens: int
+
+
+@dataclass(frozen=True)
 class SmokeConfig:
     mode: str
     host: str
@@ -67,6 +74,7 @@ class SmokeConfig:
     require_kv_write_seams: bool
     require_kv_read_seams: bool
     log_path: Path
+    completion_cases: tuple[CompletionCase, ...] | None = None
 
     @property
     def base_url(self) -> str:
@@ -1078,14 +1086,19 @@ def wait_for_ready(
     )
 
 
-def run_completion(config: SmokeConfig) -> dict[str, Any]:
+def run_completion(
+    config: SmokeConfig,
+    *,
+    prompt: str,
+    max_tokens: int,
+) -> dict[str, Any]:
     status, payload = http_json(
         "POST",
         f"{config.base_url}/v1/completions",
         payload={
             "model": config.model_name,
-            "prompt": config.prompt,
-            "max_tokens": config.max_tokens,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
             "temperature": 0,
         },
         timeout_seconds=config.timeout_seconds,
@@ -1099,6 +1112,18 @@ def run_completion(config: SmokeConfig) -> dict[str, Any]:
     if not choices:
         raise SmokeFailure(f"completion response has no choices: {payload}")
     return payload
+
+
+def completion_case_sequence(config: SmokeConfig) -> tuple[CompletionCase, ...]:
+    if config.completion_cases:
+        return config.completion_cases
+    return (
+        CompletionCase(
+            name="default",
+            prompt=config.prompt,
+            max_tokens=config.max_tokens,
+        ),
+    )
 
 
 def run_smoke(config: SmokeConfig) -> dict[str, Any]:
@@ -1161,8 +1186,28 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         process = start_server(config)
         models = wait_for_ready(process, config)
         ready_at = time.monotonic()
-        completion = run_completion(config)
-        completed_at = time.monotonic()
+        completion_cases: list[dict[str, Any]] = []
+        completion_seconds_total = 0.0
+        for case in completion_case_sequence(config):
+            case_started_at = time.monotonic()
+            completion = run_completion(
+                config,
+                prompt=case.prompt,
+                max_tokens=case.max_tokens,
+            )
+            case_completed_at = time.monotonic()
+            case_seconds = round(case_completed_at - case_started_at, 3)
+            completion_seconds_total += case_completed_at - case_started_at
+            completion_cases.append(
+                {
+                    "name": case.name,
+                    "prompt": case.prompt,
+                    "max_tokens": case.max_tokens,
+                    "completion_seconds": case_seconds,
+                    "completion": completion,
+                }
+            )
+        completion = completion_cases[0]["completion"]
         result = {
             "mode": config.mode,
             "base_url": config.base_url,
@@ -1170,9 +1215,10 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "model_name": config.model_name,
             "log_path": str(config.log_path),
             "startup_seconds": round(ready_at - started_at, 3),
-            "completion_seconds": round(completed_at - ready_at, 3),
+            "completion_seconds": round(completion_seconds_total, 3),
             "models": models,
             "completion": completion,
+            "completion_cases": completion_cases,
             "generated_model": generated_model,
             "runtime_derived_pool": config.runtime_derived_pool,
             "instrument_kv_writes": config.instrument_kv_writes,
