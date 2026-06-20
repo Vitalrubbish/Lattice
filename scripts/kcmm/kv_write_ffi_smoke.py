@@ -267,14 +267,16 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
             blocks[1] * config.block_size + 3,
             -1,
         ]
+        slot_stream = torch.cuda.current_stream(config.device_ordinal)
+        slot_stream_ptr = int(slot_stream.cuda_stream)
         pool.append_kv_slots(
             layer_idx=0,
             slot_mapping=slots,
             k_src_ptr=int(slot_k_src.data_ptr()),
             v_src_ptr=int(slot_v_src.data_ptr()),
+            stream_ptr=slot_stream_ptr,
         )
-        pool.synchronize()
-        torch.cuda.synchronize(config.device_ordinal)
+        slot_stream.synchronize()
 
         for row, slot in enumerate(slots):
             if slot < 0:
@@ -320,6 +322,7 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
                 slot_mapping=[invalid_slot],
                 k_src_ptr=int(slot_k_src[:1].data_ptr()),
                 v_src_ptr=int(slot_v_src[:1].data_ptr()),
+                stream_ptr=slot_stream_ptr,
             )
         except KcmmError as exc:
             invalid_error = str(exc)
@@ -360,6 +363,8 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
             "direct_slot_writes": {
                 "slot_formula": "slot = block_id * block_size + offset_in_block",
                 "slots": slots,
+                "stream_aware": True,
+                "stream_ptr": slot_stream_ptr,
                 "invalid_slot": invalid_slot,
                 "invalid_slot_error": invalid_error,
             },

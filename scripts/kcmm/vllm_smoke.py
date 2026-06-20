@@ -830,6 +830,11 @@ def read_kv_write_mirror_report(path: Path) -> dict[str, Any]:
             "KCMM KV write report did not write any rows: "
             + json.dumps(report, sort_keys=True)
         )
+    if report.get("stream_aware_write_calls", 0) <= 0:
+        raise SmokeFailure(
+            "KCMM KV write report used no stream-aware writes: "
+            + json.dumps(report, sort_keys=True)
+        )
     if report.get("verified_rows", 0) <= 0:
         raise SmokeFailure(
             "KCMM KV write report did not verify any rows: "

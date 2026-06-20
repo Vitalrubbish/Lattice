@@ -164,35 +164,43 @@ PyTorch/vLLM forward pass.
 
 Before patching vLLM, `python -m scripts.kcmm.kv_write_ffi_smoke` must pass. This
 preflight gate proves the Python launcher can call the sequence-position writer
-`kcmm_append_kv_step` and the physical-slot writer `kcmm_append_kv_slots`, read
-back KCMM VA bytes, and detect K/V mismatches independently of vLLM scheduling.
-Then `python -m scripts.kcmm.vllm_smoke --instrument-kv-writes` must pass to
-record the version-pinned `reshape_and_cache` tensor contract that the
-replacement must preserve. The trace decodes `slot_mapping` as
+`kcmm_append_kv_step`, the physical-slot writer `kcmm_append_kv_slots`, and the
+stream-aware physical-slot writer `kcmm_append_kv_slots_on_stream`; read back
+KCMM VA bytes; and detect K/V mismatches independently of vLLM scheduling. Then
+`python -m scripts.kcmm.vllm_smoke --instrument-kv-writes` must pass to record
+the version-pinned `reshape_and_cache` tensor contract that the replacement must
+preserve. The trace decodes `slot_mapping` as
 `block_id = slot // block_size` and `offset_in_block = slot % block_size`,
 which means the `reshape_and_cache` seam exposes physical KV slots but not
 sequence ids.
 
-The chosen replacement path at this seam is therefore
-`kcmm_append_kv_slots(layer_idx, slot_mapping, batch, k_src, v_src)`.
-`kcmm_append_kv_step` remains useful for lower-level sequence/position tests and
-future metadata-aware integration points, but it is not the direct replacement
-for vLLM `reshape_and_cache` unless a separate metadata-builder patch restores
-sequence/position context.
+The chosen replacement path at this seam is therefore the direct-slot writer
+`kcmm_append_kv_slots_on_stream(layer_idx, slot_mapping, batch, k_src, v_src,
+stream_ptr)`, where `stream_ptr` is PyTorch's current CUDA stream for the tensor
+device. The older `kcmm_append_kv_slots` ABI remains available for low-level
+tests and compatibility. `kcmm_append_kv_step` remains useful for lower-level
+sequence/position tests and future metadata-aware integration points, but it is
+not the direct replacement for vLLM `reshape_and_cache` unless a separate
+metadata-builder patch restores sequence/position context.
 
 The first vLLM-integrated slice is a shadow mirror, not a replacement: native
 vLLM `reshape_and_cache` still writes the canonical KV tensors, then KCMM mirrors
-the same write through `kcmm_append_kv_slots` and verifies KCMM bytes by D2H
-read-back. This mirror mode requires KCMM-backed allocation mode so vLLM
-physical block ids and KCMM block ids are the same ids. Allocator shadow mode is
-not sufficient for direct-slot mirroring because its KCMM block ids are separate
-from vLLM's native block ids.
+the same write through `kcmm_append_kv_slots_on_stream` and verifies KCMM bytes
+by D2H read-back. This mirror mode requires KCMM-backed allocation mode so vLLM
+physical block ids and KCMM block ids are the same ids. Allocator shadow mode
+is not sufficient for direct-slot mirroring because its KCMM block ids are
+separate from vLLM's native block ids.
 
 The next write-path slice is a replacement candidate behind a stronger opt-in
 flag: native `reshape_and_cache` is skipped and KCMM is the only write target.
 This validates the Phase II.B seam but still does not establish end-to-end
 correctness, because vLLM attention reads continue to use native KV tensors
 until Phase II.C replaces the read path.
+
+The vLLM-integrated write replacement path now enqueues KCMM D2D writes on the
+current PyTorch CUDA stream and returns without full-device synchronization.
+D2H verification in smoke tests still synchronizes that stream before reading
+KCMM bytes back to host.
 
 ### Why A1 is not valid at the vLLM Python custom-op seam (intercept 3)
 
@@ -283,10 +291,13 @@ The vLLM-integrated GPU read path now uses the stream-aware C ABI
 `kcmm_paged_attn_decode_f16_on_stream`, passing PyTorch's current CUDA stream
 handle from the patched read seam and returning without synchronizing the whole
 CUDA context. The old `kcmm_paged_attn_decode_f16` remains as a synchronous
-compatibility wrapper. On the current local eager vLLM seam the reported stream
-handle is `0`, the legacy default stream, so the next write-path step is still
-to remove the Python-side write synchronizations and broaden performance
-coverage beyond the tiny local OPT gate.
+compatibility wrapper. The write replacement path likewise uses
+`kcmm_append_kv_slots_on_stream`. On the current local eager vLLM seam both
+patched write and read paths report stream handle `0`, the legacy default
+stream. Future non-default-stream scheduling must still validate that write and
+read seams are ordered by the framework stream graph or explicit CUDA events.
+The remaining Phase II.C work is broader shape, model, batch, and concurrency
+coverage and performance optimization beyond the tiny local OPT gate.
 
 ### CUDA context sharing risk
 

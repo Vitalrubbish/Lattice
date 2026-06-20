@@ -195,21 +195,23 @@ python -m scripts.kcmm.kv_write_ffi_smoke
 
 The gate creates a tiny KCMM pool, registers a sequence backed by two KCMM
 blocks, writes known FP16 K/V rows through `kcmm_append_kv_step`, then verifies
-the vLLM-style physical-slot writer `kcmm_append_kv_slots` with
+the vLLM-style physical-slot writer `kcmm_append_kv_slots_on_stream` with
 `slot = block_id * block_size + offset_in_block`. It reads the destination KCMM
 VA bytes back to host and compares them with the source CUDA tensors. This
-verifies the C ABI, VA accessors, D2D write paths, direct-slot decoding, padding
-skip behavior, unallocated-slot failure, and D2H byte-level comparison without
-downloading a model or starting vLLM.
+verifies the C ABI, VA accessors, D2D write paths, direct-slot decoding, caller
+stream enqueue, padding skip behavior, unallocated-slot failure, and D2H
+byte-level comparison without downloading a model or starting vLLM.
 
-Latest local Phase II.B preflight result on 2026-06-19:
+Latest local Phase II.B preflight result on 2026-06-20:
 
-- Command: `python -m scripts.kcmm.kv_write_ffi_smoke`
+- Command: `python -m scripts.kcmm.kv_write_ffi_smoke --no-build-kcmm`
 - Result: `passed=true`
 - Compared two K rows and two V rows at positions `0` and `5`.
 - The smoke wrote into two KCMM blocks through a registered sequence.
 - Direct-slot writes passed for slots `2` and `7` using
   `slot = block_id * block_size + offset_in_block`.
+- Direct-slot stream-aware write: `true`
+- Direct-slot stream pointer: `0`
 - Direct-slot padding slot `-1` was skipped.
 - Invalid direct slot `16` failed with `block_idx 4 from slot 16 not in use`.
 - Final KCMM stats recorded `blocks_in_use=0`.
@@ -233,8 +235,8 @@ contents.
 The trace also decodes the bounded `slot_mapping` sample using the vLLM contract
 `slot = block_id * block_size + offset_in_block`. This proves the write seam
 exposes physical KV slots. The replacement path for this seam is the KCMM
-direct-slot writer `kcmm_append_kv_slots`; `kcmm_append_kv_step` remains the
-lower-level sequence/position writer.
+stream-aware direct-slot writer `kcmm_append_kv_slots_on_stream`;
+`kcmm_append_kv_step` remains the lower-level sequence/position writer.
 
 Latest local Phase II.B write contract result on 2026-06-19:
 
@@ -264,9 +266,10 @@ python -m scripts.kcmm.vllm_smoke \
 
 This mode keeps native vLLM KV tensors as the storage of record. It calls native
 `reshape_and_cache` first, then mirrors post-attach writes into KCMM through
-`kcmm_append_kv_slots`. It requires `--backed-allocations` so vLLM physical block
-ids in `slot_mapping` are also valid KCMM block ids. The smoke fails if the
-mirror report records errors, mirrors no rows, or verifies no D2H KCMM rows.
+`kcmm_append_kv_slots_on_stream`. It requires `--backed-allocations` so vLLM
+physical block ids in `slot_mapping` are also valid KCMM block ids. The smoke
+fails if the mirror report records errors, mirrors no rows, records no
+stream-aware writes, or verifies no D2H KCMM rows.
 
 Latest local Phase II.B KV write mirror result on 2026-06-19:
 
@@ -297,21 +300,24 @@ python -m scripts.kcmm.vllm_smoke \
 ```
 
 This mode skips native vLLM `reshape_and_cache` writes and writes only to KCMM
-through `kcmm_append_kv_slots`. It is a Phase II.B write-path candidate, not an
-end-to-end correctness mode: native vLLM attention still reads native KV tensors
-until Phase II.C replaces the read path. The report must therefore be interpreted
-as write-path validation only.
+through `kcmm_append_kv_slots_on_stream`. It is a Phase II.B write-path
+candidate, not an end-to-end correctness mode: native vLLM attention still reads
+native KV tensors until Phase II.C replaces the read path. The report must
+therefore be interpreted as write-path validation only.
 
-Latest local Phase II.B KV write replacement-candidate result on 2026-06-19:
+Latest local Phase II.B KV write replacement-candidate result on 2026-06-20:
 
 - Command:
-  `python -m scripts.kcmm.vllm_smoke --backed-allocations --instrument-kv-writes --kv-write-replace-candidate`
+  `python -m scripts.kcmm.vllm_smoke --backed-allocations --instrument-kv-writes --kv-write-replace-candidate --no-build-kcmm`
 - Result: `passed=true`
 - Observed write seam: `vllm._custom_ops.reshape_and_cache`
 - Write calls observed: `8`
 - Native passthrough calls: `0`
 - Native skipped calls: `8`
 - KCMM write calls: `8`
+- Stream-aware write calls: `8`
+- Stream-level verification synchronizations: `8`
+- Last stream pointer: `0`
 - D2H verified rows: `10`
 - Verification bytes: `5120`
 - Cache layers mapped: `2`
@@ -329,6 +335,10 @@ The mirror gate was also rerun after the patch-order change:
 - Native skipped calls: `0`
 - KCMM mirror calls: `8`
 - D2H verified rows: `10`
+
+The vLLM-integrated write path no longer performs a full-device synchronize
+around every KCMM write. D2H verification still synchronizes the current stream
+before reading KCMM bytes back to host.
 
 ## Phase II.C vLLM KV read contract trace
 
@@ -556,6 +566,8 @@ Latest local Phase II.C GPU read-kernel A/B result on 2026-06-20:
 - Reference KCMM read bytes: `0`
 - Native KV write calls skipped: `22`
 - KCMM write verified rows: `36`
+- Stream-aware KV write calls: `22`
+- Stream-level write verification synchronizations: `22`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after both modes.
 - Performance warnings: `[]`
@@ -575,7 +587,8 @@ torch.cuda.current_stream(device_index).cuda_stream
 ```
 
 This enqueues the read kernel on the caller's current CUDA stream and returns
-without a per-call full context synchronize. The older
+without a per-call full context synchronize. The write replacement path uses the
+same stream handoff model through `kcmm_append_kv_slots_on_stream`. The older
 `kcmm_paged_attn_decode_f16` ABI remains as a synchronous compatibility wrapper.
 Pool teardown still synchronizes before unloading the raw CUDA module.
 
@@ -590,12 +603,16 @@ Latest local stream-aware validation on 2026-06-20:
 - GPU kernel calls: `16`
 - Stream-aware kernel calls: `16`
 - Stream pointer sample: all `16` recent calls reported `0`
+- Stream-aware KV write calls: `22`
+- KV write stream pointer sample: all recent calls reported `0`
 - Reference KCMM read bytes: `0`
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after both modes.
 
 The current vLLM eager seam reports stream pointer `0`, the legacy default
-stream. The KV write replacement path still contains Python-side
-synchronizations and should be made stream-aware separately.
+stream. D2H verification still synchronizes that stream, but the integrated
+write/read replacement paths no longer require full-device synchronization per
+call. Future non-default-stream scheduling still needs explicit validation that
+write and read seams are ordered by the framework stream graph or CUDA events.
 
 ## Phase II.C GPU read-kernel performance characterization
 
@@ -625,9 +642,9 @@ Latest local performance characterization on 2026-06-20:
 - Performance warnings: `[]`
 - Coverage cases: `hello`, `math`, `long_context`
 - Aggregate completion tokens: `11`
-- Startup seconds: stock `13.545`, KCMM `10.526`, ratio `0.777`
-- Request latency seconds: stock `1.752`, KCMM `1.958`, ratio `1.118`
-- Tokens per second: stock `6.279`, KCMM `5.618`, ratio `0.895`
+- Startup seconds: stock `13.54`, KCMM `10.529`, ratio `0.778`
+- Request latency seconds: stock `1.763`, KCMM `1.972`, ratio `1.119`
+- Tokens per second: stock `6.239`, KCMM `5.578`, ratio `0.894`
 - Peak GPU memory delta MiB: stock `3417`, KCMM `3425`, ratio `1.002`
 
 The next Phase II.C work is broader shape, model, batch, and concurrency

@@ -441,6 +441,43 @@ int kcmm_append_kv_step(kcmm_pool_t *pool, uint32_t layer_idx,
                         uint64_t k_src_ptr, uint64_t v_src_ptr);
 
 /**
+ * Write one step of KV data using vLLM-style physical slot ids.
+ *
+ * Non-negative slots are interpreted as
+ * `slot = block_idx * block_size + offset_in_block`; negative slots are
+ * padding and are skipped. K and V source tensors are FP16 rows laid out as
+ * [batch, kv_heads * head_dim].
+ *
+ * @param pool         Pool handle.
+ * @param layer_idx    Transformer layer index.
+ * @param slot_mapping CPU array of vLLM physical slots, length = batch.
+ * @param batch        Number of source rows.
+ * @param k_src_ptr    GPU virtual address of K source data.
+ * @param v_src_ptr    GPU virtual address of V source data.
+ * @return 0 on successful enqueue, -1 on error.
+ */
+int kcmm_append_kv_slots(kcmm_pool_t *pool, uint32_t layer_idx,
+                         const int64_t *slot_mapping, uint32_t batch,
+                         uint64_t k_src_ptr, uint64_t v_src_ptr);
+
+/**
+ * Write one step of KV data using vLLM-style physical slot ids on a caller
+ * CUDA stream.
+ *
+ * This has the same data contract as `kcmm_append_kv_slots`, but enqueues D2D
+ * copies on `stream_ptr` and returns without synchronizing. The caller is
+ * responsible for passing the current framework stream and preserving source
+ * tensor lifetimes until the stream reaches this work.
+ *
+ * @param stream_ptr Raw CUDA stream handle, or 0 for the legacy default stream.
+ * @return 0 on successful enqueue, -1 on error.
+ */
+int kcmm_append_kv_slots_on_stream(kcmm_pool_t *pool, uint32_t layer_idx,
+                                   const int64_t *slot_mapping, uint32_t batch,
+                                   uint64_t k_src_ptr, uint64_t v_src_ptr,
+                                   uint64_t stream_ptr);
+
+/**
  * Launch KCMM paged-attention decode for vLLM-owned query/output tensors.
  *
  * All pointer arguments are CUDA virtual addresses. `query_ptr` and `out_ptr`

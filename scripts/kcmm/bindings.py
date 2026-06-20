@@ -278,6 +278,16 @@ class KcmmLibrary:
             ctypes.c_uint64,
         ]
         lib.kcmm_append_kv_slots.restype = ctypes.c_int
+        lib.kcmm_append_kv_slots_on_stream.argtypes = [
+            pool,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        lib.kcmm_append_kv_slots_on_stream.restype = ctypes.c_int
         lib.kcmm_paged_attn_decode_f16.argtypes = [
             pool,
             ctypes.c_uint32,
@@ -503,12 +513,13 @@ class KcmmPool:
         slot_mapping: list[int],
         k_src_ptr: int,
         v_src_ptr: int,
+        stream_ptr: int | None = None,
     ) -> None:
         batch = len(slot_mapping)
         if batch <= 0:
             raise ValueError("batch must be positive")
         slot_arr = (ctypes.c_int64 * batch)(*slot_mapping)
-        rc = self.library.lib.kcmm_append_kv_slots(
+        args = (
             self.handle,
             layer_idx,
             slot_arr,
@@ -516,7 +527,15 @@ class KcmmPool:
             int(k_src_ptr),
             int(v_src_ptr),
         )
-        self._check(rc, "kcmm_append_kv_slots")
+        if stream_ptr is None:
+            rc = self.library.lib.kcmm_append_kv_slots(*args)
+            self._check(rc, "kcmm_append_kv_slots")
+        else:
+            rc = self.library.lib.kcmm_append_kv_slots_on_stream(
+                *args,
+                int(stream_ptr),
+            )
+            self._check(rc, "kcmm_append_kv_slots_on_stream")
 
     def paged_attn_decode_f16(
         self,

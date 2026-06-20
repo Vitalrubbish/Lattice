@@ -83,5 +83,5 @@ Latest local multi-case result on 2026-06-20:
 
 ## Next step
 
-Broaden from prompt coverage to shape/model coverage, or make the KV write
-replacement path stream-aware before deeper performance work.
+Continue with
+`.scratch/kcmm-vllm-phase-ii-c/issues/09-make-kv-write-replacement-stream-aware.md`.

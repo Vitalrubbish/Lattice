@@ -120,6 +120,9 @@ class KcmmKvWriteMirrorTracker:
         self._padding_slots = 0
         self._verified_rows = 0
         self._verification_bytes = 0
+        self._stream_aware_write_calls = 0
+        self._stream_synchronize_for_verification_calls = 0
+        self._last_stream_ptr: int | None = None
         self._counts_by_function: dict[str, int] = {}
         self._recent_calls: list[dict[str, Any]] = []
         self._error_count = 0
@@ -335,18 +338,27 @@ class KcmmKvWriteMirrorTracker:
 
                 import torch
 
-                torch.cuda.synchronize(device_index)
+                stream = torch.cuda.current_stream(device_index)
+                stream_ptr = int(stream.cuda_stream)
                 pool.append_kv_slots(
                     layer_idx=layer_idx,
                     slot_mapping=slots,
                     k_src_ptr=int(k_rows.data_ptr()),
                     v_src_ptr=int(v_rows.data_ptr()),
+                    stream_ptr=stream_ptr,
                 )
-                pool.synchronize()
-                torch.cuda.synchronize(device_index)
 
                 padding_slots = sum(1 for slot in slots if slot < 0)
                 mirrored_rows = batch - padding_slots
+                self._stream_aware_write_calls += 1
+                self._last_stream_ptr = stream_ptr
+
+                verification_synchronized = False
+                if self._verify_rows_per_call > 0 and mirrored_rows > 0:
+                    stream.synchronize()
+                    verification_synchronized = True
+                    self._stream_synchronize_for_verification_calls += 1
+
                 verified_rows, verified_bytes = self._verify_rows(
                     pool=pool,
                     layer_idx=layer_idx,
@@ -371,6 +383,9 @@ class KcmmKvWriteMirrorTracker:
                         "mirrored_rows": mirrored_rows,
                         "padding_slots": padding_slots,
                         "verified_rows": verified_rows,
+                        "stream_aware_write": True,
+                        "stream_ptr": stream_ptr,
+                        "verification_synchronized": verification_synchronized,
                         "slot_sample": slots[:16],
                         "key_shape": _shape(key),
                         "value_shape": _shape(value),
@@ -404,6 +419,7 @@ class KcmmKvWriteMirrorTracker:
                     else "native_vllm_kv_tensors"
                 ),
                 "write_path": "kcmm_append_kv_slots",
+                "stream_aware_write_path": "kcmm_append_kv_slots_on_stream",
                 "slot_formula": "slot = block_id * block_size + offset_in_block",
                 "pool_attached": self._pool is not None,
                 "write_calls": self._write_calls,
@@ -417,6 +433,11 @@ class KcmmKvWriteMirrorTracker:
                 "padding_slots": self._padding_slots,
                 "verified_rows": self._verified_rows,
                 "verification_bytes": self._verification_bytes,
+                "stream_aware_write_calls": self._stream_aware_write_calls,
+                "stream_synchronize_for_verification_calls": (
+                    self._stream_synchronize_for_verification_calls
+                ),
+                "last_stream_ptr": self._last_stream_ptr,
                 "counts_by_function": dict(sorted(self._counts_by_function.items())),
                 "cache_layers": [
                     asdict(layer)

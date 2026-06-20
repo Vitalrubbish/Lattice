@@ -1081,6 +1081,61 @@ pub unsafe extern "C" fn kcmm_append_kv_slots(
     k_src_ptr: u64,
     v_src_ptr: u64,
 ) -> i32 {
+    unsafe {
+        kcmm_append_kv_slots_impl(
+            pool,
+            layer_idx,
+            slot_mapping,
+            batch,
+            k_src_ptr,
+            v_src_ptr,
+            0,
+        )
+    }
+}
+
+/// Write one step of KV data using vLLM-style physical slot ids on a caller
+/// CUDA stream.
+///
+/// This has the same data contract as `kcmm_append_kv_slots`, but enqueues the
+/// D2D copies on `stream_ptr` and returns without synchronizing. The caller owns
+/// stream ordering and tensor lifetimes.
+///
+/// # Safety
+/// Same as `kcmm_append_kv_slots`, plus `stream_ptr` must be either a valid CUDA
+/// stream for the active context or 0 for the legacy default stream.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_append_kv_slots_on_stream(
+    pool: *mut kcmm_pool_t,
+    layer_idx: u32,
+    slot_mapping: *const i64,
+    batch: u32,
+    k_src_ptr: u64,
+    v_src_ptr: u64,
+    stream_ptr: u64,
+) -> i32 {
+    unsafe {
+        kcmm_append_kv_slots_impl(
+            pool,
+            layer_idx,
+            slot_mapping,
+            batch,
+            k_src_ptr,
+            v_src_ptr,
+            stream_ptr,
+        )
+    }
+}
+
+unsafe fn kcmm_append_kv_slots_impl(
+    pool: *mut kcmm_pool_t,
+    layer_idx: u32,
+    slot_mapping: *const i64,
+    batch: u32,
+    k_src_ptr: u64,
+    v_src_ptr: u64,
+    stream_ptr: u64,
+) -> i32 {
     if pool.is_null() || slot_mapping.is_null() {
         if !pool.is_null() {
             pool_from_ptr(pool)
@@ -1122,6 +1177,7 @@ pub unsafe extern "C" fn kcmm_append_kv_slots(
     let eb = std::mem::size_of::<half::f16>();
     let step = pool.elem_per_block / pool.block_size; // kv_heads * head_dim
     let nbytes = step * eb;
+    let stream = stream_ptr as sys::CUstream;
 
     let info_lock = pool.block_info.lock();
 
@@ -1154,7 +1210,7 @@ pub unsafe extern "C" fn kcmm_append_kv_slots(
         let sk = k_src + (src_off * eb) as u64;
         let sv = v_src + (src_off * eb) as u64;
 
-        let r = sys::lib().cuMemcpyDtoDAsync_v2(dk, sk, nbytes, std::ptr::null_mut());
+        let r = sys::lib().cuMemcpyDtoDAsync_v2(dk, sk, nbytes, stream);
         if r != sys::CUresult::CUDA_SUCCESS {
             handle.set_error(format!(
                 "kcmm_append_kv_slots: cuMemcpyDtoDAsync K failed: {:?}",
@@ -1162,7 +1218,7 @@ pub unsafe extern "C" fn kcmm_append_kv_slots(
             ));
             return -1;
         }
-        let r = sys::lib().cuMemcpyDtoDAsync_v2(dv, sv, nbytes, std::ptr::null_mut());
+        let r = sys::lib().cuMemcpyDtoDAsync_v2(dv, sv, nbytes, stream);
         if r != sys::CUresult::CUDA_SUCCESS {
             handle.set_error(format!(
                 "kcmm_append_kv_slots: cuMemcpyDtoDAsync V failed: {:?}",

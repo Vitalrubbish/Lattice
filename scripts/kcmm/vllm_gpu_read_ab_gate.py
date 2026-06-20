@@ -380,6 +380,10 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "offset_table_builds": read_report.get("offset_table_builds"),
         "native_write_skipped_calls": write_report.get("native_skipped_calls"),
         "kcmm_write_verified_rows": write_report.get("verified_rows"),
+        "stream_aware_write_calls": write_report.get("stream_aware_write_calls"),
+        "write_stream_synchronize_for_verification_calls": write_report.get(
+            "stream_synchronize_for_verification_calls"
+        ),
         "storage_of_record": write_report.get("storage_of_record"),
         "blocks_in_use_after_shutdown": backed_pool_stats.get("blocks_in_use"),
     }
