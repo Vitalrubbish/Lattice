@@ -84,7 +84,7 @@ Phase II-C — KV read path (intercept 3)
   ├─ A1 decision: Python custom-op seam expects block ids plus native KV tensor base
   ├─ Prototype A2 block_id → KCMM f16 VA offset side table
   ├─ Replace native read kernel with KCMM reference attention candidate
-  ├─ Replace CPU-staged reference path with CUDA kernel/compiled extension
+  ├─ Replace CPU-staged reference path with CUDA kernel/compiled extension candidate
   └─ Gate: token-exact match vs stock vLLM (same prompt → same completion)
 
 Phase III  — Tiering (intercepts 4, 6, 7)
@@ -249,6 +249,25 @@ completion text. It is not an acceptable performance implementation because it
 uses CPU staging and Python loops. The next Phase II.C step is to replace this
 reference path with a CUDA kernel or compiled extension that consumes the KCMM
 K/V bases and the A2 offset table directly on GPU.
+
+### GPU read kernel candidate
+
+The GPU read candidate keeps the same vLLM Python custom-op seam and A2 offset
+table contract, but replaces the CPU-staged reference attention loop with the
+KCMM C ABI entrypoint `kcmm_paged_attn_decode_f16`. The launcher passes raw CUDA
+VAs for vLLM-owned `query`, `out`, `block_tables`, and `seq_lens` tensors,
+plus the KCMM K/V base VAs and the GPU `offset_table[block_id] =
+kcmm_f16_va_offset` side table. Rust compiles the CUDA source with NVRTC,
+caches the resulting function per pool, launches it, synchronizes, and returns
+without calling the native vLLM paged-attention kernel.
+
+The current kernel is intentionally narrow: FP16 decode attention only,
+`head_dim <= 64`, no alibi, no block-sparse mode, no FP8 cache scales, and a
+synchronous return path. It proves that vLLM can run with KCMM as the only KV
+write target and a GPU-side KCMM read path on the tiny local OPT smoke, but it
+does not yet satisfy the final Phase II.C acceptance gate. The remaining gate is
+a broader deterministic stock-vs-KCMM correctness run plus stream-aware launch
+and performance characterization.
 
 ### CUDA context sharing risk
 

@@ -472,9 +472,51 @@ Same-model A/B check:
 - Stock completion text: `" 80 80 80 80"`
 - KCMM replacement completion text: `" 80 80 80 80"`
 
-The next implementation step is to remove the CPU-staged reference path and use
-a CUDA kernel or compiled extension that consumes KCMM K/V base addresses and
-the A2 offset table directly on GPU.
+The CPU-staged path remains useful as a debugging fallback. The GPU candidate
+below is the next implementation slice for removing CPU staging from the read
+replacement path.
+
+## Phase II.C GPU read kernel candidate
+
+Run the GPU read-kernel candidate after the read replacement path has proved the
+storage-of-record transition:
+
+```bash
+python -m scripts.kcmm.vllm_smoke \
+  --backed-allocations \
+  --kv-write-replace-candidate \
+  --instrument-kv-reads \
+  --kv-read-gpu-kernel-candidate \
+  --no-build-kcmm
+```
+
+This mode skips native `reshape_and_cache` writes, skips native
+`paged_attention_v1/v2` reads, and launches `kcmm_paged_attn_decode_f16` to fill
+vLLM's `out` tensor from KCMM K/V memory and the A2 offset table. The current
+candidate is intentionally narrow: FP16 only, `head_dim <= 64`, no alibi,
+no block-sparse mode, no FP8 cache scales, and a synchronous FFI return path.
+
+Latest local Phase II.C GPU read-kernel result on 2026-06-20:
+
+- Command:
+  `python -m scripts.kcmm.vllm_smoke --backed-allocations --kv-write-replace-candidate --instrument-kv-reads --kv-read-gpu-kernel-candidate --no-build-kcmm`
+- Result: `passed=true`
+- Completion text: `" behaviour behaviour behaviour behaviour"`
+- Native KV write calls skipped: `8`
+- Native paged-attention calls replaced: `6`
+- Read path: `kcmm_paged_attn_decode_f16`
+- Replacement backend: `gpu_kernel`
+- GPU kernel calls: `6`
+- Reference KCMM read bytes: `0`
+- Offset table builds: `6`
+- Observed read seam: `vllm._custom_ops.paged_attention_v1`
+- KCMM write verified rows: `10`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
+The next Phase II.C gate is a deterministic stock-vs-KCMM correctness run for
+the GPU kernel path, followed by stream-aware launch and performance
+characterization.
 
 The manual steps below are the expanded form of the same check.
 

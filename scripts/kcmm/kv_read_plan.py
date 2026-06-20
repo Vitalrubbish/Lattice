@@ -32,7 +32,9 @@ class ReadPlanCall:
     block_locations_sample: dict[str, str]
     offset_f16_sample: dict[str, int]
     native_replaced: bool
+    replacement_backend: str
     reference_read_bytes: int
+    gpu_kernel_launched: bool
 
 
 @dataclass
@@ -106,16 +108,21 @@ class KcmmKvReadOffsetTableTracker:
         report_path: str | None = None,
         *,
         replace_native: bool = False,
+        replacement_backend: str = "reference",
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
         self._replace_native = bool(replace_native)
+        if replacement_backend not in {"reference", "gpu_kernel"}:
+            raise ValueError(f"unsupported replacement backend: {replacement_backend}")
+        self._replacement_backend = replacement_backend
         self._lock = threading.RLock()
         self._cache_layers: dict[tuple[int, int], CacheLayer] = {}
         self._driver: _CudaDriver | None = None
         self._read_calls = 0
         self._planned_calls = 0
         self._replacement_calls = 0
+        self._gpu_kernel_calls = 0
         self._offset_table_builds = 0
         self._reference_read_bytes = 0
         self._total_block_table_entries = 0
@@ -253,7 +260,9 @@ class KcmmKvReadOffsetTableTracker:
                 str(block_id): int(offsets_f16[block_id]) for block_id in sample_ids
             },
             native_replaced=self._replace_native,
+            replacement_backend=self._replacement_backend,
             reference_read_bytes=0,
+            gpu_kernel_launched=False,
         )
         return call, offsets_f16, unique_ids
 
@@ -307,12 +316,21 @@ class KcmmKvReadOffsetTableTracker:
                     function_name,
                     arguments,
                 )
-                read_bytes = self._run_reference_attention(
-                    layer_idx=call.layer_idx,
-                    offsets_f16=offsets_f16,
-                    arguments=arguments,
-                )
-                call.reference_read_bytes = read_bytes
+                if self._replacement_backend == "gpu_kernel":
+                    self._run_gpu_kernel_attention(
+                        layer_idx=call.layer_idx,
+                        arguments=arguments,
+                    )
+                    read_bytes = 0
+                    call.gpu_kernel_launched = True
+                    self._gpu_kernel_calls += 1
+                else:
+                    read_bytes = self._run_reference_attention(
+                        layer_idx=call.layer_idx,
+                        offsets_f16=offsets_f16,
+                        arguments=arguments,
+                    )
+                    call.reference_read_bytes = read_bytes
                 self._planned_calls += 1
                 self._replacement_calls += 1
                 self._offset_table_builds += 1
@@ -333,13 +351,7 @@ class KcmmKvReadOffsetTableTracker:
                 self._record_error(exc)
                 raise
 
-    def _run_reference_attention(
-        self,
-        *,
-        layer_idx: int,
-        offsets_f16: list[int],
-        arguments: dict[str, Any],
-    ) -> int:
+    def _validate_replacement_args(self, arguments: dict[str, Any]) -> None:
         if function_name := arguments.get("function_name"):
             raise KcmmError(f"unexpected function_name argument: {function_name}")
         if arguments.get("alibi_slopes") is not None:
@@ -356,6 +368,15 @@ class KcmmKvReadOffsetTableTracker:
             raise KcmmError("KCMM read replacement only supports k_scale=1.0")
         if float(arguments.get("v_scale", 1.0)) != 1.0:
             raise KcmmError("KCMM read replacement only supports v_scale=1.0")
+
+    def _run_reference_attention(
+        self,
+        *,
+        layer_idx: int,
+        offsets_f16: list[int],
+        arguments: dict[str, Any],
+    ) -> int:
+        self._validate_replacement_args(arguments)
 
         import torch
 
@@ -445,6 +466,58 @@ class KcmmKvReadOffsetTableTracker:
         out.copy_(torch.stack(outputs, dim=0))
         return total_read_bytes
 
+    def _run_gpu_kernel_attention(
+        self,
+        *,
+        layer_idx: int,
+        arguments: dict[str, Any],
+    ) -> None:
+        self._validate_replacement_args(arguments)
+
+        pool = self._require_pool()
+        out = arguments["out"]
+        query = arguments["query"]
+        block_tables = arguments["block_tables"]
+        seq_lens = arguments["seq_lens"]
+        offset_table = self._last_offset_table
+        if offset_table is None:
+            raise KcmmError("KCMM read replacement has no offset table")
+
+        query_shape = _shape(query)
+        block_tables_shape = _shape(block_tables)
+        if query_shape is None or len(query_shape) != 3:
+            raise KcmmError(f"invalid query shape for KCMM read kernel: {query_shape}")
+        if block_tables_shape is None or len(block_tables_shape) != 2:
+            raise KcmmError(
+                f"invalid block_tables shape for KCMM read kernel: {block_tables_shape}"
+            )
+        if str(getattr(query, "dtype", "")) != "torch.float16":
+            raise KcmmError(f"KCMM read kernel requires FP16 query, got {query.dtype}")
+        if str(getattr(out, "dtype", "")) != "torch.float16":
+            raise KcmmError(f"KCMM read kernel requires FP16 out, got {out.dtype}")
+        if str(getattr(block_tables, "dtype", "")) != "torch.int32":
+            raise KcmmError(
+                f"KCMM read kernel requires int32 block_tables, got {block_tables.dtype}"
+            )
+        if str(getattr(seq_lens, "dtype", "")) != "torch.int32":
+            raise KcmmError(f"KCMM read kernel requires int32 seq_lens, got {seq_lens.dtype}")
+
+        pool.paged_attn_decode_f16(
+            layer_idx=layer_idx,
+            query_ptr=_data_ptr(query, "query"),
+            out_ptr=_data_ptr(out, "out"),
+            block_tables_ptr=_data_ptr(block_tables, "block_tables"),
+            seq_lens_ptr=_data_ptr(seq_lens, "seq_lens"),
+            block_offsets_f16_ptr=_data_ptr(offset_table, "block_offsets_f16"),
+            batch=int(query_shape[0]),
+            num_q_heads=int(query_shape[1]),
+            kv_heads=int(arguments["num_kv_heads"]),
+            head_dim=int(query_shape[2]),
+            block_size=int(arguments["block_size"]),
+            max_blocks_per_seq=int(block_tables_shape[1]),
+            scale=float(arguments["scale"]),
+        )
+
     def report(self) -> dict[str, Any]:
         with self._lock:
             pool_stats: dict[str, int | float] | None = None
@@ -463,10 +536,15 @@ class KcmmKvReadOffsetTableTracker:
                 ),
                 "candidate": "A2",
                 "kernel_replaced": self._replace_native,
+                "replacement_backend": self._replacement_backend,
                 "read_path": (
-                    "kcmm_reference_attention"
-                    if self._replace_native
-                    else "native_vllm_paged_attention"
+                    "native_vllm_paged_attention"
+                    if not self._replace_native
+                    else (
+                        "kcmm_paged_attn_decode_f16"
+                        if self._replacement_backend == "gpu_kernel"
+                        else "kcmm_reference_attention"
+                    )
                 ),
                 "offset_table_contract": "torch.int64[f16_va_offset_by_block_id]",
                 "required_allocator_mode": "kcmm_backed_allocator",
@@ -474,6 +552,7 @@ class KcmmKvReadOffsetTableTracker:
                 "read_calls": self._read_calls,
                 "planned_calls": self._planned_calls,
                 "replacement_calls": self._replacement_calls,
+                "gpu_kernel_calls": self._gpu_kernel_calls,
                 "offset_table_builds": self._offset_table_builds,
                 "reference_read_bytes": self._reference_read_bytes,
                 "total_block_table_entries": self._total_block_table_entries,

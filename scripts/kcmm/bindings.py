@@ -278,6 +278,23 @@ class KcmmLibrary:
             ctypes.c_uint64,
         ]
         lib.kcmm_append_kv_slots.restype = ctypes.c_int
+        lib.kcmm_paged_attn_decode_f16.argtypes = [
+            pool,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_float,
+        ]
+        lib.kcmm_paged_attn_decode_f16.restype = ctypes.c_int
         lib.kcmm_get_block_location.argtypes = [
             pool,
             ctypes.c_uint32,
@@ -482,6 +499,41 @@ class KcmmPool:
             int(v_src_ptr),
         )
         self._check(rc, "kcmm_append_kv_slots")
+
+    def paged_attn_decode_f16(
+        self,
+        *,
+        layer_idx: int,
+        query_ptr: int,
+        out_ptr: int,
+        block_tables_ptr: int,
+        seq_lens_ptr: int,
+        block_offsets_f16_ptr: int,
+        batch: int,
+        num_q_heads: int,
+        kv_heads: int,
+        head_dim: int,
+        block_size: int,
+        max_blocks_per_seq: int,
+        scale: float,
+    ) -> None:
+        rc = self.library.lib.kcmm_paged_attn_decode_f16(
+            self.handle,
+            layer_idx,
+            int(query_ptr),
+            int(out_ptr),
+            int(block_tables_ptr),
+            int(seq_lens_ptr),
+            int(block_offsets_f16_ptr),
+            batch,
+            num_q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            float(scale),
+        )
+        self._check(rc, "kcmm_paged_attn_decode_f16")
 
     def block_location(self, block_idx: int) -> str:
         out = ctypes.c_uint32()

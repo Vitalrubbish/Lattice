@@ -316,10 +316,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _print_json({"vllm_kv_write_instrumentation": kv_write_report})
 
-    if config.kv_read_offset_table or config.kv_read_replace_candidate:
+    if (
+        config.kv_read_offset_table
+        or config.kv_read_replace_candidate
+        or config.kv_read_gpu_kernel_candidate
+    ):
         _KV_READ_OFFSET_TABLE_TRACKER = KcmmKvReadOffsetTableTracker(
             config.kv_read_offset_table_report_path,
-            replace_native=config.kv_read_replace_candidate,
+            replace_native=(
+                config.kv_read_replace_candidate
+                or config.kv_read_gpu_kernel_candidate
+            ),
+            replacement_backend=(
+                "gpu_kernel"
+                if config.kv_read_gpu_kernel_candidate
+                else "reference"
+            ),
         )
         kv_read_offset_table_report = apply_kv_read_offset_table(
             _KV_READ_OFFSET_TABLE_TRACKER

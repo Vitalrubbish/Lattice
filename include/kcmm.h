@@ -440,6 +440,40 @@ int kcmm_append_kv_step(kcmm_pool_t *pool, uint32_t layer_idx,
                         const uint32_t *positions, uint32_t batch,
                         uint64_t k_src_ptr, uint64_t v_src_ptr);
 
+/**
+ * Launch KCMM paged-attention decode for vLLM-owned query/output tensors.
+ *
+ * All pointer arguments are CUDA virtual addresses. `query_ptr` and `out_ptr`
+ * are FP16 tensors shaped [batch, num_q_heads, head_dim]. `block_tables_ptr`
+ * and `seq_lens_ptr` are int32 tensors. `block_offsets_f16_ptr` is an
+ * int64/u64 table indexed by block_id, where each value is the KCMM K/V VA
+ * byte offset divided by sizeof(f16).
+ *
+ * @param pool                  Pool handle.
+ * @param layer_idx             Transformer layer index.
+ * @param query_ptr             CUDA VA of query tensor.
+ * @param out_ptr               CUDA VA of output tensor to fill.
+ * @param block_tables_ptr      CUDA VA of int32 block table tensor.
+ * @param seq_lens_ptr          CUDA VA of int32 sequence lengths tensor.
+ * @param block_offsets_f16_ptr CUDA VA of int64/u64 block offset table.
+ * @param batch                 Number of sequences.
+ * @param num_q_heads           Number of query heads.
+ * @param kv_heads              Number of KV heads.
+ * @param head_dim              Attention head dimension. Current kernel max: 64.
+ * @param block_size            Tokens per KV block.
+ * @param max_blocks_per_seq    Columns in `block_tables`.
+ * @param scale                 Attention scale.
+ * @return 0 on success, -1 on error.
+ */
+int kcmm_paged_attn_decode_f16(kcmm_pool_t *pool, uint32_t layer_idx,
+                               uint64_t query_ptr, uint64_t out_ptr,
+                               uint64_t block_tables_ptr, uint64_t seq_lens_ptr,
+                               uint64_t block_offsets_f16_ptr,
+                               uint32_t batch, uint32_t num_q_heads,
+                               uint32_t kv_heads, uint32_t head_dim,
+                               uint32_t block_size, uint32_t max_blocks_per_seq,
+                               float scale);
+
 /* ===========================================================================
  * Tiering Operations
  * =========================================================================== */

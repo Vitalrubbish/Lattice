@@ -23,6 +23,8 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::Arc;
 
+use cudarc::driver::{CudaFunction, LaunchAsync, LaunchConfig};
+
 use crate::config::KcmmConfig;
 use crate::cuda::CudaContext;
 use crate::kcmm::pool::{BlockLocation, KcmmPool, SequencePriority};
@@ -44,6 +46,7 @@ pub struct kcmm_pool_t {
 struct KcmmPoolHandle {
     pool: Arc<KcmmPool>,
     last_error: parking_lot::Mutex<String>,
+    paged_attn_kernel: parking_lot::Mutex<Option<CudaFunction>>,
 }
 
 impl KcmmPoolHandle {
@@ -51,12 +54,48 @@ impl KcmmPoolHandle {
         Self {
             pool: Arc::new(pool),
             last_error: parking_lot::Mutex::new(String::new()),
+            paged_attn_kernel: parking_lot::Mutex::new(None),
         }
     }
 
     fn set_error(&self, msg: String) {
         *self.last_error.lock() = msg;
     }
+}
+
+fn compile_vllm_paged_attn_kernel(handle: &KcmmPoolHandle) -> anyhow::Result<CudaFunction> {
+    if let Some(kernel) = handle.paged_attn_kernel.lock().as_ref().cloned() {
+        return Ok(kernel);
+    }
+
+    let mut include_paths = vec!["/usr/include".to_string()];
+    let cuda_home = std::env::var("CUDA_HOME")
+        .or_else(|_| std::env::var("CUDA_PATH"))
+        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    include_paths.push(format!("{cuda_home}/include"));
+    let opts = cudarc::nvrtc::CompileOptions {
+        ftz: Some(true),
+        use_fast_math: Some(true),
+        include_paths,
+        ..Default::default()
+    };
+    let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(
+        include_str!("../cuda/kernels/kcmm_vllm_paged_attn.cu"),
+        opts,
+    )?;
+    handle.pool.ctx.device.load_ptx(
+        ptx,
+        "kcmm_vllm_paged_attn",
+        &["kcmm_vllm_paged_attn_decode_f16"],
+    )?;
+    let kernel = handle
+        .pool
+        .ctx
+        .device
+        .get_func("kcmm_vllm_paged_attn", "kcmm_vllm_paged_attn_decode_f16")
+        .ok_or_else(|| anyhow::anyhow!("kernel not found: kcmm_vllm_paged_attn_decode_f16"))?;
+    *handle.paged_attn_kernel.lock() = Some(kernel.clone());
+    Ok(kernel)
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,6 +1149,158 @@ pub unsafe extern "C" fn kcmm_append_kv_slots(
         }
     }
 
+    0
+}
+
+/// Launch KCMM's vLLM-facing paged-attention decode kernel.
+///
+/// All pointer arguments are raw CUDA virtual addresses. `query_ptr` and
+/// `out_ptr` point to FP16 tensors shaped [batch, num_q_heads, head_dim].
+/// `block_tables_ptr` and `seq_lens_ptr` point to int32 tensors. The
+/// `block_offsets_f16_ptr` tensor is an int64/u64 table indexed by block_id.
+///
+/// Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `pool` must be a valid handle and all raw pointers must refer to live CUDA
+/// device memory for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_paged_attn_decode_f16(
+    pool: *mut kcmm_pool_t,
+    layer_idx: u32,
+    query_ptr: u64,
+    out_ptr: u64,
+    block_tables_ptr: u64,
+    seq_lens_ptr: u64,
+    block_offsets_f16_ptr: u64,
+    batch: u32,
+    num_q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    max_blocks_per_seq: u32,
+    scale: f32,
+) -> i32 {
+    if pool.is_null()
+        || query_ptr == 0
+        || out_ptr == 0
+        || block_tables_ptr == 0
+        || seq_lens_ptr == 0
+        || block_offsets_f16_ptr == 0
+    {
+        if !pool.is_null() {
+            pool_from_ptr(pool)
+                .set_error("kcmm_paged_attn_decode_f16: null pointer argument".to_string());
+        }
+        return -1;
+    }
+    if batch == 0
+        || num_q_heads == 0
+        || kv_heads == 0
+        || head_dim == 0
+        || block_size == 0
+        || max_blocks_per_seq == 0
+    {
+        pool_from_ptr(pool).set_error(
+            "kcmm_paged_attn_decode_f16: shape arguments must be positive".to_string(),
+        );
+        return -1;
+    }
+    if head_dim > 64 {
+        pool_from_ptr(pool).set_error(format!(
+            "kcmm_paged_attn_decode_f16: head_dim {} exceeds kernel limit 64",
+            head_dim
+        ));
+        return -1;
+    }
+    if num_q_heads > 0xFFFF
+        || kv_heads > 0xFFFF
+        || block_size > 0xFFFF
+        || max_blocks_per_seq > 0xFFFF
+    {
+        pool_from_ptr(pool).set_error(
+            "kcmm_paged_attn_decode_f16: packed shape argument exceeds 65535".to_string(),
+        );
+        return -1;
+    }
+
+    let handle = pool_from_ptr(pool);
+    let va_k = match handle.pool.va_k.get(layer_idx as usize) {
+        Some(&value) => value,
+        None => {
+            handle.set_error(format!(
+                "kcmm_paged_attn_decode_f16: layer_idx {} out of bounds",
+                layer_idx
+            ));
+            return -1;
+        }
+    };
+    let va_v = match handle.pool.va_v.get(layer_idx as usize) {
+        Some(&value) => value,
+        None => {
+            handle.set_error(format!(
+                "kcmm_paged_attn_decode_f16: layer_idx {} out of bounds",
+                layer_idx
+            ));
+            return -1;
+        }
+    };
+
+    let kernel = match compile_vllm_paged_attn_kernel(handle) {
+        Ok(value) => value,
+        Err(e) => {
+            handle.set_error(format!(
+                "kcmm_paged_attn_decode_f16: compile/load kernel failed: {:#}",
+                e
+            ));
+            return -1;
+        }
+    };
+
+    let total_heads = match batch.checked_mul(num_q_heads) {
+        Some(value) => value,
+        None => {
+            handle.set_error("kcmm_paged_attn_decode_f16: total_heads overflow".to_string());
+            return -1;
+        }
+    };
+    let block_dim = 128u32;
+    let grid_dim = ((total_heads + block_dim - 1) / block_dim, 1, 1);
+    let cfg = LaunchConfig {
+        grid_dim,
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let packed_heads = ((kv_heads as i32) << 16) | (num_q_heads as i32);
+    let packed_blocks = ((max_blocks_per_seq as i32) << 16) | (block_size as i32);
+    let launch_result = unsafe { kernel.clone().launch(
+        cfg,
+        (
+            query_ptr,
+            va_k,
+            va_v,
+            block_tables_ptr,
+            seq_lens_ptr,
+            block_offsets_f16_ptr,
+            out_ptr,
+            total_heads as i32,
+            packed_heads,
+            head_dim as i32,
+            packed_blocks,
+            scale,
+        ),
+    ) };
+    if let Err(e) = launch_result {
+        handle.set_error(format!("kcmm_paged_attn_decode_f16: launch failed: {:#}", e));
+        return -1;
+    }
+    if let Err(e) = handle.pool.ctx.synchronize() {
+        handle.set_error(format!(
+            "kcmm_paged_attn_decode_f16: synchronize failed: {:#}",
+            e
+        ));
+        return -1;
+    }
     0
 }
 

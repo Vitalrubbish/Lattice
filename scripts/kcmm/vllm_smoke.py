@@ -50,6 +50,7 @@ class SmokeConfig:
     instrument_kv_reads: bool
     kv_read_offset_table: bool
     kv_read_replace_candidate: bool
+    kv_read_gpu_kernel_candidate: bool
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
     runtime_derived_pool: bool
@@ -149,6 +150,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Skip native paged_attention and fill output with a KCMM-backed "
             "reference attention implementation."
+        ),
+    )
+    parser.add_argument(
+        "--kv-read-gpu-kernel-candidate",
+        action="store_true",
+        help=(
+            "Skip native paged_attention and fill output with KCMM's GPU "
+            "paged-attention kernel."
         ),
     )
     parser.add_argument(
@@ -291,6 +300,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         instrument_kv_reads=args.instrument_kv_reads,
         kv_read_offset_table=args.kv_read_offset_table,
         kv_read_replace_candidate=args.kv_read_replace_candidate,
+        kv_read_gpu_kernel_candidate=args.kv_read_gpu_kernel_candidate,
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
         runtime_derived_pool=(
@@ -301,6 +311,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
             or args.kv_write_replace_candidate
             or args.kv_read_offset_table
             or args.kv_read_replace_candidate
+            or args.kv_read_gpu_kernel_candidate
         ),
         shadow_allocations=args.shadow_allocations,
         backed_allocations=args.backed_allocations,
@@ -556,12 +567,17 @@ def vllm_command(config: SmokeConfig) -> list[str]:
                     str(config.kv_write_mirror_report_path),
                 ]
             )
-        if config.kv_read_offset_table or config.kv_read_replace_candidate:
-            mode_flag = (
-                "--kcmm-kv-read-replace-candidate"
-                if config.kv_read_replace_candidate
-                else "--kcmm-kv-read-offset-table"
-            )
+        if (
+            config.kv_read_offset_table
+            or config.kv_read_replace_candidate
+            or config.kv_read_gpu_kernel_candidate
+        ):
+            if config.kv_read_gpu_kernel_candidate:
+                mode_flag = "--kcmm-kv-read-gpu-kernel-candidate"
+            elif config.kv_read_replace_candidate:
+                mode_flag = "--kcmm-kv-read-replace-candidate"
+            else:
+                mode_flag = "--kcmm-kv-read-offset-table"
             command.extend(
                 [
                     mode_flag,
@@ -636,6 +652,7 @@ def vllm_command(config: SmokeConfig) -> list[str]:
         or config.instrument_kv_reads
         or config.kv_read_offset_table
         or config.kv_read_replace_candidate
+        or config.kv_read_gpu_kernel_candidate
         or config.kv_write_mirror
         or config.kv_write_replace_candidate
         or config.runtime_derived_pool
@@ -817,6 +834,7 @@ def read_kv_read_offset_table_report(
     path: Path,
     *,
     expect_replacement: bool,
+    expect_gpu_kernel: bool = False,
 ) -> dict[str, Any]:
     if not path.exists():
         raise SmokeFailure(
@@ -860,7 +878,28 @@ def read_kv_read_offset_table_report(
                 "KCMM KV read replacement candidate replaced no calls: "
                 + json.dumps(report, sort_keys=True)
             )
-        if report.get("reference_read_bytes", 0) <= 0:
+        if expect_gpu_kernel:
+            if report.get("replacement_backend") != "gpu_kernel":
+                raise SmokeFailure(
+                    "KCMM KV read report did not use the GPU kernel backend: "
+                    + json.dumps(report, sort_keys=True)
+                )
+            if report.get("read_path") != "kcmm_paged_attn_decode_f16":
+                raise SmokeFailure(
+                    "KCMM KV read report did not use the GPU kernel read path: "
+                    + json.dumps(report, sort_keys=True)
+                )
+            if report.get("gpu_kernel_calls", 0) <= 0:
+                raise SmokeFailure(
+                    "KCMM KV read GPU kernel candidate launched no kernels: "
+                    + json.dumps(report, sort_keys=True)
+                )
+            if report.get("reference_read_bytes", 0) != 0:
+                raise SmokeFailure(
+                    "KCMM KV read GPU kernel candidate used CPU-staged reads: "
+                    + json.dumps(report, sort_keys=True)
+                )
+        elif report.get("reference_read_bytes", 0) <= 0:
             raise SmokeFailure(
                 "KCMM KV read replacement candidate read no KCMM bytes: "
                 + json.dumps(report, sort_keys=True)
@@ -1080,13 +1119,29 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         raise SmokeFailure(
             "--kv-read-replace-candidate cannot be combined with --kv-read-offset-table"
         )
+    if config.kv_read_gpu_kernel_candidate and (
+        config.kv_read_offset_table or config.kv_read_replace_candidate
+    ):
+        raise SmokeFailure(
+            "--kv-read-gpu-kernel-candidate cannot be combined with "
+            "--kv-read-offset-table or --kv-read-replace-candidate"
+        )
     if config.kv_read_replace_candidate and not config.backed_allocations:
         raise SmokeFailure("--kv-read-replace-candidate requires --backed-allocations")
+    if config.kv_read_gpu_kernel_candidate and not config.backed_allocations:
+        raise SmokeFailure("--kv-read-gpu-kernel-candidate requires --backed-allocations")
     if config.kv_read_replace_candidate and not (
         config.kv_write_mirror or config.kv_write_replace_candidate
     ):
         raise SmokeFailure(
             "--kv-read-replace-candidate requires --kv-write-mirror or "
+            "--kv-write-replace-candidate"
+        )
+    if config.kv_read_gpu_kernel_candidate and not (
+        config.kv_write_mirror or config.kv_write_replace_candidate
+    ):
+        raise SmokeFailure(
+            "--kv-read-gpu-kernel-candidate requires --kv-write-mirror or "
             "--kv-write-replace-candidate"
         )
     ensure_kcmm_library(config)
@@ -1119,6 +1174,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "instrument_kv_reads": config.instrument_kv_reads,
             "kv_read_offset_table": config.kv_read_offset_table,
             "kv_read_replace_candidate": config.kv_read_replace_candidate,
+            "kv_read_gpu_kernel_candidate": config.kv_read_gpu_kernel_candidate,
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,
             "shadow_allocations": config.shadow_allocations,
@@ -1149,10 +1205,18 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             result["kv_write_replace_candidate_report"] = report
         else:
             result["kv_write_mirror"] = report
-    if config.kv_read_offset_table or config.kv_read_replace_candidate:
+    if (
+        config.kv_read_offset_table
+        or config.kv_read_replace_candidate
+        or config.kv_read_gpu_kernel_candidate
+    ):
         result["kv_read_offset_table_report"] = read_kv_read_offset_table_report(
             config.kv_read_offset_table_report_path,
-            expect_replacement=config.kv_read_replace_candidate,
+            expect_replacement=(
+                config.kv_read_replace_candidate
+                or config.kv_read_gpu_kernel_candidate
+            ),
+            expect_gpu_kernel=config.kv_read_gpu_kernel_candidate,
         )
     if config.shadow_allocations:
         result["shadow_allocator"] = read_shadow_report(config.shadow_report_path)
@@ -1186,7 +1250,11 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
         if (
-            (config.kv_read_offset_table or config.kv_read_replace_candidate)
+            (
+                config.kv_read_offset_table
+                or config.kv_read_replace_candidate
+                or config.kv_read_gpu_kernel_candidate
+            )
             and config.kv_read_offset_table_report_path.exists()
         ):
             print(

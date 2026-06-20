@@ -130,6 +130,7 @@ class ObserverConfig:
     require_kv_read_seams: bool = False
     kv_read_offset_table: bool = False
     kv_read_replace_candidate: bool = False
+    kv_read_gpu_kernel_candidate: bool = False
     kv_read_offset_table_report_path: str | None = None
     shadow_allocations: bool = False
     shadow_report_path: str | None = None
@@ -186,6 +187,9 @@ class ObserverConfig:
             kv_read_offset_table=_env_bool("KCMM_KV_READ_OFFSET_TABLE", False),
             kv_read_replace_candidate=_env_bool(
                 "KCMM_KV_READ_REPLACE_CANDIDATE", False
+            ),
+            kv_read_gpu_kernel_candidate=_env_bool(
+                "KCMM_KV_READ_GPU_KERNEL_CANDIDATE", False
             ),
             kv_read_offset_table_report_path=(
                 os.environ.get("KCMM_KV_READ_OFFSET_TABLE_REPORT_PATH") or None
@@ -293,23 +297,49 @@ class ObserverConfig:
                 "KCMM KV read replacement candidate cannot be combined with "
                 "offset-table planning mode"
             )
+        if self.kv_read_gpu_kernel_candidate and (
+            self.kv_read_offset_table or self.kv_read_replace_candidate
+        ):
+            raise ValueError(
+                "KCMM KV read GPU kernel candidate cannot be combined with "
+                "offset-table planning or reference replacement mode"
+            )
         if self.kv_read_replace_candidate and self.pool_mode != "runtime":
             raise ValueError(
                 "KCMM KV read replacement candidate requires --kcmm-pool-mode runtime"
+            )
+        if self.kv_read_gpu_kernel_candidate and self.pool_mode != "runtime":
+            raise ValueError(
+                "KCMM KV read GPU kernel candidate requires --kcmm-pool-mode runtime"
             )
         if self.kv_read_replace_candidate and self.skip_observer:
             raise ValueError(
                 "KCMM KV read replacement candidate requires the KCMM observer pool"
             )
+        if self.kv_read_gpu_kernel_candidate and self.skip_observer:
+            raise ValueError(
+                "KCMM KV read GPU kernel candidate requires the KCMM observer pool"
+            )
         if self.kv_read_replace_candidate and not self.backed_allocations:
             raise ValueError(
                 "KCMM KV read replacement candidate requires --kcmm-backed-allocations"
+            )
+        if self.kv_read_gpu_kernel_candidate and not self.backed_allocations:
+            raise ValueError(
+                "KCMM KV read GPU kernel candidate requires --kcmm-backed-allocations"
             )
         if self.kv_read_replace_candidate and not (
             self.kv_write_mirror or self.kv_write_replace_candidate
         ):
             raise ValueError(
                 "KCMM KV read replacement candidate requires KCMM KV writes via "
+                "--kcmm-kv-write-mirror or --kcmm-kv-write-replace-candidate"
+            )
+        if self.kv_read_gpu_kernel_candidate and not (
+            self.kv_write_mirror or self.kv_write_replace_candidate
+        ):
+            raise ValueError(
+                "KCMM KV read GPU kernel candidate requires KCMM KV writes via "
                 "--kcmm-kv-write-mirror or --kcmm-kv-write-replace-candidate"
             )
 
@@ -432,6 +462,11 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kcmm-kv-read-replace-candidate",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--kcmm-kv-read-gpu-kernel-candidate",
         action="store_true",
         default=None,
     )
