@@ -474,6 +474,24 @@ int kcmm_paged_attn_decode_f16(kcmm_pool_t *pool, uint32_t layer_idx,
                                uint32_t block_size, uint32_t max_blocks_per_seq,
                                float scale);
 
+/**
+ * Launch KCMM paged-attention decode on a caller-owned CUDA stream.
+ *
+ * This has the same tensor contract as `kcmm_paged_attn_decode_f16`, but it
+ * enqueues the kernel on `stream_ptr` and returns without synchronizing. The
+ * caller is responsible for passing the current framework stream and preserving
+ * tensor lifetimes until the stream reaches this work.
+ *
+ * @param stream_ptr Raw CUDA stream handle, or 0 for the legacy default stream.
+ * @return 0 on successful enqueue, -1 on error.
+ */
+int kcmm_paged_attn_decode_f16_on_stream(
+    kcmm_pool_t *pool, uint32_t layer_idx, uint64_t query_ptr, uint64_t out_ptr,
+    uint64_t block_tables_ptr, uint64_t seq_lens_ptr,
+    uint64_t block_offsets_f16_ptr, uint32_t batch, uint32_t num_q_heads,
+    uint32_t kv_heads, uint32_t head_dim, uint32_t block_size,
+    uint32_t max_blocks_per_seq, float scale, uint64_t stream_ptr);
+
 /* ===========================================================================
  * Tiering Operations
  * =========================================================================== */

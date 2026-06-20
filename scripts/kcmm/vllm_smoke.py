@@ -894,6 +894,11 @@ def read_kv_read_offset_table_report(
                     "KCMM KV read GPU kernel candidate launched no kernels: "
                     + json.dumps(report, sort_keys=True)
                 )
+            if report.get("stream_aware_kernel_calls", 0) <= 0:
+                raise SmokeFailure(
+                    "KCMM KV read GPU kernel candidate used no stream-aware launches: "
+                    + json.dumps(report, sort_keys=True)
+                )
             if report.get("reference_read_bytes", 0) != 0:
                 raise SmokeFailure(
                     "KCMM KV read GPU kernel candidate used CPU-staged reads: "

@@ -262,10 +262,10 @@ caches the resulting function per pool, launches it, synchronizes, and returns
 without calling the native vLLM paged-attention kernel.
 
 The current kernel is intentionally narrow: FP16 decode attention only,
-`head_dim <= 64`, no alibi, no block-sparse mode, no FP8 cache scales, and a
-synchronous return path. It proves that vLLM can run with KCMM as the only KV
-write target and a GPU-side KCMM read path on the tiny local OPT smoke, but it
-does not yet satisfy the final Phase II.C acceptance gate.
+`head_dim <= 64`, no alibi, no block-sparse mode, and no FP8 cache scales. It
+proves that vLLM can run with KCMM as the only KV write target and a GPU-side
+KCMM read path on the tiny local OPT smoke, but it does not yet satisfy the
+final Phase II.C acceptance gate.
 
 The first deterministic stock-vs-KCMM GPU read-kernel A/B gate is
 `python -m scripts.kcmm.vllm_gpu_read_ab_gate`. It generates the tiny local OPT
@@ -273,8 +273,16 @@ model with a fixed default seed when the model is absent, runs stock vLLM and
 the KCMM-backed write-replacement plus GPU read-kernel path against the same
 model directory, and compares completion text, finish reason, and token counts.
 The local tiny-model gate has passed. The remaining work before treating this
-as a stable read path is broader prompt/shape coverage, stream-aware launch, and
-performance characterization.
+as a stable read path is broader prompt/shape coverage and performance
+characterization.
+
+The vLLM-integrated GPU read path now uses the stream-aware C ABI
+`kcmm_paged_attn_decode_f16_on_stream`, passing PyTorch's current CUDA stream
+handle from the patched read seam and returning without synchronizing the whole
+CUDA context. The old `kcmm_paged_attn_decode_f16` remains as a synchronous
+compatibility wrapper. On the current local eager vLLM seam the reported stream
+handle is `0`, the legacy default stream, so the next write-path step is still
+to remove the Python-side write synchronizations and characterize performance.
 
 ### CUDA context sharing risk
 

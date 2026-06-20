@@ -295,6 +295,24 @@ class KcmmLibrary:
             ctypes.c_float,
         ]
         lib.kcmm_paged_attn_decode_f16.restype = ctypes.c_int
+        lib.kcmm_paged_attn_decode_f16_on_stream.argtypes = [
+            pool,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_float,
+            ctypes.c_uint64,
+        ]
+        lib.kcmm_paged_attn_decode_f16_on_stream.restype = ctypes.c_int
         lib.kcmm_get_block_location.argtypes = [
             pool,
             ctypes.c_uint32,
@@ -516,8 +534,9 @@ class KcmmPool:
         block_size: int,
         max_blocks_per_seq: int,
         scale: float,
+        stream_ptr: int | None = None,
     ) -> None:
-        rc = self.library.lib.kcmm_paged_attn_decode_f16(
+        args = (
             self.handle,
             layer_idx,
             int(query_ptr),
@@ -533,7 +552,15 @@ class KcmmPool:
             max_blocks_per_seq,
             float(scale),
         )
-        self._check(rc, "kcmm_paged_attn_decode_f16")
+        if stream_ptr is None:
+            rc = self.library.lib.kcmm_paged_attn_decode_f16(*args)
+            self._check(rc, "kcmm_paged_attn_decode_f16")
+        else:
+            rc = self.library.lib.kcmm_paged_attn_decode_f16_on_stream(
+                *args,
+                int(stream_ptr),
+            )
+            self._check(rc, "kcmm_paged_attn_decode_f16_on_stream")
 
     def block_location(self, block_idx: int) -> str:
         out = ctypes.c_uint32()

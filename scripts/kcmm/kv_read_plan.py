@@ -35,6 +35,8 @@ class ReadPlanCall:
     replacement_backend: str
     reference_read_bytes: int
     gpu_kernel_launched: bool
+    stream_ptr: int | None
+    stream_aware_launch: bool
 
 
 @dataclass
@@ -123,6 +125,7 @@ class KcmmKvReadOffsetTableTracker:
         self._planned_calls = 0
         self._replacement_calls = 0
         self._gpu_kernel_calls = 0
+        self._stream_aware_kernel_calls = 0
         self._offset_table_builds = 0
         self._reference_read_bytes = 0
         self._total_block_table_entries = 0
@@ -263,6 +266,8 @@ class KcmmKvReadOffsetTableTracker:
             replacement_backend=self._replacement_backend,
             reference_read_bytes=0,
             gpu_kernel_launched=False,
+            stream_ptr=None,
+            stream_aware_launch=False,
         )
         return call, offsets_f16, unique_ids
 
@@ -317,13 +322,16 @@ class KcmmKvReadOffsetTableTracker:
                     arguments,
                 )
                 if self._replacement_backend == "gpu_kernel":
-                    self._run_gpu_kernel_attention(
+                    stream_ptr = self._run_gpu_kernel_attention(
                         layer_idx=call.layer_idx,
                         arguments=arguments,
                     )
                     read_bytes = 0
                     call.gpu_kernel_launched = True
+                    call.stream_ptr = stream_ptr
+                    call.stream_aware_launch = True
                     self._gpu_kernel_calls += 1
+                    self._stream_aware_kernel_calls += 1
                 else:
                     read_bytes = self._run_reference_attention(
                         layer_idx=call.layer_idx,
@@ -471,8 +479,10 @@ class KcmmKvReadOffsetTableTracker:
         *,
         layer_idx: int,
         arguments: dict[str, Any],
-    ) -> None:
+    ) -> int:
         self._validate_replacement_args(arguments)
+
+        import torch
 
         pool = self._require_pool()
         out = arguments["out"]
@@ -502,6 +512,11 @@ class KcmmKvReadOffsetTableTracker:
         if str(getattr(seq_lens, "dtype", "")) != "torch.int32":
             raise KcmmError(f"KCMM read kernel requires int32 seq_lens, got {seq_lens.dtype}")
 
+        device = getattr(query, "device", None)
+        device_index = getattr(device, "index", None)
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        stream_ptr = int(torch.cuda.current_stream(device_index).cuda_stream)
         pool.paged_attn_decode_f16(
             layer_idx=layer_idx,
             query_ptr=_data_ptr(query, "query"),
@@ -516,7 +531,9 @@ class KcmmKvReadOffsetTableTracker:
             block_size=int(arguments["block_size"]),
             max_blocks_per_seq=int(block_tables_shape[1]),
             scale=float(arguments["scale"]),
+            stream_ptr=stream_ptr,
         )
+        return stream_ptr
 
     def report(self) -> dict[str, Any]:
         with self._lock:
@@ -553,6 +570,7 @@ class KcmmKvReadOffsetTableTracker:
                 "planned_calls": self._planned_calls,
                 "replacement_calls": self._replacement_calls,
                 "gpu_kernel_calls": self._gpu_kernel_calls,
+                "stream_aware_kernel_calls": self._stream_aware_kernel_calls,
                 "offset_table_builds": self._offset_table_builds,
                 "reference_read_bytes": self._reference_read_bytes,
                 "total_block_table_entries": self._total_block_table_entries,

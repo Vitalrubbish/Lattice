@@ -80,5 +80,5 @@ Latest local A/B result on 2026-06-20:
 ## Next step
 
 Make `kcmm_paged_attn_decode_f16` stream-aware instead of synchronizing the
-whole KCMM CUDA context before returning, then add basic performance
-characterization for the GPU read-kernel path.
+whole KCMM CUDA context before returning. This is tracked by
+`.scratch/kcmm-vllm-phase-ii-c/issues/06-make-gpu-read-kernel-stream-aware.md`.

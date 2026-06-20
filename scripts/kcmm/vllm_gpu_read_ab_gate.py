@@ -207,6 +207,7 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "read_path": read_report.get("read_path"),
         "replacement_backend": read_report.get("replacement_backend"),
         "gpu_kernel_calls": read_report.get("gpu_kernel_calls"),
+        "stream_aware_kernel_calls": read_report.get("stream_aware_kernel_calls"),
         "reference_read_bytes": read_report.get("reference_read_bytes"),
         "replacement_calls": read_report.get("replacement_calls"),
         "offset_table_builds": read_report.get("offset_table_builds"),

@@ -547,15 +547,51 @@ Latest local Phase II.C GPU read-kernel A/B result on 2026-06-20:
 - Read path: `kcmm_paged_attn_decode_f16`
 - Replacement backend: `gpu_kernel`
 - GPU kernel calls: `6`
+- Stream-aware kernel calls: `6`
 - Reference KCMM read bytes: `0`
 - Native KV write calls skipped: `8`
 - KCMM write verified rows: `10`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after both modes.
 
-The next Phase II.C work is stream-aware launch and performance
-characterization, plus broader prompt/shape coverage beyond the tiny local OPT
-gate.
+## Phase II.C stream-aware GPU read launch
+
+The vLLM-integrated GPU read path uses:
+
+```text
+kcmm_paged_attn_decode_f16_on_stream(..., stream_ptr)
+```
+
+The Python read replacement passes:
+
+```python
+torch.cuda.current_stream(device_index).cuda_stream
+```
+
+This enqueues the read kernel on the caller's current CUDA stream and returns
+without a per-call full context synchronize. The older
+`kcmm_paged_attn_decode_f16` ABI remains as a synchronous compatibility wrapper.
+Pool teardown still synchronizes before unloading the raw CUDA module.
+
+Latest local stream-aware validation on 2026-06-20:
+
+- Command: `python -m scripts.kcmm.vllm_gpu_read_ab_gate --no-build-kcmm`
+- Result: `passed=true`
+- Stock completion text: `" pioneer pioneer pioneer pioneer"`
+- KCMM completion text: `" pioneer pioneer pioneer pioneer"`
+- Read path: `kcmm_paged_attn_decode_f16`
+- Replacement backend: `gpu_kernel`
+- GPU kernel calls: `6`
+- Stream-aware kernel calls: `6`
+- Stream pointer sample: `[0, 0, 0, 0, 0, 0]`
+- Reference KCMM read bytes: `0`
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after both modes.
+
+The current vLLM eager seam reports stream pointer `0`, the legacy default
+stream. The next Phase II.C work is performance characterization plus broader
+prompt/shape coverage beyond the tiny local OPT gate. The KV write replacement
+path still contains Python-side synchronizations and should be made
+stream-aware separately.
 
 The manual steps below are the expanded form of the same check.
 

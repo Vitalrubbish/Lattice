@@ -19,11 +19,11 @@
 //   - Each kcmm_pool_t handle is independent; sharing a handle across threads
 //     is safe (backed by Arc<KcmmPool> with internal Mutex protection).
 
-use std::ffi::CStr;
+use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaFunction, LaunchAsync, LaunchConfig};
+use cudarc::driver::{result, sys, LaunchConfig};
 
 use crate::config::KcmmConfig;
 use crate::cuda::CudaContext;
@@ -46,8 +46,17 @@ pub struct kcmm_pool_t {
 struct KcmmPoolHandle {
     pool: Arc<KcmmPool>,
     last_error: parking_lot::Mutex<String>,
-    paged_attn_kernel: parking_lot::Mutex<Option<CudaFunction>>,
+    paged_attn_kernel: parking_lot::Mutex<Option<KcmmPagedAttnKernel>>,
 }
+
+#[derive(Clone, Copy)]
+struct KcmmPagedAttnKernel {
+    module: sys::CUmodule,
+    function: sys::CUfunction,
+}
+
+unsafe impl Send for KcmmPagedAttnKernel {}
+unsafe impl Sync for KcmmPagedAttnKernel {}
 
 impl KcmmPoolHandle {
     fn new(pool: KcmmPool) -> Self {
@@ -63,7 +72,18 @@ impl KcmmPoolHandle {
     }
 }
 
-fn compile_vllm_paged_attn_kernel(handle: &KcmmPoolHandle) -> anyhow::Result<CudaFunction> {
+impl Drop for KcmmPoolHandle {
+    fn drop(&mut self) {
+        if let Some(kernel) = self.paged_attn_kernel.lock().take() {
+            let _ = self.pool.ctx.device.bind_to_thread();
+            unsafe {
+                let _ = result::module::unload(kernel.module);
+            }
+        }
+    }
+}
+
+fn compile_vllm_paged_attn_kernel(handle: &KcmmPoolHandle) -> anyhow::Result<KcmmPagedAttnKernel> {
     if let Some(kernel) = handle.paged_attn_kernel.lock().as_ref().cloned() {
         return Ok(kernel);
     }
@@ -83,17 +103,17 @@ fn compile_vllm_paged_attn_kernel(handle: &KcmmPoolHandle) -> anyhow::Result<Cud
         include_str!("../cuda/kernels/kcmm_vllm_paged_attn.cu"),
         opts,
     )?;
-    handle.pool.ctx.device.load_ptx(
-        ptx,
-        "kcmm_vllm_paged_attn",
-        &["kcmm_vllm_paged_attn_decode_f16"],
-    )?;
-    let kernel = handle
-        .pool
-        .ctx
-        .device
-        .get_func("kcmm_vllm_paged_attn", "kcmm_vllm_paged_attn_decode_f16")
-        .ok_or_else(|| anyhow::anyhow!("kernel not found: kcmm_vllm_paged_attn_decode_f16"))?;
+    handle.pool.ctx.device.bind_to_thread()?;
+    let ptx_src = ptx.to_src();
+    let ptx_image = CString::new(ptx_src)?;
+    let module = unsafe { result::module::load_data(ptx_image.as_ptr() as *const c_void) }?;
+    let function = unsafe {
+        result::module::get_function(
+            module,
+            CString::new("kcmm_vllm_paged_attn_decode_f16")?,
+        )
+    }?;
+    let kernel = KcmmPagedAttnKernel { module, function };
     *handle.paged_attn_kernel.lock() = Some(kernel.clone());
     Ok(kernel)
 }
@@ -414,7 +434,10 @@ pub unsafe extern "C" fn kcmm_pool_destroy(pool: *mut kcmm_pool_t) {
         return;
     }
     let handle: Box<KcmmPoolHandle> = Box::from_raw(pool as *mut KcmmPoolHandle);
-    // Wait for streams before the pool (and its Arc references) drop.
+    // Wait for in-flight work before the pool and raw kernel module drop.
+    // Stream-aware vLLM read kernels may be queued on a caller-owned stream
+    // rather than KCMM's dedicated migration streams.
+    handle.pool.ctx.synchronize().ok();
     handle.pool.streams.synchronize_all().ok();
     drop(handle);
 }
@@ -1181,6 +1204,95 @@ pub unsafe extern "C" fn kcmm_paged_attn_decode_f16(
     max_blocks_per_seq: u32,
     scale: f32,
 ) -> i32 {
+    unsafe {
+        kcmm_paged_attn_decode_f16_impl(
+            pool,
+            layer_idx,
+            query_ptr,
+            out_ptr,
+            block_tables_ptr,
+            seq_lens_ptr,
+            block_offsets_f16_ptr,
+            batch,
+            num_q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            scale,
+            0,
+            true,
+        )
+    }
+}
+
+/// Launch KCMM's vLLM-facing paged-attention decode kernel on a caller stream.
+///
+/// `stream_ptr` is a raw CUDA stream handle, typically PyTorch's current
+/// stream for the tensor device. This function does not synchronize before
+/// returning; the caller owns stream ordering and lifetime.
+///
+/// # Safety
+/// Same as `kcmm_paged_attn_decode_f16`, plus `stream_ptr` must be either a
+/// valid CUDA stream for the active context or 0 for the legacy default stream.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_paged_attn_decode_f16_on_stream(
+    pool: *mut kcmm_pool_t,
+    layer_idx: u32,
+    query_ptr: u64,
+    out_ptr: u64,
+    block_tables_ptr: u64,
+    seq_lens_ptr: u64,
+    block_offsets_f16_ptr: u64,
+    batch: u32,
+    num_q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    max_blocks_per_seq: u32,
+    scale: f32,
+    stream_ptr: u64,
+) -> i32 {
+    unsafe {
+        kcmm_paged_attn_decode_f16_impl(
+            pool,
+            layer_idx,
+            query_ptr,
+            out_ptr,
+            block_tables_ptr,
+            seq_lens_ptr,
+            block_offsets_f16_ptr,
+            batch,
+            num_q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            scale,
+            stream_ptr,
+            false,
+        )
+    }
+}
+
+unsafe fn kcmm_paged_attn_decode_f16_impl(
+    pool: *mut kcmm_pool_t,
+    layer_idx: u32,
+    query_ptr: u64,
+    out_ptr: u64,
+    block_tables_ptr: u64,
+    seq_lens_ptr: u64,
+    block_offsets_f16_ptr: u64,
+    batch: u32,
+    num_q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    max_blocks_per_seq: u32,
+    scale: f32,
+    stream_ptr: u64,
+    synchronize_after_launch: bool,
+) -> i32 {
     if pool.is_null()
         || query_ptr == 0
         || out_ptr == 0
@@ -1273,33 +1385,62 @@ pub unsafe extern "C" fn kcmm_paged_attn_decode_f16(
     };
     let packed_heads = ((kv_heads as i32) << 16) | (num_q_heads as i32);
     let packed_blocks = ((max_blocks_per_seq as i32) << 16) | (block_size as i32);
-    let launch_result = unsafe { kernel.clone().launch(
-        cfg,
-        (
-            query_ptr,
-            va_k,
-            va_v,
-            block_tables_ptr,
-            seq_lens_ptr,
-            block_offsets_f16_ptr,
-            out_ptr,
-            total_heads as i32,
-            packed_heads,
-            head_dim as i32,
-            packed_blocks,
-            scale,
-        ),
-    ) };
+    if let Err(e) = handle.pool.ctx.device.bind_to_thread() {
+        handle.set_error(format!(
+            "kcmm_paged_attn_decode_f16: bind context failed: {:#}",
+            e
+        ));
+        return -1;
+    }
+    let mut query_ptr_arg = query_ptr;
+    let mut va_k_arg = va_k;
+    let mut va_v_arg = va_v;
+    let mut block_tables_ptr_arg = block_tables_ptr;
+    let mut seq_lens_ptr_arg = seq_lens_ptr;
+    let mut block_offsets_f16_ptr_arg = block_offsets_f16_ptr;
+    let mut out_ptr_arg = out_ptr;
+    let mut total_heads_arg = total_heads as i32;
+    let mut packed_heads_arg = packed_heads;
+    let mut head_dim_arg = head_dim as i32;
+    let mut packed_blocks_arg = packed_blocks;
+    let mut scale_arg = scale;
+    let mut params = [
+        &mut query_ptr_arg as *mut u64 as *mut c_void,
+        &mut va_k_arg as *mut u64 as *mut c_void,
+        &mut va_v_arg as *mut u64 as *mut c_void,
+        &mut block_tables_ptr_arg as *mut u64 as *mut c_void,
+        &mut seq_lens_ptr_arg as *mut u64 as *mut c_void,
+        &mut block_offsets_f16_ptr_arg as *mut u64 as *mut c_void,
+        &mut out_ptr_arg as *mut u64 as *mut c_void,
+        &mut total_heads_arg as *mut i32 as *mut c_void,
+        &mut packed_heads_arg as *mut i32 as *mut c_void,
+        &mut head_dim_arg as *mut i32 as *mut c_void,
+        &mut packed_blocks_arg as *mut i32 as *mut c_void,
+        &mut scale_arg as *mut f32 as *mut c_void,
+    ];
+    let stream = stream_ptr as sys::CUstream;
+    let launch_result = unsafe {
+        result::launch_kernel(
+            kernel.function,
+            cfg.grid_dim,
+            cfg.block_dim,
+            cfg.shared_mem_bytes,
+            stream,
+            &mut params,
+        )
+    };
     if let Err(e) = launch_result {
         handle.set_error(format!("kcmm_paged_attn_decode_f16: launch failed: {:#}", e));
         return -1;
     }
-    if let Err(e) = handle.pool.ctx.synchronize() {
-        handle.set_error(format!(
-            "kcmm_paged_attn_decode_f16: synchronize failed: {:#}",
-            e
-        ));
-        return -1;
+    if synchronize_after_launch {
+        if let Err(e) = handle.pool.ctx.synchronize() {
+            handle.set_error(format!(
+                "kcmm_paged_attn_decode_f16: synchronize failed: {:#}",
+                e
+            ));
+            return -1;
+        }
     }
     0
 }
