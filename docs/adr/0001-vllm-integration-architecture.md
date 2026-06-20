@@ -258,8 +258,8 @@ KCMM C ABI entrypoint `kcmm_paged_attn_decode_f16`. The launcher passes raw CUDA
 VAs for vLLM-owned `query`, `out`, `block_tables`, and `seq_lens` tensors,
 plus the KCMM K/V base VAs and the GPU `offset_table[block_id] =
 kcmm_f16_va_offset` side table. Rust compiles the CUDA source with NVRTC,
-caches the resulting function per pool, launches it, synchronizes, and returns
-without calling the native vLLM paged-attention kernel.
+caches the resulting function per pool, and returns without calling the native
+vLLM paged-attention kernel.
 
 The current kernel is intentionally narrow: FP16 decode attention only,
 `head_dim <= 64`, no alibi, no block-sparse mode, and no FP8 cache scales. It
@@ -272,9 +272,11 @@ The first deterministic stock-vs-KCMM GPU read-kernel A/B gate is
 model with a fixed default seed when the model is absent, runs stock vLLM and
 the KCMM-backed write-replacement plus GPU read-kernel path against the same
 model directory, and compares completion text, finish reason, and token counts.
-The local tiny-model gate has passed. The remaining work before treating this
-as a stable read path is broader prompt/shape coverage and performance
-characterization.
+The local tiny-model gate has passed. It also records startup latency, request
+latency, generated-token throughput, peak GPU memory delta, and warning
+classifications for KCMM-vs-stock regressions. The remaining work before
+treating this as a stable read path is broader prompt/shape coverage and
+performance optimization.
 
 The vLLM-integrated GPU read path now uses the stream-aware C ABI
 `kcmm_paged_attn_decode_f16_on_stream`, passing PyTorch's current CUDA stream
@@ -282,7 +284,8 @@ handle from the patched read seam and returning without synchronizing the whole
 CUDA context. The old `kcmm_paged_attn_decode_f16` remains as a synchronous
 compatibility wrapper. On the current local eager vLLM seam the reported stream
 handle is `0`, the legacy default stream, so the next write-path step is still
-to remove the Python-side write synchronizations and characterize performance.
+to remove the Python-side write synchronizations and broaden performance
+coverage beyond the tiny local OPT gate.
 
 ### CUDA context sharing risk
 

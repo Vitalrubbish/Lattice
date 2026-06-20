@@ -43,6 +43,10 @@ class GateConfig:
     keep_model: bool
     print_seams: bool
     output_path: Path
+    latency_warning_ratio: float
+    throughput_warning_ratio: float
+    memory_warning_ratio: float
+    memory_warning_min_delta_mib: int
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,6 +82,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="A/B gate JSON report path. Defaults to a /tmp file.",
     )
+    parser.add_argument(
+        "--latency-warning-ratio",
+        type=float,
+        default=2.0,
+        help="Warn when KCMM startup or request latency exceeds stock by this ratio.",
+    )
+    parser.add_argument(
+        "--throughput-warning-ratio",
+        type=float,
+        default=0.5,
+        help="Warn when KCMM token throughput falls below stock times this ratio.",
+    )
+    parser.add_argument(
+        "--memory-warning-ratio",
+        type=float,
+        default=1.5,
+        help="Warn when KCMM peak GPU memory delta exceeds stock by this ratio.",
+    )
+    parser.add_argument(
+        "--memory-warning-min-delta-mib",
+        type=int,
+        default=256,
+        help="Minimum extra GPU memory delta before memory ratio warnings are emitted.",
+    )
     return parser
 
 
@@ -104,6 +132,10 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         keep_model=args.keep_model,
         print_seams=args.print_seams,
         output_path=output_path,
+        latency_warning_ratio=args.latency_warning_ratio,
+        throughput_warning_ratio=args.throughput_warning_ratio,
+        memory_warning_ratio=args.memory_warning_ratio,
+        memory_warning_min_delta_mib=args.memory_warning_min_delta_mib,
     )
 
 
@@ -315,6 +347,182 @@ def add_correctness_failures(modes: dict[str, Any]) -> list[dict[str, Any]]:
     return failures
 
 
+def number(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None:
+        return None
+    if denominator <= 0:
+        return None
+    return round(numerator / denominator, 3)
+
+
+def nested_number(value: Any, *keys: str) -> float | None:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return number(current)
+
+
+def performance_comparison(modes: dict[str, Any]) -> dict[str, Any]:
+    stock = modes.get("stock", {})
+    gpu_read = modes.get("kcmm_gpu_read", {})
+    if not stock.get("success") or not gpu_read.get("success"):
+        return {"available": False, "reason": "both modes must pass first"}
+
+    metrics = [
+        (
+            "startup_seconds",
+            number(stock.get("startup_seconds")),
+            number(gpu_read.get("startup_seconds")),
+            "lower_is_better",
+        ),
+        (
+            "request_latency_seconds",
+            number(stock.get("request_latency_seconds")),
+            number(gpu_read.get("request_latency_seconds")),
+            "lower_is_better",
+        ),
+        (
+            "tokens_per_second",
+            number(stock.get("tokens_per_second")),
+            number(gpu_read.get("tokens_per_second")),
+            "higher_is_better",
+        ),
+        (
+            "gpu_memory_peak_delta_mib",
+            nested_number(stock, "gpu_memory", "peak_delta_mib"),
+            nested_number(gpu_read, "gpu_memory", "peak_delta_mib"),
+            "lower_is_better",
+        ),
+    ]
+    return {
+        "available": True,
+        "metrics": {
+            name: {
+                "stock": stock_value,
+                "kcmm_gpu_read": kcmm_value,
+                "kcmm_to_stock_ratio": ratio(kcmm_value, stock_value),
+                "direction": direction,
+            }
+            for name, stock_value, kcmm_value, direction in metrics
+        },
+    }
+
+
+def add_ratio_warning(
+    warnings: list[dict[str, Any]],
+    *,
+    metric: str,
+    stock_value: float | None,
+    mode_value: float | None,
+    ratio_threshold: float,
+    higher_is_worse: bool,
+) -> None:
+    if stock_value is None or mode_value is None:
+        return
+    if stock_value <= 0:
+        return
+    threshold = stock_value * ratio_threshold
+    if higher_is_worse and mode_value > threshold:
+        warnings.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "metric": metric,
+                "stock_value": round(stock_value, 3),
+                "mode_value": round(mode_value, 3),
+                "threshold": round(threshold, 3),
+                "classification": "performance_warning",
+            }
+        )
+    if not higher_is_worse and mode_value < threshold:
+        warnings.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "metric": metric,
+                "stock_value": round(stock_value, 3),
+                "mode_value": round(mode_value, 3),
+                "threshold": round(threshold, 3),
+                "classification": "performance_warning",
+            }
+        )
+
+
+def add_memory_warning(
+    warnings: list[dict[str, Any]],
+    *,
+    config: GateConfig,
+    stock_delta: float | None,
+    mode_delta: float | None,
+) -> None:
+    if stock_delta is None or mode_delta is None:
+        return
+    threshold = max(
+        stock_delta * config.memory_warning_ratio,
+        stock_delta + config.memory_warning_min_delta_mib,
+    )
+    if mode_delta > threshold:
+        warnings.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "metric": "gpu_memory_peak_delta_mib",
+                "stock_value": round(stock_delta, 3),
+                "mode_value": round(mode_delta, 3),
+                "threshold": round(threshold, 3),
+                "classification": "performance_warning",
+            }
+        )
+
+
+def add_performance_warnings(
+    config: GateConfig,
+    modes: dict[str, Any],
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    stock = modes.get("stock", {})
+    gpu_read = modes.get("kcmm_gpu_read", {})
+    if not stock.get("success") or not gpu_read.get("success"):
+        return warnings
+
+    add_ratio_warning(
+        warnings,
+        metric="startup_seconds",
+        stock_value=number(stock.get("startup_seconds")),
+        mode_value=number(gpu_read.get("startup_seconds")),
+        ratio_threshold=config.latency_warning_ratio,
+        higher_is_worse=True,
+    )
+    add_ratio_warning(
+        warnings,
+        metric="request_latency_seconds",
+        stock_value=number(stock.get("request_latency_seconds")),
+        mode_value=number(gpu_read.get("request_latency_seconds")),
+        ratio_threshold=config.latency_warning_ratio,
+        higher_is_worse=True,
+    )
+    add_ratio_warning(
+        warnings,
+        metric="tokens_per_second",
+        stock_value=number(stock.get("tokens_per_second")),
+        mode_value=number(gpu_read.get("tokens_per_second")),
+        ratio_threshold=config.throughput_warning_ratio,
+        higher_is_worse=False,
+    )
+    add_memory_warning(
+        warnings,
+        config=config,
+        stock_delta=nested_number(stock, "gpu_memory", "peak_delta_mib"),
+        mode_delta=nested_number(gpu_read, "gpu_memory", "peak_delta_mib"),
+    )
+    return warnings
+
+
 def run_gate(config: GateConfig) -> dict[str, Any]:
     run_id = int(time.time() * 1000)
     run_dir = Path(tempfile.gettempdir()) / f"kcmm-vllm-phase-ii-c-gpu-read-ab-{run_id}"
@@ -331,6 +539,7 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
             shutil.rmtree(config.model_path, ignore_errors=True)
 
     correctness_failures = add_correctness_failures(modes)
+    performance_warnings = add_performance_warnings(config, modes)
     report = {
         "phase": "II.C",
         "gate": "stock-vs-kcmm-gpu-read-kernel-ab",
@@ -346,6 +555,8 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "mode_order": list(MODE_ORDER),
         "modes": modes,
         "correctness_failures": correctness_failures,
+        "performance_comparison": performance_comparison(modes),
+        "performance_warnings": performance_warnings,
         "output_path": str(config.output_path),
     }
     return report

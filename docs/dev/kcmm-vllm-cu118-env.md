@@ -553,6 +553,7 @@ Latest local Phase II.C GPU read-kernel A/B result on 2026-06-20:
 - KCMM write verified rows: `10`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after both modes.
+- Performance warnings: `[]`
 
 ## Phase II.C stream-aware GPU read launch
 
@@ -588,10 +589,42 @@ Latest local stream-aware validation on 2026-06-20:
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after both modes.
 
 The current vLLM eager seam reports stream pointer `0`, the legacy default
-stream. The next Phase II.C work is performance characterization plus broader
-prompt/shape coverage beyond the tiny local OPT gate. The KV write replacement
-path still contains Python-side synchronizations and should be made
-stream-aware separately.
+stream. The KV write replacement path still contains Python-side
+synchronizations and should be made stream-aware separately.
+
+## Phase II.C GPU read-kernel performance characterization
+
+The GPU read-kernel A/B gate records performance metrics in addition to the
+correctness check. These metrics are warnings only; correctness failures still
+control the command exit code.
+
+The report includes:
+
+- `startup_seconds`
+- `request_latency_seconds`
+- `tokens_per_second`
+- `gpu_memory_peak_delta_mib`
+- `performance_comparison`
+- `performance_warnings`
+
+Default warning thresholds:
+
+- startup or request latency above `2.0x` stock,
+- token throughput below `0.5x` stock,
+- peak GPU memory delta above `1.5x` stock and at least `256 MiB` higher.
+
+Latest local performance characterization on 2026-06-20:
+
+- Command: `python -m scripts.kcmm.vllm_gpu_read_ab_gate --no-build-kcmm`
+- Result: `passed=true`
+- Performance warnings: `[]`
+- Startup seconds: stock `13.543`, KCMM `10.528`, ratio `0.777`
+- Request latency seconds: stock `1.731`, KCMM `1.908`, ratio `1.102`
+- Tokens per second: stock `2.311`, KCMM `2.096`, ratio `0.907`
+- Peak GPU memory delta MiB: stock `3417`, KCMM `3425`, ratio `1.002`
+
+The next Phase II.C work is broader prompt/shape correctness coverage and
+performance optimization beyond this tiny local OPT gate.
 
 The manual steps below are the expanded form of the same check.
 

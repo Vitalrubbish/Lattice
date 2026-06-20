@@ -76,5 +76,6 @@ Latest local A/B result on 2026-06-20:
 
 ## Next step
 
-Add basic performance characterization for the GPU read-kernel path and start
-broadening correctness coverage beyond the tiny local OPT shape.
+Add basic performance characterization for the GPU read-kernel path. This is
+tracked by
+`.scratch/kcmm-vllm-phase-ii-c/issues/07-add-gpu-read-kernel-performance-characterization.md`.
