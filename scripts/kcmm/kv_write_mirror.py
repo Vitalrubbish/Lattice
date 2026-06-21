@@ -123,6 +123,7 @@ class KcmmKvWriteMirrorTracker:
         self._stream_aware_write_calls = 0
         self._stream_synchronize_for_verification_calls = 0
         self._last_stream_ptr: int | None = None
+        self._max_batch_seen = 0
         self._counts_by_function: dict[str, int] = {}
         self._recent_calls: list[dict[str, Any]] = []
         self._error_count = 0
@@ -313,6 +314,7 @@ class KcmmKvWriteMirrorTracker:
                 self._validate_dtype(key, value)
                 slots = self._slot_mapping_to_list(slot_mapping)
                 batch = len(slots)
+                self._max_batch_seen = max(self._max_batch_seen, batch)
                 if batch == 0:
                     self._skipped_empty_batches += 1
                     self.write_report()
@@ -438,6 +440,7 @@ class KcmmKvWriteMirrorTracker:
                     self._stream_synchronize_for_verification_calls
                 ),
                 "last_stream_ptr": self._last_stream_ptr,
+                "max_batch_seen": self._max_batch_seen,
                 "counts_by_function": dict(sorted(self._counts_by_function.items())),
                 "cache_layers": [
                     asdict(layer)

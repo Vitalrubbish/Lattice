@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import shutil
@@ -74,6 +75,10 @@ class SmokeConfig:
     require_kv_write_seams: bool
     require_kv_read_seams: bool
     log_path: Path
+    max_model_len: int = 64
+    max_num_seqs: int = 1
+    max_num_batched_tokens: int = 64
+    completion_concurrency: int = 1
     completion_cases: tuple[CompletionCase, ...] | None = None
 
     @property
@@ -107,6 +112,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shutdown-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--max-tokens", type=int, default=4)
+    parser.add_argument("--max-model-len", type=int, default=64)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=64)
+    parser.add_argument(
+        "--completion-concurrency",
+        type=int,
+        default=1,
+        help="Number of completion requests to keep in flight within one smoke run.",
+    )
     parser.add_argument(
         "--build-kcmm",
         action=argparse.BooleanOptionalAction,
@@ -244,7 +258,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_config(argv: list[str] | None = None) -> SmokeConfig:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    for field in (
+        "max_model_len",
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "completion_concurrency",
+    ):
+        if int(getattr(args, field)) <= 0:
+            parser.error(f"--{field.replace('_', '-')} must be positive")
     log_path = (
         Path(args.log_path)
         if args.log_path
@@ -334,6 +357,10 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         require_kv_write_seams=args.require_kv_write_seams,
         require_kv_read_seams=args.require_kv_read_seams,
         log_path=log_path,
+        max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        completion_concurrency=args.completion_concurrency,
     )
 
 
@@ -636,16 +663,16 @@ def vllm_command(config: SmokeConfig) -> list[str]:
             "--dtype",
             "float16",
             "--max-model-len",
-            "64",
+            str(config.max_model_len),
             "--gpu-memory-utilization",
             "0.25",
             "--max-num-seqs",
-            "1",
+            str(config.max_num_seqs),
             "--max-num-batched-tokens",
-            "64",
+            str(config.max_num_batched_tokens),
             "--enforce-eager",
             "--max-seq-len-to-capture",
-            "64",
+            str(config.max_model_len),
             "--guided-decoding-backend",
             "lm-format-enforcer",
             "--disable-log-requests",
@@ -1131,6 +1158,42 @@ def completion_case_sequence(config: SmokeConfig) -> tuple[CompletionCase, ...]:
     )
 
 
+def run_completion_case(config: SmokeConfig, case: CompletionCase) -> dict[str, Any]:
+    case_started_at = time.monotonic()
+    completion = run_completion(
+        config,
+        prompt=case.prompt,
+        max_tokens=case.max_tokens,
+    )
+    case_completed_at = time.monotonic()
+    return {
+        "name": case.name,
+        "prompt": case.prompt,
+        "max_tokens": case.max_tokens,
+        "completion_seconds": round(case_completed_at - case_started_at, 3),
+        "completion": completion,
+    }
+
+
+def run_completion_cases(
+    config: SmokeConfig,
+    cases: tuple[CompletionCase, ...],
+) -> list[dict[str, Any]]:
+    if config.completion_concurrency <= 1 or len(cases) <= 1:
+        return [run_completion_case(config, case) for case in cases]
+
+    max_workers = min(config.completion_concurrency, len(cases))
+    results: list[dict[str, Any] | None] = [None] * len(cases)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {
+            executor.submit(run_completion_case, config, case): index
+            for index, case in enumerate(cases)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            results[future_to_index[future]] = future.result()
+    return [result for result in results if result is not None]
+
+
 def run_smoke(config: SmokeConfig) -> dict[str, Any]:
     if config.shadow_allocations and config.mode != "kcmm":
         raise SmokeFailure("--shadow-allocations requires --mode kcmm")
@@ -1191,27 +1254,15 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         process = start_server(config)
         models = wait_for_ready(process, config)
         ready_at = time.monotonic()
-        completion_cases: list[dict[str, Any]] = []
-        completion_seconds_total = 0.0
-        for case in completion_case_sequence(config):
-            case_started_at = time.monotonic()
-            completion = run_completion(
-                config,
-                prompt=case.prompt,
-                max_tokens=case.max_tokens,
-            )
-            case_completed_at = time.monotonic()
-            case_seconds = round(case_completed_at - case_started_at, 3)
-            completion_seconds_total += case_completed_at - case_started_at
-            completion_cases.append(
-                {
-                    "name": case.name,
-                    "prompt": case.prompt,
-                    "max_tokens": case.max_tokens,
-                    "completion_seconds": case_seconds,
-                    "completion": completion,
-                }
-            )
+        request_started_at = time.monotonic()
+        completion_cases = run_completion_cases(
+            config,
+            completion_case_sequence(config),
+        )
+        request_completed_at = time.monotonic()
+        completion_case_seconds_total = sum(
+            float(case["completion_seconds"]) for case in completion_cases
+        )
         completion = completion_cases[0]["completion"]
         result = {
             "mode": config.mode,
@@ -1220,11 +1271,16 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "model_name": config.model_name,
             "log_path": str(config.log_path),
             "startup_seconds": round(ready_at - started_at, 3),
-            "completion_seconds": round(completion_seconds_total, 3),
+            "completion_seconds": round(request_completed_at - request_started_at, 3),
+            "completion_case_seconds_total": round(completion_case_seconds_total, 3),
+            "completion_concurrency": config.completion_concurrency,
             "models": models,
             "completion": completion,
             "completion_cases": completion_cases,
             "generated_model": generated_model,
+            "max_model_len": config.max_model_len,
+            "max_num_seqs": config.max_num_seqs,
+            "max_num_batched_tokens": config.max_num_batched_tokens,
             "runtime_derived_pool": config.runtime_derived_pool,
             "instrument_kv_writes": config.instrument_kv_writes,
             "instrument_kv_reads": config.instrument_kv_reads,

@@ -20,6 +20,10 @@ from .bindings import KcmmError, KcmmPool
 class ReadPlanCall:
     function: str
     layer_idx: int
+    batch: int | None
+    query_shape: list[int] | None
+    block_tables_shape: list[int] | None
+    seq_lens_shape: list[int] | None
     block_table_entries: int
     block_ids_sample: list[int]
     unique_block_ids: int
@@ -131,6 +135,7 @@ class KcmmKvReadOffsetTableTracker:
         self._total_block_table_entries = 0
         self._unique_block_ids_seen: set[int] = set()
         self._max_block_id_seen: int | None = None
+        self._max_batch_seen = 0
         self._counts_by_function: dict[str, int] = {}
         self._recent_calls: list[ReadPlanCall] = []
         self._error_count = 0
@@ -207,9 +212,15 @@ class KcmmKvReadOffsetTableTracker:
     ) -> tuple[ReadPlanCall, list[int], list[int]]:
         pool = self._require_pool()
         block_tables = arguments["block_tables"]
+        query = arguments.get("query")
+        seq_lens = arguments.get("seq_lens")
         key_cache = arguments["key_cache"]
         value_cache = arguments["value_cache"]
         layer_idx = self._layer_for_cache(key_cache, value_cache)
+        query_shape = _shape(query)
+        block_tables_shape = _shape(block_tables)
+        seq_lens_shape = _shape(seq_lens)
+        batch = query_shape[0] if query_shape else None
         block_ids = _tensor_block_ids(block_tables)
         unique_ids = sorted(set(block_ids))
         max_block_id = max(unique_ids) if unique_ids else None
@@ -247,6 +258,10 @@ class KcmmKvReadOffsetTableTracker:
         call = ReadPlanCall(
             function=function_name,
             layer_idx=layer_idx,
+            batch=batch,
+            query_shape=query_shape,
+            block_tables_shape=block_tables_shape,
+            seq_lens_shape=seq_lens_shape,
             block_table_entries=len(block_ids),
             block_ids_sample=sample_ids,
             unique_block_ids=len(unique_ids),
@@ -290,6 +305,8 @@ class KcmmKvReadOffsetTableTracker:
                 self._planned_calls += 1
                 self._offset_table_builds += 1
                 self._total_block_table_entries += call.block_table_entries
+                if call.batch is not None:
+                    self._max_batch_seen = max(self._max_batch_seen, call.batch)
                 self._unique_block_ids_seen.update(unique_ids)
                 if call.max_block_id is not None:
                     self._max_block_id_seen = max(
@@ -344,6 +361,8 @@ class KcmmKvReadOffsetTableTracker:
                 self._offset_table_builds += 1
                 self._reference_read_bytes += read_bytes
                 self._total_block_table_entries += call.block_table_entries
+                if call.batch is not None:
+                    self._max_batch_seen = max(self._max_batch_seen, call.batch)
                 self._unique_block_ids_seen.update(unique_ids)
                 if call.max_block_id is not None:
                     self._max_block_id_seen = max(
@@ -576,6 +595,7 @@ class KcmmKvReadOffsetTableTracker:
                 "total_block_table_entries": self._total_block_table_entries,
                 "unique_block_ids_seen": len(self._unique_block_ids_seen),
                 "max_block_id_seen": self._max_block_id_seen,
+                "max_batch_seen": self._max_batch_seen,
                 "counts_by_function": dict(sorted(self._counts_by_function.items())),
                 "cache_layers": [
                     asdict(layer)

@@ -53,6 +53,10 @@ class GateConfig:
     prompt: str
     max_tokens: int
     coverage_cases: tuple[CompletionCase, ...]
+    max_model_len: int
+    max_num_seqs: int
+    max_num_batched_tokens: int
+    completion_concurrency: int
     build_kcmm: bool
     keep_model: bool
     print_seams: bool
@@ -74,6 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shutdown-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--max-tokens", type=int, default=4)
+    parser.add_argument("--max-model-len", type=int, default=64)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=64)
+    parser.add_argument("--completion-concurrency", type=int, default=1)
     parser.add_argument(
         "--coverage-case",
         action="append",
@@ -179,6 +187,14 @@ def coverage_cases_from_args(args: argparse.Namespace) -> tuple[CompletionCase, 
 def parse_config(argv: list[str] | None = None) -> GateConfig:
     parser = build_parser()
     args = parser.parse_args(argv)
+    for field in (
+        "max_model_len",
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "completion_concurrency",
+    ):
+        if int(getattr(args, field)) <= 0:
+            parser.error(f"--{field.replace('_', '-')} must be positive")
     try:
         coverage_cases = coverage_cases_from_args(args)
     except (argparse.ArgumentTypeError, ValueError) as exc:
@@ -201,6 +217,10 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         prompt=args.prompt,
         max_tokens=args.max_tokens,
         coverage_cases=coverage_cases,
+        max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        completion_concurrency=args.completion_concurrency,
         build_kcmm=args.build_kcmm,
         keep_model=args.keep_model,
         print_seams=args.print_seams,
@@ -237,6 +257,10 @@ def smoke_config_for_mode(
         shutdown_timeout_seconds=config.shutdown_timeout_seconds,
         prompt=config.prompt,
         max_tokens=config.max_tokens,
+        max_model_len=config.max_model_len,
+        max_num_seqs=config.max_num_seqs,
+        max_num_batched_tokens=config.max_num_batched_tokens,
+        completion_concurrency=config.completion_concurrency,
         build_kcmm=(config.build_kcmm and not is_stock),
         keep_model=True,
         print_seams=(config.print_seams and not is_stock),
@@ -381,6 +405,8 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "native_write_skipped_calls": write_report.get("native_skipped_calls"),
         "kcmm_write_verified_rows": write_report.get("verified_rows"),
         "stream_aware_write_calls": write_report.get("stream_aware_write_calls"),
+        "max_read_batch_seen": read_report.get("max_batch_seen"),
+        "max_write_batch_seen": write_report.get("max_batch_seen"),
         "write_stream_synchronize_for_verification_calls": write_report.get(
             "stream_synchronize_for_verification_calls"
         ),
@@ -740,6 +766,10 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
             }
             for case in config.coverage_cases
         ],
+        "max_model_len": config.max_model_len,
+        "max_num_seqs": config.max_num_seqs,
+        "max_num_batched_tokens": config.max_num_batched_tokens,
+        "completion_concurrency": config.completion_concurrency,
         "mode_order": list(MODE_ORDER),
         "modes": modes,
         "correctness_failures": correctness_failures,

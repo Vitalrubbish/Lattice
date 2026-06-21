@@ -122,5 +122,5 @@ The shape gate now rejects that class of variant during argument parsing.
 
 ## Next step
 
-Broaden Phase II.C from single-request shape coverage to batch and concurrency
-coverage under the supported `head_dim=64` envelope.
+Broaden Phase II.C from short batch/concurrency coverage to longer concurrent
+decode correctness under the supported `head_dim=64` envelope.

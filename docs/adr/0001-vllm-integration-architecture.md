@@ -291,8 +291,15 @@ two tiny OPT shape variants inside the currently supported local envelope:
 restricted to `head_dim=64`: this CUDA 11.8 vLLM/XFormers stack supports
 paged-attention head sizes `64`, `80`, `96`, `112`, `120`, `128`, `192`, and
 `256`, while the current KCMM GPU read kernel is limited to `head_dim <= 64`.
-The remaining work before treating this as a stable read path is batch and
-concurrency coverage, tensor parallel coverage, non-64 head dimensions after
+
+`python -m scripts.kcmm.vllm_gpu_read_batch_gate` now adds a short
+batch/concurrency gate. It runs two concurrent completion requests with
+`max_num_seqs=2`, requires the KCMM read seam to observe `max_read_batch_seen`
+of at least `2`, and compares deterministic stock-vs-KCMM outputs. The local
+short concurrent gate passes. A longer concurrent run with the same prompts and
+`max_tokens=8` already exposes a `parallel_math` completion divergence, so the
+remaining work before treating this as a stable read path is longer concurrent
+decode correctness, tensor parallel coverage, non-64 head dimensions after
 backend/kernel support is broadened, and performance optimization.
 
 The vLLM-integrated GPU read path now uses the stream-aware C ABI
@@ -304,9 +311,9 @@ compatibility wrapper. The write replacement path likewise uses
 patched write and read paths report stream handle `0`, the legacy default
 stream. Future non-default-stream scheduling must still validate that write and
 read seams are ordered by the framework stream graph or explicit CUDA events.
-The remaining Phase II.C work is broader batch and concurrency coverage,
+The remaining Phase II.C work is longer batch/concurrency correctness,
 non-default-stream coverage, tensor parallel coverage, and performance
-optimization beyond the tiny local OPT shape gate.
+optimization beyond the tiny local OPT shape and short-concurrency gates.
 
 ### CUDA context sharing risk
 

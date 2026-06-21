@@ -718,7 +718,70 @@ Latest local shape coverage result on 2026-06-20:
 - Tokens per second: stock `6.156`, KCMM `6.084`, ratio `0.988`
 - Peak GPU memory delta MiB: stock `3443`, KCMM `3455`, ratio `1.003`
 
-The next Phase II.C work is broader batch and concurrency coverage under the
+## Phase II.C GPU read-kernel batch/concurrency gate
+
+Run the batch/concurrency gate for the GPU read-kernel path:
+
+```bash
+python -m scripts.kcmm.vllm_gpu_read_batch_gate --no-build-kcmm
+```
+
+The gate starts stock vLLM and the KCMM-backed GPU read-kernel mode with:
+
+- `max_model_len=128`
+- `max_num_seqs=2`
+- `max_num_batched_tokens=128`
+- `completion_concurrency=2`
+- `require_min_read_batch=2`
+
+The default coverage cases are two concurrent completion requests:
+
+- `parallel_alpha`: `alpha beta gamma delta epsilon zeta eta theta`,
+  `max_tokens=4`
+- `parallel_math`: `Question: 2 + 2 =`, `max_tokens=4`
+
+The gate fails if stock-vs-KCMM completion text, finish reason, completion
+tokens, or total tokens differ. It also fails if the KCMM read report does not
+observe a decode batch of at least `2`.
+
+Latest local batch/concurrency result on 2026-06-21:
+
+- Command:
+  `python -m scripts.kcmm.vllm_gpu_read_batch_gate --no-build-kcmm --no-print-seams`
+- Result: `passed=true`
+- Correctness failures: `[]`
+- Performance warnings: `[]`
+- Aggregate report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-batch-1782007014826.json`
+- Run directory:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-ab-1782007014826`
+- `parallel_alpha` completion: `" Vol Vol Vol Vol"`
+- `parallel_math` completion: `"gallgallgallgall"`
+- Observed max read batch: `2`
+- Observed max write batch: `14`
+- GPU read kernel calls: `6`
+- Stream-aware read kernel calls: `6`
+- Native KV write calls skipped: `10`
+- KCMM write verified rows: `28`
+- Stream-aware KV write calls: `10`
+- Reference KCMM read bytes: `0`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+- Startup seconds: stock `13.536`, KCMM `10.528`, ratio `0.778`
+- Request latency seconds: stock `1.785`, KCMM `1.922`, ratio `1.077`
+- Tokens per second: stock `4.482`, KCMM `4.162`, ratio `0.929`
+- Peak GPU memory delta MiB: stock `3415`, KCMM `3423`, ratio `1.002`
+
+Known boundary: the same concurrent prompts with `max_tokens=8` observed
+`max_read_batch_seen=2` but diverged on `parallel_math`:
+
+- Stock: `"gallgallgallgallgallgall cord cord"`
+- KCMM: `"gallgallgallgallgallgallgallgall"`
+
+That longer concurrent decode divergence is tracked as the next Phase II.C
+correctness issue.
+
+The next Phase II.C work is longer concurrent decode correctness under the
 supported `head_dim=64` envelope, plus non-64 head-dimension support after the
 vLLM/backend/kernel constraints are broadened.
 
