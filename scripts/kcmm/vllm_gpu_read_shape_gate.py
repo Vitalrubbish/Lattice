@@ -282,6 +282,7 @@ def gate_config_for_variant(
         max_num_seqs=1,
         max_num_batched_tokens=64,
         completion_concurrency=1,
+        kv_force_non_default_stream=False,
         build_kcmm=config.build_kcmm,
         keep_model=True,
         print_seams=config.print_seams,

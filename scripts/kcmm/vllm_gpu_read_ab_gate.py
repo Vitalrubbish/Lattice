@@ -57,6 +57,7 @@ class GateConfig:
     max_num_seqs: int
     max_num_batched_tokens: int
     completion_concurrency: int
+    kv_force_non_default_stream: bool
     build_kcmm: bool
     keep_model: bool
     print_seams: bool
@@ -82,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-num-batched-tokens", type=int, default=64)
     parser.add_argument("--completion-concurrency", type=int, default=1)
+    parser.add_argument(
+        "--kv-force-non-default-stream",
+        action="store_true",
+        help=(
+            "Run KCMM write/read replacement launches through a dedicated "
+            "non-default CUDA stream with explicit stream waits."
+        ),
+    )
     parser.add_argument(
         "--coverage-case",
         action="append",
@@ -221,6 +230,7 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         completion_concurrency=args.completion_concurrency,
+        kv_force_non_default_stream=args.kv_force_non_default_stream,
         build_kcmm=args.build_kcmm,
         keep_model=args.keep_model,
         print_seams=args.print_seams,
@@ -272,6 +282,9 @@ def smoke_config_for_mode(
         kv_read_gpu_kernel_candidate=is_gpu_read,
         kv_write_mirror=False,
         kv_write_replace_candidate=is_gpu_read,
+        kv_force_non_default_stream=(
+            is_gpu_read and config.kv_force_non_default_stream
+        ),
         runtime_derived_pool=is_gpu_read,
         shadow_allocations=False,
         backed_allocations=is_gpu_read,
@@ -405,6 +418,19 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "native_write_skipped_calls": write_report.get("native_skipped_calls"),
         "kcmm_write_verified_rows": write_report.get("verified_rows"),
         "stream_aware_write_calls": write_report.get("stream_aware_write_calls"),
+        "force_non_default_stream": read_report.get("force_non_default_stream"),
+        "read_forced_non_default_stream_calls": read_report.get(
+            "forced_non_default_stream_calls"
+        ),
+        "read_last_stream_ptr": read_report.get("last_stream_ptr"),
+        "read_last_original_stream_ptr": read_report.get("last_original_stream_ptr"),
+        "read_last_default_stream_ptr": read_report.get("last_default_stream_ptr"),
+        "write_forced_non_default_stream_calls": write_report.get(
+            "forced_non_default_stream_calls"
+        ),
+        "write_last_stream_ptr": write_report.get("last_stream_ptr"),
+        "write_last_original_stream_ptr": write_report.get("last_original_stream_ptr"),
+        "write_last_default_stream_ptr": write_report.get("last_default_stream_ptr"),
         "max_read_batch_seen": read_report.get("max_batch_seen"),
         "max_write_batch_seen": write_report.get("max_batch_seen"),
         "write_stream_synchronize_for_verification_calls": write_report.get(
@@ -770,6 +796,7 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "max_num_seqs": config.max_num_seqs,
         "max_num_batched_tokens": config.max_num_batched_tokens,
         "completion_concurrency": config.completion_concurrency,
+        "kv_force_non_default_stream": config.kv_force_non_default_stream,
         "mode_order": list(MODE_ORDER),
         "modes": modes,
         "correctness_failures": correctness_failures,

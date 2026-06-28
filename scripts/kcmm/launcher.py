@@ -305,6 +305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _KV_WRITE_MIRROR_TRACKER = KcmmKvWriteMirrorTracker(
             config.kv_write_mirror_report_path,
             replace_native=config.kv_write_replace_candidate,
+            force_non_default_stream=config.kv_force_non_default_stream,
         )
         kv_write_mirror_report = apply_kv_write_mirror(_KV_WRITE_MIRROR_TRACKER)
         _print_json({"kcmm_kv_write_mirror_patch": kv_write_mirror_report})
@@ -332,6 +333,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if config.kv_read_gpu_kernel_candidate
                 else "reference"
             ),
+            force_non_default_stream=config.kv_force_non_default_stream,
         )
         kv_read_offset_table_report = apply_kv_read_offset_table(
             _KV_READ_OFFSET_TABLE_TRACKER

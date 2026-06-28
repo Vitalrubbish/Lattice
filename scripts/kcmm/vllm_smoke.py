@@ -61,6 +61,7 @@ class SmokeConfig:
     kv_read_gpu_kernel_candidate: bool
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
+    kv_force_non_default_stream: bool
     runtime_derived_pool: bool
     shadow_allocations: bool
     backed_allocations: bool
@@ -194,6 +195,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Skip native reshape_and_cache writes and write only to KCMM. "
             "This validates the Phase II.B write candidate only; Phase II.C "
             "read replacement is still required for correctness."
+        ),
+    )
+    parser.add_argument(
+        "--kv-force-non-default-stream",
+        action="store_true",
+        help=(
+            "Route KCMM KV write/read replacement launches through a dedicated "
+            "non-default CUDA stream with explicit stream waits."
         ),
     )
     parser.add_argument(
@@ -334,6 +343,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         kv_read_gpu_kernel_candidate=args.kv_read_gpu_kernel_candidate,
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
+        kv_force_non_default_stream=args.kv_force_non_default_stream,
         runtime_derived_pool=(
             args.runtime_derived_pool
             or args.shadow_allocations
@@ -343,6 +353,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
             or args.kv_read_offset_table
             or args.kv_read_replace_candidate
             or args.kv_read_gpu_kernel_candidate
+            or args.kv_force_non_default_stream
         ),
         shadow_allocations=args.shadow_allocations,
         backed_allocations=args.backed_allocations,
@@ -602,6 +613,8 @@ def vllm_command(config: SmokeConfig) -> list[str]:
                     str(config.kv_write_mirror_report_path),
                 ]
             )
+        if config.kv_force_non_default_stream:
+            command.append("--kcmm-kv-force-non-default-stream")
         if (
             config.kv_read_offset_table
             or config.kv_read_replace_candidate
@@ -870,6 +883,35 @@ def read_kv_write_mirror_report(path: Path) -> dict[str, Any]:
     return {"path": str(path), **report}
 
 
+def require_non_default_stream_report(
+    report: dict[str, Any],
+    *,
+    name: str,
+) -> None:
+    if not report.get("force_non_default_stream", False):
+        raise SmokeFailure(
+            f"{name} report did not enable forced non-default stream mode: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if report.get("forced_non_default_stream_calls", 0) <= 0:
+        raise SmokeFailure(
+            f"{name} report recorded no forced non-default stream calls: "
+            + json.dumps(report, sort_keys=True)
+        )
+    stream_ptr = report.get("last_stream_ptr")
+    default_stream_ptr = report.get("last_default_stream_ptr")
+    if not isinstance(stream_ptr, int) or stream_ptr == 0:
+        raise SmokeFailure(
+            f"{name} report did not record a non-zero stream pointer: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if isinstance(default_stream_ptr, int) and stream_ptr == default_stream_ptr:
+        raise SmokeFailure(
+            f"{name} report used the default stream despite forced mode: "
+            + json.dumps(report, sort_keys=True)
+        )
+
+
 def read_kv_read_offset_table_report(
     path: Path,
     *,
@@ -1080,7 +1122,13 @@ def terminate_server(
     ):
         raise SmokeFailure(f"port still listening after shutdown: {config.port}")
 
-    wait_process_exit(process, 0.5)
+    # vLLM can close the HTTP port before Python atexit hooks and CUDA teardown
+    # have finished. Give the process a bounded cleanup window before treating
+    # the process group as leaked.
+    wait_process_exit(
+        process,
+        max(2.0, min(5.0, config.shutdown_timeout_seconds * 0.25)),
+    )
     live_members = live_process_group_members(process.pid)
     if process.poll() is None and live_members:
         raise SmokeFailure(
@@ -1242,6 +1290,14 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "--kv-read-gpu-kernel-candidate requires --kv-write-mirror or "
             "--kv-write-replace-candidate"
         )
+    if config.kv_force_non_default_stream and not (
+        config.kv_write_mirror
+        or config.kv_write_replace_candidate
+        or config.kv_read_gpu_kernel_candidate
+    ):
+        raise SmokeFailure(
+            "--kv-force-non-default-stream requires a KCMM KV write or GPU read path"
+        )
     ensure_kcmm_library(config)
     generated_model = ensure_tiny_model(config.model_path)
     process: subprocess.Popen[None] | None = None
@@ -1289,6 +1345,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "kv_read_gpu_kernel_candidate": config.kv_read_gpu_kernel_candidate,
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,
+            "kv_force_non_default_stream": config.kv_force_non_default_stream,
             "shadow_allocations": config.shadow_allocations,
             "backed_allocations": config.backed_allocations,
         }
@@ -1313,6 +1370,8 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         result["kv_read_trace"] = read_kv_read_trace(config.kv_read_trace_path)
     if config.kv_write_mirror or config.kv_write_replace_candidate:
         report = read_kv_write_mirror_report(config.kv_write_mirror_report_path)
+        if config.kv_force_non_default_stream:
+            require_non_default_stream_report(report, name="KCMM KV write")
         if config.kv_write_replace_candidate:
             result["kv_write_replace_candidate_report"] = report
         else:
@@ -1330,6 +1389,11 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             ),
             expect_gpu_kernel=config.kv_read_gpu_kernel_candidate,
         )
+        if config.kv_force_non_default_stream and config.kv_read_gpu_kernel_candidate:
+            require_non_default_stream_report(
+                result["kv_read_offset_table_report"],
+                name="KCMM KV read",
+            )
     if config.shadow_allocations:
         result["shadow_allocator"] = read_shadow_report(config.shadow_report_path)
     if config.backed_allocations:

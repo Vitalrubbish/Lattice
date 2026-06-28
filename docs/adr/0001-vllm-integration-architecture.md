@@ -301,8 +301,9 @@ gate passes. The first long-concurrency failure was caused by vLLM passing
 materializes compact inputs on the current PyTorch CUDA stream before launching
 the stream-aware KCMM kernel on that same stream. The remaining work before
 treating this as a stable read path is tensor parallel coverage, non-64 head
-dimensions after backend/kernel support is broadened, vLLM-integrated
-non-default-stream scheduling coverage, and performance optimization.
+dimensions after backend/kernel support is broadened, framework-originated
+non-default-stream scheduling revalidation if vLLM starts invoking the patched
+seams from non-default current streams, and performance optimization.
 
 The vLLM-integrated GPU read path now uses the stream-aware C ABI
 `kcmm_paged_attn_decode_f16_on_stream`, passing PyTorch's current CUDA stream
@@ -319,12 +320,19 @@ non-default-stream `_on_stream` behavior independently of vLLM scheduling. It
 creates a real `torch.cuda.Stream()` with a non-zero handle, enqueues
 `kcmm_append_kv_slots_on_stream` and `kcmm_paged_attn_decode_f16_on_stream` on
 that same stream, synchronizes only that stream for verification, and confirms
-the decoded output matches the just-written V row. Future vLLM-integrated
-non-default-stream scheduling must still validate that patched write and read
-seams are ordered by the framework stream graph or explicit CUDA events. The
-remaining Phase II.C work is tensor parallel coverage, broader shape coverage,
-integrated non-default-stream scheduling coverage, and performance optimization
-beyond the tiny local OPT shape and batch/concurrency gates.
+the decoded output matches the just-written V row.
+
+The vLLM-integrated gate
+`python -m scripts.kcmm.vllm_gpu_read_non_default_stream_gate` now forces KCMM
+write and read replacement launches onto dedicated non-default streams while
+preserving ordering through the original PyTorch stream with `wait_stream` and
+preserving temporary tensor lifetimes with `record_stream`. This covers the
+monkey-patched integration path when KCMM work is not launched on stream `0`.
+It does not claim the current vLLM eager scheduler naturally invokes the seams
+from non-default current streams. The remaining Phase II.C work is tensor
+parallel coverage, broader shape coverage, framework-originated non-default
+stream revalidation if vLLM changes scheduling behavior, and performance
+optimization beyond the tiny local OPT shape and batch/concurrency gates.
 
 ### CUDA context sharing risk
 

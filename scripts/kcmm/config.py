@@ -132,6 +132,7 @@ class ObserverConfig:
     kv_read_replace_candidate: bool = False
     kv_read_gpu_kernel_candidate: bool = False
     kv_read_offset_table_report_path: str | None = None
+    kv_force_non_default_stream: bool = False
     shadow_allocations: bool = False
     shadow_report_path: str | None = None
     backed_allocations: bool = False
@@ -193,6 +194,9 @@ class ObserverConfig:
             ),
             kv_read_offset_table_report_path=(
                 os.environ.get("KCMM_KV_READ_OFFSET_TABLE_REPORT_PATH") or None
+            ),
+            kv_force_non_default_stream=_env_bool(
+                "KCMM_KV_FORCE_NON_DEFAULT_STREAM", False
             ),
             shadow_allocations=_env_bool("KCMM_SHADOW_ALLOCATIONS", False),
             shadow_report_path=os.environ.get("KCMM_SHADOW_REPORT_PATH") or None,
@@ -342,6 +346,15 @@ class ObserverConfig:
                 "KCMM KV read GPU kernel candidate requires KCMM KV writes via "
                 "--kcmm-kv-write-mirror or --kcmm-kv-write-replace-candidate"
             )
+        if self.kv_force_non_default_stream and not (
+            self.kv_write_mirror
+            or self.kv_write_replace_candidate
+            or self.kv_read_gpu_kernel_candidate
+        ):
+            raise ValueError(
+                "KCMM forced non-default stream mode requires a stream-aware "
+                "KV write or GPU read path"
+            )
 
     def with_runtime_sizing(self, sizing: VllmRuntimeSizing) -> "ObserverConfig":
         sizing.validate()
@@ -471,6 +484,11 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--kcmm-kv-read-offset-table-report-path", default=None)
+    parser.add_argument(
+        "--kcmm-kv-force-non-default-stream",
+        action="store_true",
+        default=None,
+    )
     parser.add_argument(
         "--kcmm-shadow-allocations",
         action="store_true",

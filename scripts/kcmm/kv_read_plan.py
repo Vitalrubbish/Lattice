@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .bindings import KcmmError, KcmmPool
+from .streaming import KcmmStreamProvider
 
 
 @dataclass
@@ -50,6 +51,9 @@ class ReadPlanCall:
     gpu_kernel_launched: bool
     stream_ptr: int | None
     stream_aware_launch: bool
+    forced_non_default_stream: bool
+    original_stream_ptr: int | None
+    default_stream_ptr: int | None
 
 
 @dataclass
@@ -144,6 +148,7 @@ class KcmmKvReadOffsetTableTracker:
         *,
         replace_native: bool = False,
         replacement_backend: str = "reference",
+        force_non_default_stream: bool = False,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
@@ -151,6 +156,9 @@ class KcmmKvReadOffsetTableTracker:
         if replacement_backend not in {"reference", "gpu_kernel"}:
             raise ValueError(f"unsupported replacement backend: {replacement_backend}")
         self._replacement_backend = replacement_backend
+        self._stream_provider = KcmmStreamProvider(
+            force_non_default=force_non_default_stream
+        )
         self._lock = threading.RLock()
         self._cache_layers: dict[tuple[int, int], CacheLayer] = {}
         self._driver: _CudaDriver | None = None
@@ -159,12 +167,16 @@ class KcmmKvReadOffsetTableTracker:
         self._replacement_calls = 0
         self._gpu_kernel_calls = 0
         self._stream_aware_kernel_calls = 0
+        self._forced_non_default_stream_calls = 0
         self._offset_table_builds = 0
         self._reference_read_bytes = 0
         self._total_block_table_entries = 0
         self._unique_block_ids_seen: set[int] = set()
         self._max_block_id_seen: int | None = None
         self._max_batch_seen = 0
+        self._last_stream_ptr: int | None = None
+        self._last_original_stream_ptr: int | None = None
+        self._last_default_stream_ptr: int | None = None
         self._counts_by_function: dict[str, int] = {}
         self._recent_calls: list[ReadPlanCall] = []
         self._error_count = 0
@@ -323,6 +335,9 @@ class KcmmKvReadOffsetTableTracker:
             gpu_kernel_launched=False,
             stream_ptr=None,
             stream_aware_launch=False,
+            forced_non_default_stream=False,
+            original_stream_ptr=None,
+            default_stream_ptr=None,
         )
         return call, offsets_f16, unique_ids
 
@@ -379,16 +394,26 @@ class KcmmKvReadOffsetTableTracker:
                     arguments,
                 )
                 if self._replacement_backend == "gpu_kernel":
-                    stream_ptr = self._run_gpu_kernel_attention(
+                    stream_info = self._run_gpu_kernel_attention(
                         layer_idx=call.layer_idx,
                         arguments=arguments,
                     )
                     read_bytes = 0
                     call.gpu_kernel_launched = True
-                    call.stream_ptr = stream_ptr
+                    call.stream_ptr = stream_info["stream_ptr"]
                     call.stream_aware_launch = True
+                    call.forced_non_default_stream = stream_info[
+                        "forced_non_default_stream"
+                    ]
+                    call.original_stream_ptr = stream_info["original_stream_ptr"]
+                    call.default_stream_ptr = stream_info["default_stream_ptr"]
                     self._gpu_kernel_calls += 1
                     self._stream_aware_kernel_calls += 1
+                    if call.forced_non_default_stream:
+                        self._forced_non_default_stream_calls += 1
+                    self._last_stream_ptr = call.stream_ptr
+                    self._last_original_stream_ptr = call.original_stream_ptr
+                    self._last_default_stream_ptr = call.default_stream_ptr
                 else:
                     read_bytes = self._run_reference_attention(
                         layer_idx=call.layer_idx,
@@ -538,7 +563,7 @@ class KcmmKvReadOffsetTableTracker:
         *,
         layer_idx: int,
         arguments: dict[str, Any],
-    ) -> int:
+    ) -> dict[str, Any]:
         self._validate_replacement_args(arguments)
 
         import torch
@@ -575,12 +600,10 @@ class KcmmKvReadOffsetTableTracker:
         device_index = getattr(device, "index", None)
         if device_index is None:
             device_index = torch.cuda.current_device()
-        stream = torch.cuda.current_stream(device_index)
-        stream_ptr = int(stream.cuda_stream)
 
         # The KCMM kernel indexes tensors by raw pointer and therefore requires
         # compact layouts. These copies enqueue on PyTorch's current stream, and
-        # the KCMM kernel below is launched on the same stream.
+        # forced non-default stream mode waits on that stream before launch.
         query = query.contiguous()
         block_tables = block_tables.contiguous()
         seq_lens = seq_lens.contiguous()
@@ -589,6 +612,15 @@ class KcmmKvReadOffsetTableTracker:
         else:
             out_tmp = out
 
+        stream_selection = self._stream_provider.select(device_index)
+        self._stream_provider.record_tensors(
+            stream_selection,
+            query,
+            block_tables,
+            seq_lens,
+            offset_table,
+            out_tmp,
+        )
         pool.paged_attn_decode_f16(
             layer_idx=layer_idx,
             query_ptr=_data_ptr(query, "query"),
@@ -603,11 +635,17 @@ class KcmmKvReadOffsetTableTracker:
             block_size=int(arguments["block_size"]),
             max_blocks_per_seq=int(block_tables_shape[1]),
             scale=float(arguments["scale"]),
-            stream_ptr=stream_ptr,
+            stream_ptr=stream_selection.stream_ptr,
         )
+        self._stream_provider.complete(stream_selection)
         if out_tmp is not out:
             out.copy_(out_tmp)
-        return stream_ptr
+        return {
+            "stream_ptr": stream_selection.stream_ptr,
+            "original_stream_ptr": stream_selection.original_stream_ptr,
+            "default_stream_ptr": stream_selection.default_stream_ptr,
+            "forced_non_default_stream": stream_selection.forced_non_default,
+        }
 
     def report(self) -> dict[str, Any]:
         with self._lock:
@@ -637,6 +675,9 @@ class KcmmKvReadOffsetTableTracker:
                         else "kcmm_reference_attention"
                     )
                 ),
+                "force_non_default_stream": (
+                    self._stream_provider.force_non_default
+                ),
                 "offset_table_contract": "torch.int64[f16_va_offset_by_block_id]",
                 "required_allocator_mode": "kcmm_backed_allocator",
                 "pool_attached": self._pool is not None,
@@ -645,12 +686,18 @@ class KcmmKvReadOffsetTableTracker:
                 "replacement_calls": self._replacement_calls,
                 "gpu_kernel_calls": self._gpu_kernel_calls,
                 "stream_aware_kernel_calls": self._stream_aware_kernel_calls,
+                "forced_non_default_stream_calls": (
+                    self._forced_non_default_stream_calls
+                ),
                 "offset_table_builds": self._offset_table_builds,
                 "reference_read_bytes": self._reference_read_bytes,
                 "total_block_table_entries": self._total_block_table_entries,
                 "unique_block_ids_seen": len(self._unique_block_ids_seen),
                 "max_block_id_seen": self._max_block_id_seen,
                 "max_batch_seen": self._max_batch_seen,
+                "last_stream_ptr": self._last_stream_ptr,
+                "last_original_stream_ptr": self._last_original_stream_ptr,
+                "last_default_stream_ptr": self._last_default_stream_ptr,
                 "counts_by_function": dict(sorted(self._counts_by_function.items())),
                 "cache_layers": [
                     asdict(layer)

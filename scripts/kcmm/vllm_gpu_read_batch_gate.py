@@ -160,6 +160,7 @@ def parse_config(argv: list[str] | None = None) -> BatchGateConfig:
             max_num_seqs=args.max_num_seqs,
             max_num_batched_tokens=args.max_num_batched_tokens,
             completion_concurrency=args.completion_concurrency,
+            kv_force_non_default_stream=False,
             build_kcmm=args.build_kcmm,
             keep_model=args.keep_model,
             print_seams=args.print_seams,

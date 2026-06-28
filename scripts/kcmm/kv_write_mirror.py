@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .bindings import KcmmError, KcmmPool
+from .streaming import KcmmStreamProvider
 
 
 @dataclass
@@ -102,11 +103,15 @@ class KcmmKvWriteMirrorTracker:
         *,
         verify_rows_per_call: int = 4,
         replace_native: bool = False,
+        force_non_default_stream: bool = False,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
         self._verify_rows_per_call = max(0, int(verify_rows_per_call))
         self._replace_native = bool(replace_native)
+        self._stream_provider = KcmmStreamProvider(
+            force_non_default=force_non_default_stream
+        )
         self._lock = threading.RLock()
         self._cache_layers: dict[tuple[int, int], CacheLayer] = {}
         self._driver: _CudaDriver | None = None
@@ -121,8 +126,11 @@ class KcmmKvWriteMirrorTracker:
         self._verified_rows = 0
         self._verification_bytes = 0
         self._stream_aware_write_calls = 0
+        self._forced_non_default_stream_calls = 0
         self._stream_synchronize_for_verification_calls = 0
         self._last_stream_ptr: int | None = None
+        self._last_original_stream_ptr: int | None = None
+        self._last_default_stream_ptr: int | None = None
         self._max_batch_seen = 0
         self._counts_by_function: dict[str, int] = {}
         self._recent_calls: list[dict[str, Any]] = []
@@ -338,26 +346,33 @@ class KcmmKvWriteMirrorTracker:
                 if _device_index(v_rows, "value") != device_index:
                     raise KcmmError("key and value are on different CUDA devices")
 
-                import torch
-
-                stream = torch.cuda.current_stream(device_index)
-                stream_ptr = int(stream.cuda_stream)
+                stream_selection = self._stream_provider.select(device_index)
+                self._stream_provider.record_tensors(
+                    stream_selection,
+                    k_rows,
+                    v_rows,
+                )
                 pool.append_kv_slots(
                     layer_idx=layer_idx,
                     slot_mapping=slots,
                     k_src_ptr=int(k_rows.data_ptr()),
                     v_src_ptr=int(v_rows.data_ptr()),
-                    stream_ptr=stream_ptr,
+                    stream_ptr=stream_selection.stream_ptr,
                 )
+                self._stream_provider.complete(stream_selection)
 
                 padding_slots = sum(1 for slot in slots if slot < 0)
                 mirrored_rows = batch - padding_slots
                 self._stream_aware_write_calls += 1
-                self._last_stream_ptr = stream_ptr
+                if stream_selection.forced_non_default:
+                    self._forced_non_default_stream_calls += 1
+                self._last_stream_ptr = stream_selection.stream_ptr
+                self._last_original_stream_ptr = stream_selection.original_stream_ptr
+                self._last_default_stream_ptr = stream_selection.default_stream_ptr
 
                 verification_synchronized = False
                 if self._verify_rows_per_call > 0 and mirrored_rows > 0:
-                    stream.synchronize()
+                    stream_selection.stream.synchronize()
                     verification_synchronized = True
                     self._stream_synchronize_for_verification_calls += 1
 
@@ -386,7 +401,14 @@ class KcmmKvWriteMirrorTracker:
                         "padding_slots": padding_slots,
                         "verified_rows": verified_rows,
                         "stream_aware_write": True,
-                        "stream_ptr": stream_ptr,
+                        "stream_ptr": stream_selection.stream_ptr,
+                        "original_stream_ptr": (
+                            stream_selection.original_stream_ptr
+                        ),
+                        "default_stream_ptr": stream_selection.default_stream_ptr,
+                        "forced_non_default_stream": (
+                            stream_selection.forced_non_default
+                        ),
                         "verification_synchronized": verification_synchronized,
                         "slot_sample": slots[:16],
                         "key_shape": _shape(key),
@@ -422,6 +444,9 @@ class KcmmKvWriteMirrorTracker:
                 ),
                 "write_path": "kcmm_append_kv_slots",
                 "stream_aware_write_path": "kcmm_append_kv_slots_on_stream",
+                "force_non_default_stream": (
+                    self._stream_provider.force_non_default
+                ),
                 "slot_formula": "slot = block_id * block_size + offset_in_block",
                 "pool_attached": self._pool is not None,
                 "write_calls": self._write_calls,
@@ -436,10 +461,15 @@ class KcmmKvWriteMirrorTracker:
                 "verified_rows": self._verified_rows,
                 "verification_bytes": self._verification_bytes,
                 "stream_aware_write_calls": self._stream_aware_write_calls,
+                "forced_non_default_stream_calls": (
+                    self._forced_non_default_stream_calls
+                ),
                 "stream_synchronize_for_verification_calls": (
                     self._stream_synchronize_for_verification_calls
                 ),
                 "last_stream_ptr": self._last_stream_ptr,
+                "last_original_stream_ptr": self._last_original_stream_ptr,
+                "last_default_stream_ptr": self._last_default_stream_ptr,
                 "max_batch_seen": self._max_batch_seen,
                 "counts_by_function": dict(sorted(self._counts_by_function.items())),
                 "cache_layers": [
