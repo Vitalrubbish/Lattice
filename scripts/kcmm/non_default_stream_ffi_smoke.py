@@ -190,8 +190,8 @@ def validate_config(config: NonDefaultStreamSmokeConfig) -> None:
         raise NonDefaultStreamSmokeFailure("kv_heads must be positive")
     if config.num_q_heads <= 0:
         raise NonDefaultStreamSmokeFailure("num_q_heads must be positive")
-    if config.head_dim <= 0 or config.head_dim > 64:
-        raise NonDefaultStreamSmokeFailure("head_dim must be in [1, 64]")
+    if config.head_dim <= 0 or config.head_dim > 256:
+        raise NonDefaultStreamSmokeFailure("head_dim must be in [1, 256]")
     if config.max_batch <= 0:
         raise NonDefaultStreamSmokeFailure("max_batch must be positive")
     if config.max_seq_len <= 0:

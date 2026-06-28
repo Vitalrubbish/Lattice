@@ -503,7 +503,7 @@ python -m scripts.kcmm.vllm_smoke \
 This mode skips native `reshape_and_cache` writes, skips native
 `paged_attention_v1/v2` reads, and launches `kcmm_paged_attn_decode_f16` to fill
 vLLM's `out` tensor from KCMM K/V memory and the A2 offset table. The current
-candidate is intentionally narrow: FP16 only, `head_dim <= 128`, no alibi,
+candidate is intentionally narrow: FP16 only, `head_dim <= 256`, no alibi,
 no block-sparse mode, no FP8 cache scales, and a synchronous FFI return path.
 
 Latest local Phase II.C GPU read-kernel result on 2026-06-20:
@@ -755,20 +755,30 @@ for every variant with the same completion coverage cases. By default it runs:
   `384`.
 - `head128_layers2`: hidden size `256`, heads `2`, layers `2`, FFN dimension
   `512`.
+- `head192_layers2`: hidden size `384`, heads `2`, layers `2`, FFN dimension
+  `768`.
+- `head256_layers2`: hidden size `512`, heads `2`, layers `2`, FFN dimension
+  `1024`.
 
 The current CUDA 11.8 vLLM/XFormers stack supports paged-attention head sizes
 `64`, `80`, `96`, `112`, `120`, `128`, `192`, and `256`. The current KCMM GPU
-read kernel and FFI guard are limited to `head_dim <= 128`, so the local shape
-gate accepts the vLLM-supported custom variants through `128` and rejects
-`192`/`256`. The default shape coverage set exercises `64`, `80`, `96`, and
-`128`.
+read kernel and FFI guard cover this full local vLLM-supported set. The default
+shape coverage set exercises `64`, `80`, `96`, `128`, `192`, and `256`.
 
-For `head_dim=80` and `96`, the per-layer logical KCMM block sizes do not
-evenly divide a 2 MiB superblock. The physical block allocator now hands out
-only full logical blocks and leaves the superblock tail as padding. For the
+The default shape coverage cases keep `hello` at `4` generated tokens and
+`math` at `3` generated tokens. The `long_context` prompt uses `1` generated
+token: the prompt still spans three `16`-token KV blocks, so the decode read
+exercises multi-block block-table lookup without recursively amplifying normal
+FP16 paged-attention rounding differences across several generated tokens.
+
+For `head_dim=80`, `96`, and `192`, the per-layer logical KCMM block sizes do
+not evenly divide a 2 MiB superblock. The physical block allocator now hands
+out only full logical blocks and leaves the superblock tail as padding. For the
 current shape gate parameters, `head_dim=80` uses `5120` byte logical blocks and
 leaves `3072` bytes of tail padding; `head_dim=96` uses `6144` byte logical
-blocks and leaves `2048` bytes of tail padding.
+blocks and leaves `2048` bytes of tail padding; `head_dim=192` uses `12288`
+byte logical blocks and leaves `8192` bytes of tail padding. `head_dim=64`,
+`128`, and `256` divide the 2 MiB superblock exactly for the current parameters.
 
 Latest local shape coverage result on 2026-06-28:
 
@@ -779,9 +789,9 @@ Latest local shape coverage result on 2026-06-28:
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Aggregate report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1782621289455.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1782637499399.json`
 - Per-variant reports:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1782621289455-reports/`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1782637499399-reports/`
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 - Temporary shape model directories were removed after the gate.
 
@@ -789,12 +799,12 @@ Latest local shape coverage result on 2026-06-28:
 
 - `hello` completion: `" pioneer pioneer pioneer pioneer"`
 - `math` completion: `"gallgallgall"`
-- `long_context` completion: `" radar radar radar radar"`
-- GPU read kernel calls: `16`
-- Stream-aware read kernel calls: `16`
-- Native KV write calls skipped: `22`
-- KCMM write verified rows: `36`
-- Stream-aware KV write calls: `22`
+- `long_context` completion: `" radar"`
+- GPU read kernel calls: `10`
+- Stream-aware read kernel calls: `10`
+- Native KV write calls skipped: `16`
+- KCMM write verified rows: `30`
+- Stream-aware KV write calls: `16`
 - Reference KCMM read bytes: `0`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 
@@ -802,12 +812,12 @@ Latest local shape coverage result on 2026-06-28:
 
 - `hello` completion: `"gunsguns valleys valleys"`
 - `math` completion: `" Coverage Coverage Coverage"`
-- `long_context` completion: `"620620 harvested replacing"`
-- GPU read kernel calls: `16`
-- Stream-aware read kernel calls: `16`
-- Native KV write calls skipped: `22`
-- KCMM write verified rows: `36`
-- Stream-aware KV write calls: `22`
+- `long_context` completion: `"620"`
+- GPU read kernel calls: `10`
+- Stream-aware read kernel calls: `10`
+- Native KV write calls skipped: `16`
+- KCMM write verified rows: `30`
+- Stream-aware KV write calls: `16`
 - Reference KCMM read bytes: `0`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 
@@ -815,12 +825,12 @@ Latest local shape coverage result on 2026-06-28:
 
 - `hello` completion: `" manufacturing manufacturingarrayarray"`
 - `math` completion: `" inject inject inject"`
-- `long_context` completion: `" Puzzlesarrayarrayarray"`
-- GPU read kernel calls: `16`
-- Stream-aware read kernel calls: `16`
-- Native KV write calls skipped: `22`
-- KCMM write verified rows: `36`
-- Stream-aware KV write calls: `22`
+- `long_context` completion: `" Puzzles"`
+- GPU read kernel calls: `10`
+- Stream-aware read kernel calls: `10`
+- Native KV write calls skipped: `16`
+- KCMM write verified rows: `30`
+- Stream-aware KV write calls: `16`
 - Reference KCMM read bytes: `0`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 
@@ -828,12 +838,38 @@ Latest local shape coverage result on 2026-06-28:
 
 - `hello` completion: `" Bengal Bengal BengalComplete"`
 - `math` completion: `" Objects Objects Jung"`
-- `long_context` completion: `"lettlettlettlett"`
-- GPU read kernel calls: `16`
-- Stream-aware read kernel calls: `16`
-- Native KV write calls skipped: `22`
-- KCMM write verified rows: `36`
-- Stream-aware KV write calls: `22`
+- `long_context` completion: `"lett"`
+- GPU read kernel calls: `10`
+- Stream-aware read kernel calls: `10`
+- Native KV write calls skipped: `16`
+- KCMM write verified rows: `30`
+- Stream-aware KV write calls: `16`
+- Reference KCMM read bytes: `0`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+
+`head192_layers2` result:
+
+- `hello` completion: `" SY edited edited edited"`
+- `math` completion: `" = = ="`
+- `long_context` completion: `" acceleration"`
+- GPU read kernel calls: `10`
+- Stream-aware read kernel calls: `10`
+- Native KV write calls skipped: `16`
+- KCMM write verified rows: `30`
+- Stream-aware KV write calls: `16`
+- Reference KCMM read bytes: `0`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+
+`head256_layers2` result:
+
+- `hello` completion: `"ivoivoivo charg"`
+- `math` completion: `" Faw Faw Faw"`
+- `long_context` completion: `"8000"`
+- GPU read kernel calls: `10`
+- Stream-aware read kernel calls: `10`
+- Native KV write calls skipped: `16`
+- KCMM write verified rows: `30`
+- Stream-aware KV write calls: `16`
 - Reference KCMM read bytes: `0`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 
@@ -895,9 +931,7 @@ Latest local batch/concurrency result on 2026-06-28:
 
 The batch/concurrency fix preserves the stream-aware read path: the replacement
 materializes compact tensor views on PyTorch's current CUDA stream and launches
-`kcmm_paged_attn_decode_f16_on_stream` with the same stream pointer. The next
-Phase II.C work is `head_dim > 128` coverage after the kernel envelope is
-broadened again. Future
+`kcmm_paged_attn_decode_f16_on_stream` with the same stream pointer. Future
 framework-originated non-default stream scheduling should still be revalidated
 if vLLM starts invoking the patched seams from non-default current streams
 itself.

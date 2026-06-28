@@ -1,6 +1,6 @@
 #include "cuda_fp16.h"
 
-#define KCMM_VLLM_PAGED_ATTN_MAX_HEAD_DIM 128
+#define KCMM_VLLM_PAGED_ATTN_MAX_HEAD_DIM 256
 
 // vLLM-facing KCMM paged attention decode kernel.
 //

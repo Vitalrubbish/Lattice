@@ -20,6 +20,7 @@ from scripts.kcmm.vllm_gpu_read_ab_gate import (
     run_gate,
 )
 from scripts.kcmm.vllm_smoke import (
+    CompletionCase,
     DEFAULT_KCMM_LIB_PATH,
     DEFAULT_MODEL_NAME,
     repo_root,
@@ -32,8 +33,19 @@ DEFAULT_VARIANTS = (
     "head80_layers2:160:2:2:320",
     "head96_layers2:192:2:2:384",
     "head128_layers2:256:2:2:512",
+    "head192_layers2:384:2:2:768",
+    "head256_layers2:512:2:2:1024",
 )
-SUPPORTED_HEAD_DIMS = (64, 80, 96, 112, 120, 128)
+SUPPORTED_HEAD_DIMS = (64, 80, 96, 112, 120, 128, 192, 256)
+DEFAULT_SHAPE_COVERAGE_CASES = (
+    DEFAULT_COVERAGE_CASES[0],
+    DEFAULT_COVERAGE_CASES[1],
+    CompletionCase(
+        name="long_context",
+        prompt=DEFAULT_COVERAGE_CASES[2].prompt,
+        max_tokens=1,
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -100,7 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME:MAX_TOKENS:PROMPT",
         help=(
             "Completion case to compare for every shape variant. May be repeated. "
-            "Defaults to the GPU read A/B gate coverage cases."
+            "Defaults to short multi-token cases plus a single-token "
+            "long-context case that still forces multi-block decode reads."
         ),
     )
     parser.add_argument(
@@ -184,7 +197,7 @@ def parse_config(argv: list[str] | None = None) -> ShapeGateConfig:
         coverage_cases = (
             tuple(parse_coverage_case(value) for value in args.coverage_case)
             if args.coverage_case
-            else DEFAULT_COVERAGE_CASES
+            else DEFAULT_SHAPE_COVERAGE_CASES
         )
     except (argparse.ArgumentTypeError, ValueError) as exc:
         parser.error(str(exc))

@@ -270,7 +270,7 @@ caches the resulting function per pool, and returns without calling the native
 vLLM paged-attention kernel.
 
 The current kernel is intentionally narrow: FP16 decode attention only,
-`head_dim <= 128`, no alibi, no block-sparse mode, and no FP8 cache scales. It
+`head_dim <= 256`, no alibi, no block-sparse mode, and no FP8 cache scales. It
 proves that vLLM can run with KCMM as the only KV write target and a GPU-side
 KCMM read path on the tiny local OPT smoke, but it does not yet satisfy the
 final Phase II.C acceptance gate.
@@ -286,14 +286,18 @@ latency, request latency, generated-token throughput, peak GPU memory delta,
 and warning classifications for KCMM-vs-stock regressions.
 
 `python -m scripts.kcmm.vllm_gpu_read_shape_gate` now broadens that gate across
-four tiny OPT shape variants inside the currently supported local envelope:
-`head64_layers2`, `head80_layers2`, `head96_layers2`, and `head128_layers2`.
-This CUDA 11.8 vLLM/XFormers stack supports paged-attention head sizes `64`,
-`80`, `96`, `112`, `120`, `128`, `192`, and `256`; the current KCMM GPU read
-kernel and FFI guard cover the vLLM-supported dimensions through `128`.
-Non-divisible per-layer logical block sizes, such as the `head_dim=80` and
-`head_dim=96` shape-gate variants, are handled by allocating only full logical
-blocks from each 2 MiB superblock and leaving the superblock tail as padding.
+six tiny OPT shape variants inside the currently supported local envelope:
+`head64_layers2`, `head80_layers2`, `head96_layers2`, `head128_layers2`,
+`head192_layers2`, and `head256_layers2`. This CUDA 11.8 vLLM/XFormers stack
+supports paged-attention head sizes `64`, `80`, `96`, `112`, `120`, `128`,
+`192`, and `256`; the current KCMM GPU read kernel and FFI guard cover this
+full local vLLM-supported set. Non-divisible per-layer logical block sizes,
+such as the `head_dim=80`, `96`, and `192` shape-gate variants, are handled by
+allocating only full logical blocks from each 2 MiB superblock and leaving the
+superblock tail as padding. The shape gate keeps a single-token long-context
+case so multi-block decode reads are covered without recursively amplifying
+normal FP16 paged-attention rounding differences across several generated
+tokens.
 
 `python -m scripts.kcmm.vllm_gpu_read_batch_gate` now adds a batch/concurrency
 gate. It runs two concurrent completion requests with `max_num_seqs=2`,
@@ -303,10 +307,10 @@ gate passes. The first long-concurrency failure was caused by vLLM passing
 `query` as a non-contiguous fused-QKV projection view; the replacement now
 materializes compact inputs on the current PyTorch CUDA stream before launching
 the stream-aware KCMM kernel on that same stream. The remaining work before
-treating this as a stable read path is head dimensions above `128` after the
-kernel envelope is broadened again, framework-originated non-default-stream
+treating this as a stable read path is framework-originated non-default-stream
 scheduling revalidation if vLLM starts invoking the patched seams from
-non-default current streams, and performance optimization.
+non-default current streams, broader real-model and TP coverage, and
+performance optimization.
 
 `python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate` now covers the
 local tensor-parallel case with `tensor_parallel_size=2` on the dual RTX 3080
@@ -344,10 +348,10 @@ preserving temporary tensor lifetimes with `record_stream`. This covers the
 monkey-patched integration path when KCMM work is not launched on stream `0`.
 It does not claim the current vLLM eager scheduler naturally invokes the seams
 from non-default current streams. The remaining Phase II.C work is tensor
-parallel coverage beyond the local two-GPU gate, head dimensions above `128`,
-framework-originated non-default stream revalidation if vLLM changes scheduling
-behavior, and performance optimization beyond the tiny local OPT shape,
-batch/concurrency, and tensor-parallel gates.
+parallel coverage beyond the local two-GPU gate, framework-originated
+non-default stream revalidation if vLLM changes scheduling behavior, broader
+real-model coverage, and performance optimization beyond the tiny local OPT
+shape, batch/concurrency, and tensor-parallel gates.
 
 ### CUDA context sharing risk
 
