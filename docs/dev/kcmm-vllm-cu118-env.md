@@ -611,8 +611,47 @@ Latest local stream-aware validation on 2026-06-20:
 The current vLLM eager seam reports stream pointer `0`, the legacy default
 stream. D2H verification still synchronizes that stream, but the integrated
 write/read replacement paths no longer require full-device synchronization per
-call. Future non-default-stream scheduling still needs explicit validation that
-write and read seams are ordered by the framework stream graph or CUDA events.
+call. The low-level FFI gate below validates non-default stream behavior for the
+KCMM `_on_stream` entrypoints. Future vLLM-integrated non-default-stream
+scheduling still needs explicit validation that write and read seams are ordered
+by the framework stream graph or CUDA events.
+
+## Phase II.C non-default-stream FFI gate
+
+Run the low-level non-default-stream gate:
+
+```bash
+python -m scripts.kcmm.non_default_stream_ffi_smoke --no-build-kcmm
+```
+
+The gate creates a real `torch.cuda.Stream()` and requires its raw CUDA handle
+to differ from the default stream handle. It then enqueues a KCMM direct-slot
+write through `kcmm_append_kv_slots_on_stream` and a KCMM GPU read through
+`kcmm_paged_attn_decode_f16_on_stream` on that same stream. The test uses a
+single-token sequence with zero query, so the expected attention output is
+exactly the V row written immediately before the read. Verification synchronizes
+only the non-default stream before comparing GPU output and KCMM D2H bytes.
+
+This gate covers the `_on_stream` FFI behavior when `stream_ptr != 0`. It does
+not force the current vLLM eager seam to schedule on a non-default stream.
+
+Latest local non-default-stream FFI result on 2026-06-28:
+
+- Command:
+  `python -m scripts.kcmm.non_default_stream_ffi_smoke --no-build-kcmm --output /tmp/kcmm-vllm-phase-ii-c-non-default-stream-1782615543.json`
+- Result: `passed=true`
+- Report: `/tmp/kcmm-vllm-phase-ii-c-non-default-stream-1782615543.json`
+- Device: `NVIDIA GeForce RTX 3080`
+- PyTorch/CUDA: `2.4.0+cu118` / `11.8`
+- Non-default stream pointer: `94207523571936`
+- Default stream pointer: `0`
+- Direct-slot write path: `kcmm_append_kv_slots_on_stream`
+- GPU read path: `kcmm_paged_attn_decode_f16_on_stream`
+- Verified direct-slot K/V rows: `1`
+- Read output matched the expected V row:
+  `[1000.0, 1001.0, 1002.0, 1003.0, 1004.0, 1005.0, 1006.0, 1007.0]`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 ## Phase II.C GPU read-kernel performance characterization
 
@@ -777,9 +816,9 @@ Latest local batch/concurrency result on 2026-06-28:
 The batch/concurrency fix preserves the stream-aware read path: the replacement
 materializes compact tensor views on PyTorch's current CUDA stream and launches
 `kcmm_paged_attn_decode_f16_on_stream` with the same stream pointer. The next
-Phase II.C work is broader non-default-stream, tensor-parallel, and non-64
-head-dimension coverage after the vLLM/backend/kernel constraints are
-broadened.
+Phase II.C work is vLLM-integrated non-default-stream scheduling coverage,
+tensor-parallel coverage, and non-64 head-dimension coverage after the
+vLLM/backend/kernel constraints are broadened.
 
 The manual steps below are the expanded form of the single-model GPU
 read-kernel check.

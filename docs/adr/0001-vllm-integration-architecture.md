@@ -301,8 +301,8 @@ gate passes. The first long-concurrency failure was caused by vLLM passing
 materializes compact inputs on the current PyTorch CUDA stream before launching
 the stream-aware KCMM kernel on that same stream. The remaining work before
 treating this as a stable read path is tensor parallel coverage, non-64 head
-dimensions after backend/kernel support is broadened, non-default-stream
-coverage, and performance optimization.
+dimensions after backend/kernel support is broadened, vLLM-integrated
+non-default-stream scheduling coverage, and performance optimization.
 
 The vLLM-integrated GPU read path now uses the stream-aware C ABI
 `kcmm_paged_attn_decode_f16_on_stream`, passing PyTorch's current CUDA stream
@@ -311,11 +311,20 @@ CUDA context. The old `kcmm_paged_attn_decode_f16` remains as a synchronous
 compatibility wrapper. The write replacement path likewise uses
 `kcmm_append_kv_slots_on_stream`. On the current local eager vLLM seam both
 patched write and read paths report stream handle `0`, the legacy default
-stream. Future non-default-stream scheduling must still validate that write and
-read seams are ordered by the framework stream graph or explicit CUDA events.
-The remaining Phase II.C work is non-default-stream coverage, tensor parallel
-coverage, broader shape coverage, and performance optimization beyond the tiny
-local OPT shape and batch/concurrency gates.
+stream.
+
+The low-level FFI gate
+`python -m scripts.kcmm.non_default_stream_ffi_smoke` now covers the
+non-default-stream `_on_stream` behavior independently of vLLM scheduling. It
+creates a real `torch.cuda.Stream()` with a non-zero handle, enqueues
+`kcmm_append_kv_slots_on_stream` and `kcmm_paged_attn_decode_f16_on_stream` on
+that same stream, synchronizes only that stream for verification, and confirms
+the decoded output matches the just-written V row. Future vLLM-integrated
+non-default-stream scheduling must still validate that patched write and read
+seams are ordered by the framework stream graph or explicit CUDA events. The
+remaining Phase II.C work is tensor parallel coverage, broader shape coverage,
+integrated non-default-stream scheduling coverage, and performance optimization
+beyond the tiny local OPT shape and batch/concurrency gates.
 
 ### CUDA context sharing risk
 
