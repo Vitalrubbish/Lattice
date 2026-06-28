@@ -45,7 +45,7 @@ decode batch and still compare deterministic stock-vs-KCMM outputs.
 - Updated `scripts/kcmm/vllm_gpu_read_shape_gate.py` to pass the new A/B gate
   sizing fields explicitly.
 
-The default batch gate runs:
+The initial batch gate slice ran:
 
 - `max_model_len=128`
 - `max_num_seqs=2`
@@ -99,16 +99,19 @@ comparison:
 - Stock completion: `"gallgallgallgallgallgall cord cord"`
 - KCMM completion: `"gallgallgallgallgallgallgallgall"`
 
-That longer-decode divergence is tracked separately by issue 12.
+That longer-decode divergence was fixed by issue 12. The default gate now uses
+the 8-token concurrent workload.
 
 ## Boundaries
 
-- This establishes a short batch/concurrency regression gate only.
-- This does not prove longer concurrent decode stability.
+- This issue established the initial short batch/concurrency regression gate.
+- Issue 12 later promoted the default batch/concurrency gate to the longer
+  8-token workload after fixing the strided-query divergence.
 - This does not cover tensor parallelism, non-default streams, non-64 head
   dimensions, prefix cache, alibi, block-sparse mode, or FP8 cache scale
   coverage.
 
 ## Next step
 
-Debug and fix the longer concurrent decode divergence tracked by issue 12.
+Broaden Phase II.C beyond the current batch/concurrency gate toward
+non-default-stream, tensor-parallel, and non-64 head-dimension coverage.

@@ -292,15 +292,17 @@ restricted to `head_dim=64`: this CUDA 11.8 vLLM/XFormers stack supports
 paged-attention head sizes `64`, `80`, `96`, `112`, `120`, `128`, `192`, and
 `256`, while the current KCMM GPU read kernel is limited to `head_dim <= 64`.
 
-`python -m scripts.kcmm.vllm_gpu_read_batch_gate` now adds a short
-batch/concurrency gate. It runs two concurrent completion requests with
-`max_num_seqs=2`, requires the KCMM read seam to observe `max_read_batch_seen`
-of at least `2`, and compares deterministic stock-vs-KCMM outputs. The local
-short concurrent gate passes. A longer concurrent run with the same prompts and
-`max_tokens=8` already exposes a `parallel_math` completion divergence, so the
-remaining work before treating this as a stable read path is longer concurrent
-decode correctness, tensor parallel coverage, non-64 head dimensions after
-backend/kernel support is broadened, and performance optimization.
+`python -m scripts.kcmm.vllm_gpu_read_batch_gate` now adds a batch/concurrency
+gate. It runs two concurrent completion requests with `max_num_seqs=2`,
+requires the KCMM read seam to observe `max_read_batch_seen` of at least `2`,
+and compares deterministic stock-vs-KCMM outputs. The local 8-token concurrent
+gate passes. The first long-concurrency failure was caused by vLLM passing
+`query` as a non-contiguous fused-QKV projection view; the replacement now
+materializes compact inputs on the current PyTorch CUDA stream before launching
+the stream-aware KCMM kernel on that same stream. The remaining work before
+treating this as a stable read path is tensor parallel coverage, non-64 head
+dimensions after backend/kernel support is broadened, non-default-stream
+coverage, and performance optimization.
 
 The vLLM-integrated GPU read path now uses the stream-aware C ABI
 `kcmm_paged_attn_decode_f16_on_stream`, passing PyTorch's current CUDA stream
@@ -311,9 +313,9 @@ compatibility wrapper. The write replacement path likewise uses
 patched write and read paths report stream handle `0`, the legacy default
 stream. Future non-default-stream scheduling must still validate that write and
 read seams are ordered by the framework stream graph or explicit CUDA events.
-The remaining Phase II.C work is longer batch/concurrency correctness,
-non-default-stream coverage, tensor parallel coverage, and performance
-optimization beyond the tiny local OPT shape and short-concurrency gates.
+The remaining Phase II.C work is non-default-stream coverage, tensor parallel
+coverage, broader shape coverage, and performance optimization beyond the tiny
+local OPT shape and batch/concurrency gates.
 
 ### CUDA context sharing risk
 

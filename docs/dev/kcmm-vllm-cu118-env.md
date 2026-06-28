@@ -737,14 +737,14 @@ The gate starts stock vLLM and the KCMM-backed GPU read-kernel mode with:
 The default coverage cases are two concurrent completion requests:
 
 - `parallel_alpha`: `alpha beta gamma delta epsilon zeta eta theta`,
-  `max_tokens=4`
-- `parallel_math`: `Question: 2 + 2 =`, `max_tokens=4`
+  `max_tokens=8`
+- `parallel_math`: `Question: 2 + 2 =`, `max_tokens=8`
 
 The gate fails if stock-vs-KCMM completion text, finish reason, completion
 tokens, or total tokens differ. It also fails if the KCMM read report does not
 observe a decode batch of at least `2`.
 
-Latest local batch/concurrency result on 2026-06-21:
+Latest local batch/concurrency result on 2026-06-28:
 
 - Command:
   `python -m scripts.kcmm.vllm_gpu_read_batch_gate --no-build-kcmm --no-print-seams`
@@ -752,38 +752,34 @@ Latest local batch/concurrency result on 2026-06-21:
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Aggregate report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-batch-1782007014826.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-batch-1782614236702.json`
 - Run directory:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-ab-1782007014826`
-- `parallel_alpha` completion: `" Vol Vol Vol Vol"`
-- `parallel_math` completion: `"gallgallgallgall"`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-ab-1782614236702`
+- `parallel_alpha` completion: `" Vol Vol Vol Vol Vol Vol Vol Vol"`
+- `parallel_math` completion: `"gallgallgallgallgallgall cord cord"`
 - Observed max read batch: `2`
 - Observed max write batch: `14`
-- GPU read kernel calls: `6`
-- Stream-aware read kernel calls: `6`
-- Native KV write calls skipped: `10`
-- KCMM write verified rows: `28`
-- Stream-aware KV write calls: `10`
+- GPU read kernel calls: `14`
+- Stream-aware read kernel calls: `14`
+- Native KV write calls skipped: `18`
+- KCMM write verified rows: `44`
+- Stream-aware KV write calls: `18`
 - Reference KCMM read bytes: `0`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
-- Startup seconds: stock `13.536`, KCMM `10.528`, ratio `0.778`
-- Request latency seconds: stock `1.785`, KCMM `1.922`, ratio `1.077`
-- Tokens per second: stock `4.482`, KCMM `4.162`, ratio `0.929`
+- Startup seconds: stock `13.537`, KCMM `10.529`, ratio `0.778`
+- Request latency seconds: stock `1.765`, KCMM `1.911`, ratio `1.083`
+- Tokens per second: stock `9.065`, KCMM `8.373`, ratio `0.924`
 - Peak GPU memory delta MiB: stock `3415`, KCMM `3423`, ratio `1.002`
+- Read-seam diagnostic sample: `query_shape=[2, 2, 64]`,
+  `query_stride=[384, 64, 1]`, and `query_is_contiguous=false`.
 
-Known boundary: the same concurrent prompts with `max_tokens=8` observed
-`max_read_batch_seen=2` but diverged on `parallel_math`:
-
-- Stock: `"gallgallgallgallgallgall cord cord"`
-- KCMM: `"gallgallgallgallgallgallgallgall"`
-
-That longer concurrent decode divergence is tracked as the next Phase II.C
-correctness issue.
-
-The next Phase II.C work is longer concurrent decode correctness under the
-supported `head_dim=64` envelope, plus non-64 head-dimension support after the
-vLLM/backend/kernel constraints are broadened.
+The batch/concurrency fix preserves the stream-aware read path: the replacement
+materializes compact tensor views on PyTorch's current CUDA stream and launches
+`kcmm_paged_attn_decode_f16_on_stream` with the same stream pointer. The next
+Phase II.C work is broader non-default-stream, tensor-parallel, and non-64
+head-dimension coverage after the vLLM/backend/kernel constraints are
+broadened.
 
 The manual steps below are the expanded form of the single-model GPU
 read-kernel check.

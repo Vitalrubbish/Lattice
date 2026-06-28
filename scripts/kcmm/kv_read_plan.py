@@ -22,8 +22,17 @@ class ReadPlanCall:
     layer_idx: int
     batch: int | None
     query_shape: list[int] | None
+    query_stride: list[int] | None
+    query_is_contiguous: bool | None
+    out_shape: list[int] | None
+    out_stride: list[int] | None
+    out_is_contiguous: bool | None
     block_tables_shape: list[int] | None
+    block_tables_stride: list[int] | None
+    block_tables_is_contiguous: bool | None
     seq_lens_shape: list[int] | None
+    seq_lens_stride: list[int] | None
+    seq_lens_is_contiguous: bool | None
     block_table_entries: int
     block_ids_sample: list[int]
     unique_block_ids: int
@@ -88,6 +97,26 @@ class _CudaDriver:
 def _shape(value: Any) -> list[int] | None:
     try:
         return [int(dim) for dim in value.shape]
+    except Exception:
+        return None
+
+
+def _stride(value: Any) -> list[int] | None:
+    method = getattr(value, "stride", None)
+    if not callable(method):
+        return None
+    try:
+        return [int(dim) for dim in method()]
+    except Exception:
+        return None
+
+
+def _is_contiguous(value: Any) -> bool | None:
+    method = getattr(value, "is_contiguous", None)
+    if not callable(method):
+        return None
+    try:
+        return bool(method())
     except Exception:
         return None
 
@@ -213,11 +242,13 @@ class KcmmKvReadOffsetTableTracker:
         pool = self._require_pool()
         block_tables = arguments["block_tables"]
         query = arguments.get("query")
+        out = arguments.get("out")
         seq_lens = arguments.get("seq_lens")
         key_cache = arguments["key_cache"]
         value_cache = arguments["value_cache"]
         layer_idx = self._layer_for_cache(key_cache, value_cache)
         query_shape = _shape(query)
+        out_shape = _shape(out)
         block_tables_shape = _shape(block_tables)
         seq_lens_shape = _shape(seq_lens)
         batch = query_shape[0] if query_shape else None
@@ -260,8 +291,17 @@ class KcmmKvReadOffsetTableTracker:
             layer_idx=layer_idx,
             batch=batch,
             query_shape=query_shape,
+            query_stride=_stride(query),
+            query_is_contiguous=_is_contiguous(query),
+            out_shape=out_shape,
+            out_stride=_stride(out),
+            out_is_contiguous=_is_contiguous(out),
             block_tables_shape=block_tables_shape,
+            block_tables_stride=_stride(block_tables),
+            block_tables_is_contiguous=_is_contiguous(block_tables),
             seq_lens_shape=seq_lens_shape,
+            seq_lens_stride=_stride(seq_lens),
+            seq_lens_is_contiguous=_is_contiguous(seq_lens),
             block_table_entries=len(block_ids),
             block_ids_sample=sample_ids,
             unique_block_ids=len(unique_ids),
@@ -535,11 +575,24 @@ class KcmmKvReadOffsetTableTracker:
         device_index = getattr(device, "index", None)
         if device_index is None:
             device_index = torch.cuda.current_device()
-        stream_ptr = int(torch.cuda.current_stream(device_index).cuda_stream)
+        stream = torch.cuda.current_stream(device_index)
+        stream_ptr = int(stream.cuda_stream)
+
+        # The KCMM kernel indexes tensors by raw pointer and therefore requires
+        # compact layouts. These copies enqueue on PyTorch's current stream, and
+        # the KCMM kernel below is launched on the same stream.
+        query = query.contiguous()
+        block_tables = block_tables.contiguous()
+        seq_lens = seq_lens.contiguous()
+        if not out.is_contiguous():
+            out_tmp = torch.empty_like(out, memory_format=torch.contiguous_format)
+        else:
+            out_tmp = out
+
         pool.paged_attn_decode_f16(
             layer_idx=layer_idx,
             query_ptr=_data_ptr(query, "query"),
-            out_ptr=_data_ptr(out, "out"),
+            out_ptr=_data_ptr(out_tmp, "out"),
             block_tables_ptr=_data_ptr(block_tables, "block_tables"),
             seq_lens_ptr=_data_ptr(seq_lens, "seq_lens"),
             block_offsets_f16_ptr=_data_ptr(offset_table, "block_offsets_f16"),
@@ -552,6 +605,8 @@ class KcmmKvReadOffsetTableTracker:
             scale=float(arguments["scale"]),
             stream_ptr=stream_ptr,
         )
+        if out_tmp is not out:
+            out.copy_(out_tmp)
         return stream_ptr
 
     def report(self) -> dict[str, Any]:

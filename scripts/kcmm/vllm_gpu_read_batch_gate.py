@@ -29,12 +29,12 @@ DEFAULT_BATCH_CASES = (
     CompletionCase(
         name="parallel_alpha",
         prompt="alpha beta gamma delta epsilon zeta eta theta",
-        max_tokens=4,
+        max_tokens=8,
     ),
     CompletionCase(
         name="parallel_math",
         prompt="Question: 2 + 2 =",
-        max_tokens=4,
+        max_tokens=8,
     ),
 )
 
