@@ -79,6 +79,7 @@ class SmokeConfig:
     max_model_len: int = 64
     max_num_seqs: int = 1
     max_num_batched_tokens: int = 64
+    tensor_parallel_size: int = 1
     completion_concurrency: int = 1
     completion_cases: tuple[CompletionCase, ...] | None = None
 
@@ -116,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-num-batched-tokens", type=int, default=64)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument(
         "--completion-concurrency",
         type=int,
@@ -273,6 +275,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         "max_model_len",
         "max_num_seqs",
         "max_num_batched_tokens",
+        "tensor_parallel_size",
         "completion_concurrency",
     ):
         if int(getattr(args, field)) <= 0:
@@ -371,6 +374,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        tensor_parallel_size=args.tensor_parallel_size,
         completion_concurrency=args.completion_concurrency,
     )
 
@@ -683,6 +687,8 @@ def vllm_command(config: SmokeConfig) -> list[str]:
             str(config.max_num_seqs),
             "--max-num-batched-tokens",
             str(config.max_num_batched_tokens),
+            "--tensor-parallel-size",
+            str(config.tensor_parallel_size),
             "--enforce-eager",
             "--max-seq-len-to-capture",
             str(config.max_model_len),
@@ -1337,6 +1343,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "max_model_len": config.max_model_len,
             "max_num_seqs": config.max_num_seqs,
             "max_num_batched_tokens": config.max_num_batched_tokens,
+            "tensor_parallel_size": config.tensor_parallel_size,
             "runtime_derived_pool": config.runtime_derived_pool,
             "instrument_kv_writes": config.instrument_kv_writes,
             "instrument_kv_reads": config.instrument_kv_reads,

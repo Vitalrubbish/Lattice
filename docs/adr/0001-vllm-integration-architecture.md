@@ -303,10 +303,21 @@ gate passes. The first long-concurrency failure was caused by vLLM passing
 `query` as a non-contiguous fused-QKV projection view; the replacement now
 materializes compact inputs on the current PyTorch CUDA stream before launching
 the stream-aware KCMM kernel on that same stream. The remaining work before
-treating this as a stable read path is tensor parallel coverage, head dimensions
-above `128` after the kernel envelope is broadened again, framework-originated
-non-default-stream scheduling revalidation if vLLM starts invoking the patched
-seams from non-default current streams, and performance optimization.
+treating this as a stable read path is head dimensions above `128` after the
+kernel envelope is broadened again, framework-originated non-default-stream
+scheduling revalidation if vLLM starts invoking the patched seams from
+non-default current streams, and performance optimization.
+
+`python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate` now covers the
+local tensor-parallel case with `tensor_parallel_size=2` on the dual RTX 3080
+machine. vLLM TP worker subprocesses inherit the KCMM monkey patches but do not
+run the driver process's `LLMEngine.__init__` runtime-pool callback, so the
+launcher also patches `Worker.initialize_cache` to attach a worker-local KCMM
+pool before model execution. TP workers receive driver-scheduler slot mappings;
+the write replacement therefore lazily ensures local KCMM block IDs from
+`slot_mapping` before appending KV rows. The local TP gate passes with matching
+stock-vs-KCMM completions, stream-aware GPU read calls, and zero CPU-staged
+reference read bytes.
 
 The vLLM-integrated GPU read path now uses the stream-aware C ABI
 `kcmm_paged_attn_decode_f16_on_stream`, passing PyTorch's current CUDA stream
@@ -333,9 +344,10 @@ preserving temporary tensor lifetimes with `record_stream`. This covers the
 monkey-patched integration path when KCMM work is not launched on stream `0`.
 It does not claim the current vLLM eager scheduler naturally invokes the seams
 from non-default current streams. The remaining Phase II.C work is tensor
-parallel coverage, broader shape coverage, framework-originated non-default
-stream revalidation if vLLM changes scheduling behavior, and performance
-optimization beyond the tiny local OPT shape and batch/concurrency gates.
+parallel coverage beyond the local two-GPU gate, head dimensions above `128`,
+framework-originated non-default stream revalidation if vLLM changes scheduling
+behavior, and performance optimization beyond the tiny local OPT shape,
+batch/concurrency, and tensor-parallel gates.
 
 ### CUDA context sharing risk
 

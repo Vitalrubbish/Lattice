@@ -284,6 +284,7 @@ def gate_config_for_variant(
         max_model_len=64,
         max_num_seqs=1,
         max_num_batched_tokens=64,
+        tensor_parallel_size=1,
         completion_concurrency=1,
         kv_force_non_default_stream=False,
         build_kcmm=config.build_kcmm,

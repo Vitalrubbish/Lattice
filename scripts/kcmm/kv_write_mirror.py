@@ -123,6 +123,8 @@ class KcmmKvWriteMirrorTracker:
         self._mirror_calls = 0
         self._mirrored_rows = 0
         self._padding_slots = 0
+        self._external_block_ensure_calls = 0
+        self._external_blocks_allocated = 0
         self._verified_rows = 0
         self._verification_bytes = 0
         self._stream_aware_write_calls = 0
@@ -161,6 +163,35 @@ class KcmmKvWriteMirrorTracker:
         if self._driver is None:
             self._driver = _CudaDriver()
         return self._driver
+
+    def _ensure_slot_blocks(self, pool: KcmmPool, slots: list[int]) -> None:
+        if not self._replace_native:
+            return
+        stats = pool.stats()
+        block_size = int(stats["block_size"])
+        block_ids = sorted({slot // block_size for slot in slots if slot >= 0})
+        if not block_ids:
+            return
+
+        allocated_blocks = 0
+        for block_id in block_ids:
+            for _attempt in range(block_id + 2):
+                try:
+                    pool.block_location(block_id)
+                    break
+                except KcmmError:
+                    total_blocks = int(pool.stats().get("total_blocks", 0))
+                    needed = max(1, block_id + 1 - total_blocks)
+                    allocated_blocks += len(pool.alloc_blocks(needed))
+            else:
+                raise KcmmError(
+                    "KCMM KV write replacement could not ensure local block "
+                    f"{block_id} before appending slot-mapped KV rows"
+                )
+
+        if allocated_blocks:
+            self._external_block_ensure_calls += 1
+            self._external_blocks_allocated += allocated_blocks
 
     def _layer_for_cache(
         self,
@@ -346,6 +377,8 @@ class KcmmKvWriteMirrorTracker:
                 if _device_index(v_rows, "value") != device_index:
                     raise KcmmError("key and value are on different CUDA devices")
 
+                self._ensure_slot_blocks(pool, slots)
+
                 stream_selection = self._stream_provider.select(device_index)
                 self._stream_provider.record_tensors(
                     stream_selection,
@@ -458,6 +491,8 @@ class KcmmKvWriteMirrorTracker:
                 "mirror_calls": self._mirror_calls,
                 "mirrored_rows": self._mirrored_rows,
                 "padding_slots": self._padding_slots,
+                "external_block_ensure_calls": self._external_block_ensure_calls,
+                "external_blocks_allocated": self._external_blocks_allocated,
                 "verified_rows": self._verified_rows,
                 "verification_bytes": self._verification_bytes,
                 "stream_aware_write_calls": self._stream_aware_write_calls,

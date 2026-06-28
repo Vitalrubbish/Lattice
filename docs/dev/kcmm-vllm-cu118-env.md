@@ -896,11 +896,62 @@ Latest local batch/concurrency result on 2026-06-28:
 The batch/concurrency fix preserves the stream-aware read path: the replacement
 materializes compact tensor views on PyTorch's current CUDA stream and launches
 `kcmm_paged_attn_decode_f16_on_stream` with the same stream pointer. The next
-Phase II.C work is tensor-parallel coverage and `head_dim > 128` coverage after
-the kernel envelope is broadened again. Future
+Phase II.C work is `head_dim > 128` coverage after the kernel envelope is
+broadened again. Future
 framework-originated non-default stream scheduling should still be revalidated
 if vLLM starts invoking the patched seams from non-default current streams
 itself.
+
+## Phase II.C GPU read-kernel tensor-parallel gate
+
+Run the tensor-parallel gate for the GPU read-kernel path:
+
+```bash
+python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate --no-build-kcmm
+```
+
+The gate wraps the stock-vs-KCMM GPU read A/B gate with
+`tensor_parallel_size=2` and serves the same tiny local OPT model on both RTX
+3080 GPUs. It compares the default `hello`, `math`, and `long_context`
+completion cases, then verifies the KCMM report used the stream-aware GPU read
+kernel and did not fall back to CPU-staged reference reads.
+
+Tensor-parallel vLLM uses worker subprocesses. These workers inherit the KCMM
+monkey patches but do not run the driver process's `LLMEngine.__init__`
+runtime-pool callback. The KCMM launcher therefore also patches
+`Worker.initialize_cache` to create and attach a worker-local KCMM pool before
+model execution. Because TP workers receive scheduler-chosen slot mappings from
+the driver process, the KV write replacement lazily ensures local KCMM block IDs
+from `slot_mapping` before appending KV rows.
+
+Latest local tensor-parallel result on 2026-06-28:
+
+- Command:
+  `python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate --no-build-kcmm --no-print-seams --timeout-seconds 240 --shutdown-timeout-seconds 45`
+- Result: `passed=true`
+- Tensor parallel size: `2`
+- Correctness failures: `[]`
+- Performance warnings: startup warning only. KCMM startup `59.111s`, stock
+  startup `17.042s`, warning threshold `34.084s`.
+- Aggregate report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-tensor-parallel-1782634782121.json`
+- Run directory:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-ab-1782634782121`
+- `hello` completion: `" pioneer pioneer pioneer pioneer"`
+- `math` completion: `"gallgallgall"`
+- `long_context` completion: `" radar radar radar radar"`
+- GPU read kernel calls: `16`
+- Stream-aware read kernel calls: `16`
+- Native KV write calls skipped: `22`
+- KCMM write verified rows: `36`
+- Stream-aware KV write calls: `22`
+- Reference KCMM read bytes: `0`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
+The worker-pool hook preserves the single-GPU path. A follow-up single-GPU A/B
+regression run passed on 2026-06-28 with report
+`/tmp/kcmm-vllm-phase-ii-c-gpu-read-ab-1782635020234.json`.
 
 The manual steps below are the expanded form of the single-model GPU
 read-kernel check.

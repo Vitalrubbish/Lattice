@@ -56,6 +56,7 @@ class GateConfig:
     max_model_len: int
     max_num_seqs: int
     max_num_batched_tokens: int
+    tensor_parallel_size: int
     completion_concurrency: int
     kv_force_non_default_stream: bool
     build_kcmm: bool
@@ -82,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-num-batched-tokens", type=int, default=64)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--completion-concurrency", type=int, default=1)
     parser.add_argument(
         "--kv-force-non-default-stream",
@@ -200,6 +202,7 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         "max_model_len",
         "max_num_seqs",
         "max_num_batched_tokens",
+        "tensor_parallel_size",
         "completion_concurrency",
     ):
         if int(getattr(args, field)) <= 0:
@@ -229,6 +232,7 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        tensor_parallel_size=args.tensor_parallel_size,
         completion_concurrency=args.completion_concurrency,
         kv_force_non_default_stream=args.kv_force_non_default_stream,
         build_kcmm=args.build_kcmm,
@@ -270,6 +274,7 @@ def smoke_config_for_mode(
         max_model_len=config.max_model_len,
         max_num_seqs=config.max_num_seqs,
         max_num_batched_tokens=config.max_num_batched_tokens,
+        tensor_parallel_size=config.tensor_parallel_size,
         completion_concurrency=config.completion_concurrency,
         build_kcmm=(config.build_kcmm and not is_stock),
         keep_model=True,
@@ -795,6 +800,7 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "max_model_len": config.max_model_len,
         "max_num_seqs": config.max_num_seqs,
         "max_num_batched_tokens": config.max_num_batched_tokens,
+        "tensor_parallel_size": config.tensor_parallel_size,
         "completion_concurrency": config.completion_concurrency,
         "kv_force_non_default_stream": config.kv_force_non_default_stream,
         "mode_order": list(MODE_ORDER),

@@ -6,6 +6,7 @@ import argparse
 import atexit
 import json
 import sys
+from dataclasses import replace
 from typing import Any, Sequence
 
 from .backed_allocator import KcmmBackedAllocationTracker
@@ -21,8 +22,9 @@ from .patch_vllm import (
     apply_kv_write_mirror,
     apply_kv_write_instrumentation,
     apply_observer_patches,
-    apply_shadow_allocator,
     apply_runtime_pool_sizing,
+    apply_shadow_allocator,
+    apply_worker_runtime_pool_sizing,
 )
 from .shadow_allocator import ShadowAllocationTracker
 
@@ -216,6 +218,85 @@ def _runtime_sizing_from_engine(engine: Any) -> VllmRuntimeSizing:
     )
 
 
+def _runtime_sizing_from_worker(
+    worker: Any,
+    *,
+    num_gpu_blocks: int,
+    num_cpu_blocks: int,
+) -> VllmRuntimeSizing:
+    try:
+        import vllm
+    except Exception:
+        vllm = None
+
+    model_config = getattr(worker, "model_config", None)
+    cache_config = getattr(worker, "cache_config", None)
+    parallel_config = getattr(worker, "parallel_config", None)
+    scheduler_config = getattr(worker, "scheduler_config", None)
+    if model_config is None:
+        raise KcmmError("vLLM worker has no model_config")
+    if cache_config is None:
+        raise KcmmError("vLLM worker has no cache_config")
+    if parallel_config is None:
+        raise KcmmError("vLLM worker has no parallel_config")
+    if scheduler_config is None:
+        raise KcmmError("vLLM worker has no scheduler_config")
+
+    pipeline_parallel_size = _required_positive_int(
+        getattr(parallel_config, "pipeline_parallel_size", None),
+        "parallel_config.pipeline_parallel_size",
+    )
+    effective_num_gpu_blocks = max(1, int(num_gpu_blocks) // pipeline_parallel_size)
+
+    try:
+        num_layers = model_config.get_num_attention_layers(parallel_config)
+        kv_heads = model_config.get_num_kv_heads(parallel_config)
+        head_dim = model_config.get_head_size()
+    except Exception as exc:
+        raise KcmmError(f"failed to derive vLLM worker KV shape: {exc}") from exc
+
+    max_num_batched_tokens = getattr(scheduler_config, "max_num_batched_tokens", 0)
+    if max_num_batched_tokens is None:
+        max_num_batched_tokens = 0
+
+    return VllmRuntimeSizing(
+        vllm_version=getattr(vllm, "__version__", "unknown"),
+        block_size=_required_positive_int(
+            getattr(cache_config, "block_size", None),
+            "cache_config.block_size",
+        ),
+        num_gpu_blocks=_required_positive_int(num_gpu_blocks, "worker.num_gpu_blocks"),
+        num_cpu_blocks=int(num_cpu_blocks or 0),
+        effective_num_gpu_blocks=effective_num_gpu_blocks,
+        num_layers=_required_positive_int(num_layers, "model_config.num_attention_layers"),
+        kv_heads=_required_positive_int(kv_heads, "model_config.num_kv_heads"),
+        head_dim=_required_positive_int(head_dim, "model_config.head_size"),
+        max_model_len=_required_positive_int(
+            getattr(model_config, "max_model_len", None),
+            "model_config.max_model_len",
+        ),
+        max_num_seqs=_required_positive_int(
+            getattr(scheduler_config, "max_num_seqs", None),
+            "scheduler_config.max_num_seqs",
+        ),
+        max_num_batched_tokens=int(max_num_batched_tokens),
+        tensor_parallel_size=_required_positive_int(
+            getattr(parallel_config, "tensor_parallel_size", None),
+            "parallel_config.tensor_parallel_size",
+        ),
+        pipeline_parallel_size=pipeline_parallel_size,
+        cache_dtype=str(getattr(cache_config, "cache_dtype", "unknown")),
+        model_dtype=str(getattr(model_config, "dtype", "unknown")),
+        use_v2_block_manager=bool(
+            getattr(scheduler_config, "use_v2_block_manager", False)
+        ),
+        enforce_eager=bool(getattr(model_config, "enforce_eager", False)),
+        enable_prefix_caching=bool(
+            getattr(cache_config, "enable_prefix_caching", False)
+        ),
+    )
+
+
 def _run_vllm(vllm_args: Sequence[str]) -> int:
     import vllm.scripts
 
@@ -349,12 +430,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not config.skip_observer and config.pool_mode == "runtime":
 
-        def create_runtime_pool(engine: Any) -> dict[str, Any]:
+        def attach_runtime_pool(
+            runtime_sizing: VllmRuntimeSizing,
+            *,
+            device_ordinal: int,
+        ) -> dict[str, Any]:
             global _ACTIVE_POOL
             if _ACTIVE_POOL is not None:
                 return {"skipped": "KCMM runtime pool already active"}
-            runtime_sizing = _runtime_sizing_from_engine(engine)
-            runtime_config = config.with_runtime_sizing(runtime_sizing)
+            runtime_config = replace(
+                config.with_runtime_sizing(runtime_sizing),
+                device_ordinal=device_ordinal,
+            )
             pool, report = _create_observer_pool(
                 runtime_config,
                 source="runtime",
@@ -379,8 +466,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_json({"observer": report})
             return report
 
+        def create_runtime_pool(engine: Any) -> dict[str, Any]:
+            runtime_sizing = _runtime_sizing_from_engine(engine)
+            return attach_runtime_pool(
+                runtime_sizing,
+                device_ordinal=config.device_ordinal,
+            )
+
+        def create_worker_runtime_pool(
+            worker: Any,
+            num_gpu_blocks: int,
+            num_cpu_blocks: int,
+        ) -> dict[str, Any]:
+            runtime_sizing = _runtime_sizing_from_worker(
+                worker,
+                num_gpu_blocks=num_gpu_blocks,
+                num_cpu_blocks=num_cpu_blocks,
+            )
+            device_ordinal = _required_positive_int(
+                int(getattr(worker, "local_rank", config.device_ordinal)) + 1,
+                "worker.local_rank_plus_one",
+            ) - 1
+            return attach_runtime_pool(
+                runtime_sizing,
+                device_ordinal=device_ordinal,
+            )
+
         runtime_pool_report = apply_runtime_pool_sizing(create_runtime_pool)
         _print_json({"kcmm_runtime_pool_sizing": runtime_pool_report})
+        worker_runtime_pool_report = apply_worker_runtime_pool_sizing(
+            create_worker_runtime_pool
+        )
+        _print_json({"kcmm_worker_runtime_pool_sizing": worker_runtime_pool_report})
 
     if config.print_seams:
         seam_report = apply_observer_patches()

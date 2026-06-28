@@ -108,6 +108,7 @@ _TRACE_SEQUENCE = 0
 _INSTRUMENTED = False
 _REQUIRE_SEAMS = False
 _RUNTIME_POOL_PATCHED = False
+_WORKER_RUNTIME_POOL_PATCHED = False
 _SHADOW_ALLOCATOR_PATCHED = False
 _KCMM_BACKED_ALLOCATOR_PATCHED = False
 _KV_WRITE_TRACE_PATH: Path | None = None
@@ -970,6 +971,40 @@ def _wrap_llm_engine_init(callback: Callable[[Any], dict[str, Any]]) -> bool:
     return True
 
 
+def _wrap_worker_initialize_cache(
+    callback: Callable[[Any, int, int], dict[str, Any]],
+) -> bool:
+    module = importlib.import_module("vllm.worker.worker")
+    cls = getattr(module, "Worker")
+    original = getattr(cls, "initialize_cache")
+    if getattr(original, "_kcmm_worker_runtime_pool_patched", False):
+        return False
+
+    @wraps(original)
+    def wrapper(self: Any, num_gpu_blocks: int, num_cpu_blocks: int) -> Any:
+        try:
+            report = callback(self, int(num_gpu_blocks), int(num_cpu_blocks))
+        except BaseException as exc:
+            print(
+                "KCMM worker runtime-derived pool initialization failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        _write_trace(
+            {
+                "event": "worker_runtime_pool_sized",
+                "report": _safe_summary(report),
+            }
+        )
+        return original(self, num_gpu_blocks, num_cpu_blocks)
+
+    wrapper._kcmm_worker_runtime_pool_patched = True  # type: ignore[attr-defined]
+    setattr(cls, "initialize_cache", wrapper)
+    return True
+
+
 def _is_gpu_device(device: Any) -> bool:
     try:
         from vllm.core.block.interfaces import Device
@@ -1215,6 +1250,29 @@ def apply_runtime_pool_sizing(
         "patched": True,
         "observer_only": True,
         "target": "vllm.engine.llm_engine.LLMEngine.__init__",
+        "new_patch_installed": patched,
+        "seam_report": report,
+    }
+
+
+def apply_worker_runtime_pool_sizing(
+    callback: Callable[[Any, int, int], dict[str, Any]],
+) -> dict[str, object]:
+    """Patch vLLM workers so TP subprocesses attach their own KCMM pool."""
+
+    global _WORKER_RUNTIME_POOL_PATCHED
+
+    report = inspect_vllm_seams()
+    patched = False
+    if not _WORKER_RUNTIME_POOL_PATCHED:
+        patched = _wrap_worker_initialize_cache(callback)
+        _WORKER_RUNTIME_POOL_PATCHED = True
+
+    return {
+        "phase": "II.C",
+        "patched": True,
+        "observer_only": True,
+        "target": "vllm.worker.worker.Worker.initialize_cache",
         "new_patch_installed": patched,
         "seam_report": report,
     }
