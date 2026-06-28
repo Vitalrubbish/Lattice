@@ -29,9 +29,11 @@ from scripts.kcmm.vllm_smoke import (
 
 DEFAULT_VARIANTS = (
     "head64_layers2:128:2:2:256",
-    "head64_heads4_layers3:256:4:3:512",
+    "head80_layers2:160:2:2:320",
+    "head96_layers2:192:2:2:384",
+    "head128_layers2:256:2:2:512",
 )
-SUPPORTED_HEAD_DIMS = (64,)
+SUPPORTED_HEAD_DIMS = (64, 80, 96, 112, 120, 128)
 
 
 @dataclass(frozen=True)
@@ -153,8 +155,9 @@ def parse_variant(value: str) -> ShapeVariant:
     head_dim = hidden_size // num_heads
     if head_dim not in SUPPORTED_HEAD_DIMS:
         raise argparse.ArgumentTypeError(
-            "variant head_dim must be 64 for this CUDA 11.8 vLLM/XFormers "
-            "stack and the current GPU read kernel"
+            "variant head_dim must be one of "
+            f"{SUPPORTED_HEAD_DIMS} for this CUDA 11.8 vLLM/XFormers stack "
+            "and the current GPU read kernel"
         )
     return ShapeVariant(
         name=name,

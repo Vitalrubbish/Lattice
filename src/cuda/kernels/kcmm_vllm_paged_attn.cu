@@ -1,5 +1,7 @@
 #include "cuda_fp16.h"
 
+#define KCMM_VLLM_PAGED_ATTN_MAX_HEAD_DIM 128
+
 // vLLM-facing KCMM paged attention decode kernel.
 //
 // All pointer arguments are passed as integer CUDA virtual addresses so this
@@ -43,8 +45,8 @@ extern "C" __global__ void kcmm_vllm_paged_attn_decode_f16(
 
     float m = -1e30f;
     float s = 0.0f;
-    float acc[64];
-    float q_val[64];
+    float acc[KCMM_VLLM_PAGED_ATTN_MAX_HEAD_DIM];
+    float q_val[KCMM_VLLM_PAGED_ATTN_MAX_HEAD_DIM];
     for (int d = 0; d < head_dim; d++) {
         acc[d] = 0.0f;
     }

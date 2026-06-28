@@ -496,7 +496,7 @@ int kcmm_append_kv_slots_on_stream(kcmm_pool_t *pool, uint32_t layer_idx,
  * @param batch                 Number of sequences.
  * @param num_q_heads           Number of query heads.
  * @param kv_heads              Number of KV heads.
- * @param head_dim              Attention head dimension. Current kernel max: 64.
+ * @param head_dim              Attention head dimension. Current kernel max: 128.
  * @param block_size            Tokens per KV block.
  * @param max_blocks_per_seq    Columns in `block_tables`.
  * @param scale                 Attention scale.

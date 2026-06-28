@@ -503,7 +503,7 @@ python -m scripts.kcmm.vllm_smoke \
 This mode skips native `reshape_and_cache` writes, skips native
 `paged_attention_v1/v2` reads, and launches `kcmm_paged_attn_decode_f16` to fill
 vLLM's `out` tensor from KCMM K/V memory and the A2 offset table. The current
-candidate is intentionally narrow: FP16 only, `head_dim <= 64`, no alibi,
+candidate is intentionally narrow: FP16 only, `head_dim <= 128`, no alibi,
 no block-sparse mode, no FP8 cache scales, and a synchronous FFI return path.
 
 Latest local Phase II.C GPU read-kernel result on 2026-06-20:
@@ -749,15 +749,28 @@ for every variant with the same completion coverage cases. By default it runs:
 
 - `head64_layers2`: hidden size `128`, heads `2`, layers `2`, FFN dimension
   `256`.
-- `head64_heads4_layers3`: hidden size `256`, heads `4`, layers `3`, FFN
-  dimension `512`.
+- `head80_layers2`: hidden size `160`, heads `2`, layers `2`, FFN dimension
+  `320`.
+- `head96_layers2`: hidden size `192`, heads `2`, layers `2`, FFN dimension
+  `384`.
+- `head128_layers2`: hidden size `256`, heads `2`, layers `2`, FFN dimension
+  `512`.
 
 The current CUDA 11.8 vLLM/XFormers stack supports paged-attention head sizes
 `64`, `80`, `96`, `112`, `120`, `128`, `192`, and `256`. The current KCMM GPU
-read kernel is limited to `head_dim <= 64`, so the local shape gate rejects
-variants outside the overlap: `head_dim=64`.
+read kernel and FFI guard are limited to `head_dim <= 128`, so the local shape
+gate accepts the vLLM-supported custom variants through `128` and rejects
+`192`/`256`. The default shape coverage set exercises `64`, `80`, `96`, and
+`128`.
 
-Latest local shape coverage result on 2026-06-20:
+For `head_dim=80` and `96`, the per-layer logical KCMM block sizes do not
+evenly divide a 2 MiB superblock. The physical block allocator now hands out
+only full logical blocks and leaves the superblock tail as padding. For the
+current shape gate parameters, `head_dim=80` uses `5120` byte logical blocks and
+leaves `3072` bytes of tail padding; `head_dim=96` uses `6144` byte logical
+blocks and leaves `2048` bytes of tail padding.
+
+Latest local shape coverage result on 2026-06-28:
 
 - Command:
   `python -m scripts.kcmm.vllm_gpu_read_shape_gate --no-build-kcmm --no-print-seams`
@@ -766,9 +779,9 @@ Latest local shape coverage result on 2026-06-20:
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Aggregate report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1781964629065.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1782621289455.json`
 - Per-variant reports:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1781964629065-reports/`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-shape-gate-1782621289455-reports/`
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 - Temporary shape model directories were removed after the gate.
 
@@ -784,27 +797,45 @@ Latest local shape coverage result on 2026-06-20:
 - Stream-aware KV write calls: `22`
 - Reference KCMM read bytes: `0`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
-- Startup seconds: stock `13.537`, KCMM `10.532`, ratio `0.778`
-- Request latency seconds: stock `1.784`, KCMM `1.951`, ratio `1.094`
-- Tokens per second: stock `6.166`, KCMM `5.638`, ratio `0.914`
-- Peak GPU memory delta MiB: stock `3417`, KCMM `3425`, ratio `1.002`
 
-`head64_heads4_layers3` result:
+`head80_layers2` result:
 
-- `hello` completion: `" playoff playoff playoff playoff"`
-- `math` completion: `" MORE MORE MORE"`
-- `long_context` completion: `" belts belts belts belts"`
-- GPU read kernel calls: `24`
-- Stream-aware read kernel calls: `24`
-- Native KV write calls skipped: `33`
-- KCMM write verified rows: `54`
-- Stream-aware KV write calls: `33`
+- `hello` completion: `"gunsguns valleys valleys"`
+- `math` completion: `" Coverage Coverage Coverage"`
+- `long_context` completion: `"620620 harvested replacing"`
+- GPU read kernel calls: `16`
+- Stream-aware read kernel calls: `16`
+- Native KV write calls skipped: `22`
+- KCMM write verified rows: `36`
+- Stream-aware KV write calls: `22`
 - Reference KCMM read bytes: `0`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
-- Startup seconds: stock `11.546`, KCMM `8.525`, ratio `0.738`
-- Request latency seconds: stock `1.787`, KCMM `1.808`, ratio `1.012`
-- Tokens per second: stock `6.156`, KCMM `6.084`, ratio `0.988`
-- Peak GPU memory delta MiB: stock `3443`, KCMM `3455`, ratio `1.003`
+
+`head96_layers2` result:
+
+- `hello` completion: `" manufacturing manufacturingarrayarray"`
+- `math` completion: `" inject inject inject"`
+- `long_context` completion: `" Puzzlesarrayarrayarray"`
+- GPU read kernel calls: `16`
+- Stream-aware read kernel calls: `16`
+- Native KV write calls skipped: `22`
+- KCMM write verified rows: `36`
+- Stream-aware KV write calls: `22`
+- Reference KCMM read bytes: `0`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+
+`head128_layers2` result:
+
+- `hello` completion: `" Bengal Bengal BengalComplete"`
+- `math` completion: `" Objects Objects Jung"`
+- `long_context` completion: `"lettlettlettlett"`
+- GPU read kernel calls: `16`
+- Stream-aware read kernel calls: `16`
+- Native KV write calls skipped: `22`
+- KCMM write verified rows: `36`
+- Stream-aware KV write calls: `22`
+- Reference KCMM read bytes: `0`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
 
 ## Phase II.C GPU read-kernel batch/concurrency gate
 
@@ -840,9 +871,9 @@ Latest local batch/concurrency result on 2026-06-28:
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Aggregate report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-batch-1782614236702.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-batch-1782621793642.json`
 - Run directory:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-ab-1782614236702`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-ab-1782621793642`
 - `parallel_alpha` completion: `" Vol Vol Vol Vol Vol Vol Vol Vol"`
 - `parallel_math` completion: `"gallgallgallgallgallgall cord cord"`
 - Observed max read batch: `2`
@@ -855,9 +886,9 @@ Latest local batch/concurrency result on 2026-06-28:
 - Reference KCMM read bytes: `0`
 - Final KCMM pool stats recorded `blocks_in_use=0`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
-- Startup seconds: stock `13.537`, KCMM `10.529`, ratio `0.778`
-- Request latency seconds: stock `1.765`, KCMM `1.911`, ratio `1.083`
-- Tokens per second: stock `9.065`, KCMM `8.373`, ratio `0.924`
+- Startup seconds: stock `13.540`, KCMM `10.529`, ratio `0.778`
+- Request latency seconds: stock `1.765`, KCMM `1.940`, ratio `1.099`
+- Tokens per second: stock `9.065`, KCMM `8.247`, ratio `0.910`
 - Peak GPU memory delta MiB: stock `3415`, KCMM `3423`, ratio `1.002`
 - Read-seam diagnostic sample: `query_shape=[2, 2, 64]`,
   `query_stride=[384, 64, 1]`, and `query_is_contiguous=false`.
@@ -865,8 +896,8 @@ Latest local batch/concurrency result on 2026-06-28:
 The batch/concurrency fix preserves the stream-aware read path: the replacement
 materializes compact tensor views on PyTorch's current CUDA stream and launches
 `kcmm_paged_attn_decode_f16_on_stream` with the same stream pointer. The next
-Phase II.C work is tensor-parallel coverage and non-64 head-dimension coverage
-after the vLLM/backend/kernel constraints are broadened. Future
+Phase II.C work is tensor-parallel coverage and `head_dim > 128` coverage after
+the kernel envelope is broadened again. Future
 framework-originated non-default stream scheduling should still be revalidated
 if vLLM starts invoking the patched seams from non-default current streams
 itself.

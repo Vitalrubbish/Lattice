@@ -1374,9 +1374,9 @@ unsafe fn kcmm_paged_attn_decode_f16_impl(
         );
         return -1;
     }
-    if head_dim > 64 {
+    if head_dim > 128 {
         pool_from_ptr(pool).set_error(format!(
-            "kcmm_paged_attn_decode_f16: head_dim {} exceeds kernel limit 64",
+            "kcmm_paged_attn_decode_f16: head_dim {} exceeds kernel limit 128",
             head_dim
         ));
         return -1;

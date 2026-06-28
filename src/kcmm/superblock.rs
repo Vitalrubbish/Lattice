@@ -34,7 +34,9 @@ pub struct BlockHandle {
 ///
 /// Manages a free list of blocks. When the free list is exhausted,
 /// the caller must add a new superblock (which populates the free list
-/// with `blocks_per_superblock` new blocks).
+/// with `blocks_per_superblock` new blocks). If `block_bytes` does not evenly
+/// divide 2 MiB, the unused tail of each superblock is padding and is never
+/// handed out as a block.
 pub struct PhysicalBlockAllocator {
     /// Size of each block in bytes.
     pub block_bytes: usize,
@@ -52,16 +54,11 @@ impl PhysicalBlockAllocator {
     /// Computes `block_bytes` and `blocks_per_superblock` from `elem_count`.
     pub fn new(elem_count: usize) -> Self {
         let block_bytes = elem_count * std::mem::size_of::<f16>();
+        assert!(block_bytes > 0, "block_bytes must be positive");
         let blocks_per_superblock = SUPERBLOCK_SIZE / block_bytes;
         assert!(
             blocks_per_superblock > 0,
             "block_bytes ({}) too large; reduce BLOCK_SIZE or model dims",
-            block_bytes
-        );
-        assert_eq!(
-            SUPERBLOCK_SIZE % block_bytes,
-            0,
-            "block_bytes ({}) must divide superblock evenly",
             block_bytes
         );
 
@@ -78,15 +75,11 @@ impl PhysicalBlockAllocator {
     /// This is useful for KCMM pools where the block size is configured
     /// directly rather than derived from model dimensions.
     pub fn new_with_block_bytes(block_bytes: usize) -> Self {
+        assert!(block_bytes > 0, "block_bytes must be positive");
         let blocks_per_superblock = SUPERBLOCK_SIZE / block_bytes;
         assert!(
             blocks_per_superblock > 0,
             "block_bytes ({}) too large for superblock", block_bytes
-        );
-        assert_eq!(
-            SUPERBLOCK_SIZE % block_bytes,
-            0,
-            "block_bytes ({}) must divide superblock evenly", block_bytes
         );
 
         Self {
@@ -140,6 +133,11 @@ impl PhysicalBlockAllocator {
     /// Number of superblocks added to this allocator.
     pub fn superblock_count(&self) -> usize {
         *self.superblock_count.lock()
+    }
+
+    /// Bytes at the end of each 2 MiB superblock that cannot hold a full block.
+    pub fn tail_padding_bytes_per_superblock(&self) -> usize {
+        SUPERBLOCK_SIZE - self.blocks_per_superblock * self.block_bytes
     }
 }
 
@@ -282,6 +280,25 @@ mod tests {
             0,
             "block_bytes must divide superblock evenly"
         );
+    }
+
+    #[test]
+    fn test_non_divisible_block_bytes_use_tail_padding() {
+        let alloc = PhysicalBlockAllocator::new_with_block_bytes(5120);
+        assert_eq!(alloc.blocks_per_superblock, 409);
+        assert_eq!(alloc.tail_padding_bytes_per_superblock(), 3072);
+        assert!(
+            alloc.tail_padding_bytes_per_superblock() < alloc.block_bytes,
+            "tail padding should be smaller than one logical block"
+        );
+
+        alloc.add_superblock();
+        assert_eq!(alloc.free_count(), 409);
+        let mut max_block_index = 0;
+        while let Some(handle) = alloc.try_allocate() {
+            max_block_index = max_block_index.max(handle.block_index);
+        }
+        assert_eq!(max_block_index, 408);
     }
 
     #[test]
@@ -443,18 +460,18 @@ mod tests {
         assert_eq!(r2, h1, "LIFO: first freed (h1) should be returned second");
     }
 
-    // --- Misaligned block_bytes test for new() ---
+    // --- Non-divisible block_bytes test for new() ---
 
     #[test]
-    fn test_new_rejects_misaligned_block_bytes() {
-        // 2 MiB / odd_block_bytes → not evenly divisible
-        // SUPERBLOCK_SIZE = 2 * 1024 * 1024 = 2,097,152
-        // Choose 3 * 2 * 1000 = 6000 bytes → 2,097,152 % 6000 = 1,152 ≠ 0
+    fn test_new_allows_non_divisible_block_bytes() {
+        // 2 MiB / odd_block_bytes is not evenly divisible. The allocator uses
+        // all full blocks and leaves the trailing bytes as padding.
         let odd_bytes = 6000;
-        let result = std::panic::catch_unwind(|| {
-            PhysicalBlockAllocator::new_with_block_bytes(odd_bytes);
-        });
-        assert!(result.is_err(),
-            "block_bytes not dividing superblock evenly should panic");
+        let alloc = PhysicalBlockAllocator::new_with_block_bytes(odd_bytes);
+        assert_eq!(alloc.blocks_per_superblock, SUPERBLOCK_SIZE / odd_bytes);
+        assert_eq!(
+            alloc.tail_padding_bytes_per_superblock(),
+            SUPERBLOCK_SIZE % odd_bytes
+        );
     }
 }
