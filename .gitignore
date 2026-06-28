@@ -13,3 +13,5 @@ __pycache__/
 cufile.log
 scripts/load_trace_qwen.sh
 docs/task/kcmm-kernel-modifications.md
+.local/
+.scratch/kcmm-vllm/
