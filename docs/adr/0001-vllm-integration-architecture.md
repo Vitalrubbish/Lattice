@@ -321,8 +321,15 @@ materializes compact inputs on the current PyTorch CUDA stream before launching
 the stream-aware KCMM kernel on that same stream. The remaining work before
 treating this as a stable read path is framework-originated non-default-stream
 scheduling revalidation if vLLM starts invoking the patched seams from
-non-default current streams, broader real-model and TP coverage, and
-performance optimization.
+non-default current streams, broader real-model coverage beyond the first
+OPT-125m gate, broader TP coverage, and performance optimization.
+
+`python -m scripts.kcmm.vllm_gpu_read_real_model_gate` now adds the first
+non-generated model gate. The local run downloaded and served
+`facebook/opt-125m`, compared short deterministic stock-vs-KCMM completions,
+and verified the KCMM path used the stream-aware GPU read kernel with zero
+CPU-staged reference read bytes. This moves Phase II.C beyond generated tiny
+OPT models, but it is still only the first real-model coverage slice.
 
 `python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate` now covers the
 local tensor-parallel case with `tensor_parallel_size=2` on the dual RTX 3080
@@ -362,9 +369,9 @@ It does not claim the current vLLM eager scheduler naturally invokes the seams
 from non-default current streams. The remaining Phase II.C work is tensor
 parallel coverage beyond the local two-GPU gate, framework-originated
 non-default stream revalidation if vLLM changes scheduling behavior, broader
-real-model coverage, and performance optimization using the per-call profiling
-data beyond the tiny local OPT shape, batch/concurrency, and tensor-parallel
-gates.
+real-model coverage beyond the first `facebook/opt-125m` gate, and performance
+optimization using the per-call profiling data beyond the local tiny OPT and
+first real-model gates.
 
 ### CUDA context sharing risk
 

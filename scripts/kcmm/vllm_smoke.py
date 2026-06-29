@@ -52,6 +52,7 @@ class SmokeConfig:
     max_tokens: int
     build_kcmm: bool
     keep_model: bool
+    generate_tiny_model: bool
     print_seams: bool
     instrument_allocators: bool
     instrument_kv_writes: bool
@@ -80,6 +81,7 @@ class SmokeConfig:
     max_model_len: int = 64
     max_num_seqs: int = 1
     max_num_batched_tokens: int = 64
+    gpu_memory_utilization: float = 0.25
     tensor_parallel_size: int = 1
     completion_concurrency: int = 1
     completion_cases: tuple[CompletionCase, ...] | None = None
@@ -118,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-num-batched-tokens", type=int, default=64)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument(
         "--completion-concurrency",
@@ -135,6 +138,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-model",
         action="store_true",
         help="Keep the generated tiny model after the smoke run.",
+    )
+    parser.add_argument(
+        "--generate-tiny-model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Generate the local tiny OPT model when --model-path is missing. "
+            "Disable this for externally supplied real model directories."
+        ),
     )
     parser.add_argument(
         "--print-seams",
@@ -289,6 +301,8 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
     ):
         if int(getattr(args, field)) <= 0:
             parser.error(f"--{field.replace('_', '-')} must be positive")
+    if args.gpu_memory_utilization <= 0 or args.gpu_memory_utilization > 1:
+        parser.error("--gpu-memory-utilization must be in the range (0, 1]")
     log_path = (
         Path(args.log_path)
         if args.log_path
@@ -346,6 +360,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         max_tokens=args.max_tokens,
         build_kcmm=args.build_kcmm,
         keep_model=args.keep_model,
+        generate_tiny_model=args.generate_tiny_model,
         print_seams=args.print_seams,
         instrument_allocators=args.instrument_allocators,
         instrument_kv_writes=args.instrument_kv_writes,
@@ -385,6 +400,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
         completion_concurrency=args.completion_concurrency,
     )
@@ -591,6 +607,17 @@ def ensure_tiny_model(model_path: Path) -> bool:
     return True
 
 
+def ensure_model(config: SmokeConfig) -> bool:
+    if config.generate_tiny_model:
+        return ensure_tiny_model(config.model_path)
+    if not config.model_path.exists():
+        raise SmokeFailure(
+            "model path does not exist and tiny model generation is disabled: "
+            f"{config.model_path}"
+        )
+    return False
+
+
 def vllm_command(config: SmokeConfig) -> list[str]:
     command = [sys.executable, "-m", "scripts.kcmm"]
     if config.mode == "stock":
@@ -695,7 +722,7 @@ def vllm_command(config: SmokeConfig) -> list[str]:
             "--max-model-len",
             str(config.max_model_len),
             "--gpu-memory-utilization",
-            "0.25",
+            str(config.gpu_memory_utilization),
             "--max-num-seqs",
             str(config.max_num_seqs),
             "--max-num-batched-tokens",
@@ -1343,7 +1370,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "--kv-force-non-default-stream requires a KCMM KV write or GPU read path"
         )
     ensure_kcmm_library(config)
-    generated_model = ensure_tiny_model(config.model_path)
+    generated_model = ensure_model(config)
     process: subprocess.Popen[None] | None = None
     gpu_monitor = GpuMemoryMonitor()
     gpu_monitor.start()
@@ -1381,7 +1408,9 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "max_model_len": config.max_model_len,
             "max_num_seqs": config.max_num_seqs,
             "max_num_batched_tokens": config.max_num_batched_tokens,
+            "gpu_memory_utilization": config.gpu_memory_utilization,
             "tensor_parallel_size": config.tensor_parallel_size,
+            "generate_tiny_model": config.generate_tiny_model,
             "runtime_derived_pool": config.runtime_derived_pool,
             "instrument_kv_writes": config.instrument_kv_writes,
             "instrument_kv_reads": config.instrument_kv_reads,

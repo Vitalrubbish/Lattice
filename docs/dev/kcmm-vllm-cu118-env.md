@@ -1040,6 +1040,60 @@ The worker-pool hook preserves the single-GPU path. A follow-up single-GPU A/B
 regression run passed on 2026-06-28 with report
 `/tmp/kcmm-vllm-phase-ii-c-gpu-read-ab-1782635020234.json`.
 
+## Phase II.C GPU read-kernel real-model gate
+
+Run the first real-model gate for the GPU read-kernel path:
+
+```bash
+python -m scripts.kcmm.vllm_gpu_read_real_model_gate \
+  --download-model \
+  --no-build-kcmm
+```
+
+The gate downloads `facebook/opt-125m` into
+`.scratch/kcmm-vllm/real-models/facebook--opt-125m` unless an existing
+`--model-path` is supplied. It then reuses the stock-vs-KCMM GPU read A/B
+harness with tiny-model generation disabled, so real model directories are not
+overwritten by `create_tiny_opt_model.py`.
+
+The default real-model coverage cases are short by design:
+
+- `hello`: `Hello`, `max_tokens=2`
+- `math`: `Question: 2 + 2 =`, `max_tokens=2`
+
+This is the first real-model coverage slice. It proves the replacement path can
+serve a non-generated vLLM/Hugging Face model locally, but it does not yet claim
+broad model compatibility.
+
+Latest local real-model result on 2026-06-29:
+
+- Command:
+  `python -m scripts.kcmm.vllm_gpu_read_real_model_gate --download-model --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60`
+- Result: `passed=true`
+- Report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-real-model-1782719715998.json`
+- Model: `facebook/opt-125m`
+- Local model path:
+  `.scratch/kcmm-vllm/real-models/facebook--opt-125m`
+- Correctness failures: `[]`
+- Performance warnings: `[]`
+- `hello` completion: `", I"`
+- `math` completion: `" -2"`
+- Aggregate completion tokens: `4`
+- Aggregate total tokens: `13`
+- Read path: `kcmm_paged_attn_decode_f16`
+- Replacement backend: `gpu_kernel`
+- GPU read kernel calls: `24`
+- Stream-aware read kernel calls: `24`
+- Reference KCMM read bytes: `0`
+- Native KV write calls skipped: `48`
+- KCMM write verified rows: `96`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+- Peak GPU memory delta MiB: stock `5441`, KCMM `5591`, ratio `1.028`
+- Request latency seconds: stock `1.729`, KCMM `2.233`, ratio `1.291`
+- Tokens per second: stock `2.313`, KCMM `1.791`, ratio `0.774`
+
 The manual steps below are the expanded form of the single-model GPU
 read-kernel check.
 

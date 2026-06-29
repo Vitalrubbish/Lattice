@@ -167,6 +167,7 @@ def smoke_config_for_mode(
         max_tokens=config.max_tokens,
         build_kcmm=(config.build_kcmm and not is_stock),
         keep_model=True,
+        generate_tiny_model=True,
         print_seams=(config.print_seams and not is_stock),
         instrument_allocators=False,
         instrument_kv_writes=False,

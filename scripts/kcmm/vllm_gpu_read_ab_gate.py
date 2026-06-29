@@ -50,12 +50,14 @@ class GateConfig:
     kcmm_lib_path: Path
     timeout_seconds: float
     shutdown_timeout_seconds: float
+    generate_tiny_model: bool
     prompt: str
     max_tokens: int
     coverage_cases: tuple[CompletionCase, ...]
     max_model_len: int
     max_num_seqs: int
     max_num_batched_tokens: int
+    gpu_memory_utilization: float
     tensor_parallel_size: int
     completion_concurrency: int
     kv_force_non_default_stream: bool
@@ -79,11 +81,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kcmm-lib-path", default=DEFAULT_KCMM_LIB_PATH)
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     parser.add_argument("--shutdown-timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--generate-tiny-model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Generate the local tiny OPT model when --model-path is missing. "
+            "Disable this for externally supplied real model directories."
+        ),
+    )
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument("--max-model-len", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-num-batched-tokens", type=int, default=64)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--completion-concurrency", type=int, default=1)
     parser.add_argument(
@@ -216,6 +228,8 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
     ):
         if int(getattr(args, field)) <= 0:
             parser.error(f"--{field.replace('_', '-')} must be positive")
+    if args.gpu_memory_utilization <= 0 or args.gpu_memory_utilization > 1:
+        parser.error("--gpu-memory-utilization must be in the range (0, 1]")
     try:
         coverage_cases = coverage_cases_from_args(args)
     except (argparse.ArgumentTypeError, ValueError) as exc:
@@ -235,12 +249,14 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         kcmm_lib_path=resolve_repo_path(args.kcmm_lib_path),
         timeout_seconds=args.timeout_seconds,
         shutdown_timeout_seconds=args.shutdown_timeout_seconds,
+        generate_tiny_model=args.generate_tiny_model,
         prompt=args.prompt,
         max_tokens=args.max_tokens,
         coverage_cases=coverage_cases,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
         completion_concurrency=args.completion_concurrency,
         kv_force_non_default_stream=args.kv_force_non_default_stream,
@@ -284,10 +300,12 @@ def smoke_config_for_mode(
         max_model_len=config.max_model_len,
         max_num_seqs=config.max_num_seqs,
         max_num_batched_tokens=config.max_num_batched_tokens,
+        gpu_memory_utilization=config.gpu_memory_utilization,
         tensor_parallel_size=config.tensor_parallel_size,
         completion_concurrency=config.completion_concurrency,
         build_kcmm=(config.build_kcmm and not is_stock),
         keep_model=True,
+        generate_tiny_model=config.generate_tiny_model,
         print_seams=(config.print_seams and not is_stock),
         instrument_allocators=False,
         instrument_kv_writes=False,
@@ -777,14 +795,18 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
     run_dir = Path(tempfile.gettempdir()) / f"kcmm-vllm-phase-ii-c-gpu-read-ab-{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
     created_model_dir = not config.model_path.exists()
-    model_existed = tiny_model_exists(config.model_path)
+    model_existed = (
+        tiny_model_exists(config.model_path)
+        if config.generate_tiny_model
+        else config.model_path.exists()
+    )
     modes: dict[str, Any] = {}
     try:
         for mode_name in MODE_ORDER:
             print(f"run GPU read A/B mode: {mode_name}", flush=True)
             modes[mode_name] = run_mode(config, mode_name, run_dir)
     finally:
-        if created_model_dir and not config.keep_model:
+        if config.generate_tiny_model and created_model_dir and not config.keep_model:
             shutil.rmtree(config.model_path, ignore_errors=True)
 
     correctness_failures = add_correctness_failures(modes)
@@ -798,6 +820,7 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "run_dir": str(run_dir),
         "model_path": str(config.model_path),
         "model_name": config.model_name,
+        "generate_tiny_model": config.generate_tiny_model,
         "model_existed_before_gate": model_existed,
         "prompt": config.prompt,
         "max_tokens": config.max_tokens,
@@ -812,6 +835,7 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "max_model_len": config.max_model_len,
         "max_num_seqs": config.max_num_seqs,
         "max_num_batched_tokens": config.max_num_batched_tokens,
+        "gpu_memory_utilization": config.gpu_memory_utilization,
         "tensor_parallel_size": config.tensor_parallel_size,
         "completion_concurrency": config.completion_concurrency,
         "kv_force_non_default_stream": config.kv_force_non_default_stream,
