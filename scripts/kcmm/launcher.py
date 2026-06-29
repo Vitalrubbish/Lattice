@@ -385,6 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if config.kv_write_mirror or config.kv_write_replace_candidate:
         _KV_WRITE_MIRROR_TRACKER = KcmmKvWriteMirrorTracker(
             config.kv_write_mirror_report_path,
+            verify_rows_per_call=4 if config.kv_write_verify else 0,
             replace_native=config.kv_write_replace_candidate,
             force_non_default_stream=config.kv_force_non_default_stream,
         )

@@ -179,6 +179,7 @@ def smoke_config_for_mode(
         runtime_derived_pool=(is_shadow or is_backed),
         kv_write_mirror=False,
         kv_write_replace_candidate=False,
+        kv_write_verify=True,
         kv_force_non_default_stream=False,
         shadow_allocations=is_shadow,
         backed_allocations=is_backed,

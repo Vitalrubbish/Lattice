@@ -1,4 +1,4 @@
-"""Phase II.C stock-vs-KCMM GPU read-kernel gate for a real vLLM model."""
+"""Phase II.C real-model GPU read-kernel gate without test-only overhead."""
 
 from __future__ import annotations
 
@@ -15,39 +15,29 @@ from scripts.kcmm.vllm_gpu_read_ab_gate import (
     parse_coverage_case,
     run_gate,
 )
+from scripts.kcmm.vllm_gpu_read_real_model_gate import (
+    DEFAULT_MODEL_ID,
+    real_model_failures,
+    resolve_real_model_path,
+)
 from scripts.kcmm.vllm_smoke import (
     CompletionCase,
     DEFAULT_KCMM_LIB_PATH,
-    repo_root,
     resolve_repo_path,
 )
 
 
-DEFAULT_MODEL_ID = "facebook/opt-125m"
-DEFAULT_COVERAGE_CASES = (
-    CompletionCase(name="hello", prompt="Hello", max_tokens=2),
-    CompletionCase(name="math", prompt="Question: 2 + 2 =", max_tokens=2),
-)
-MODEL_DOWNLOAD_ALLOW_PATTERNS = (
-    "config.json",
-    "generation_config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "vocab.json",
-    "merges.txt",
-    "tokenizer.model",
-    "pytorch_model.bin",
-    "pytorch_model-*.bin",
-    "pytorch_model.bin.index.json",
-    "model.safetensors",
-    "model-*.safetensors",
-    "model.safetensors.index.json",
+DEFAULT_PERF_CLEAN_CASES = (
+    CompletionCase(
+        name="long_decode",
+        prompt="The history of operating systems shows that",
+        max_tokens=32,
+    ),
 )
 
 
 @dataclass(frozen=True)
-class RealModelGateConfig:
+class PerfCleanGateConfig:
     ab_gate: GateConfig
     model_id: str
     downloaded_model: bool
@@ -73,9 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Download --model-id into .scratch before running the gate.",
     )
-    parser.add_argument("--model-name", default="real-opt-kcmm")
+    parser.add_argument("--model-name", default="perf-clean-opt-kcmm")
     parser.add_argument("--kcmm-lib-path", default=DEFAULT_KCMM_LIB_PATH)
-    parser.add_argument("--timeout-seconds", type=float, default=360.0)
+    parser.add_argument("--timeout-seconds", type=float, default=420.0)
     parser.add_argument("--shutdown-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--max-model-len", type=int, default=128)
     parser.add_argument("--max-num-seqs", type=int, default=1)
@@ -87,8 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="NAME:MAX_TOKENS:PROMPT",
         help=(
-            "Completion case to compare. May be repeated. Defaults to two "
-            "short prompts to keep the first real-model gate small."
+            "Completion case to compare. May be repeated. Defaults to one "
+            "longer decode case that gives the request-level metric more signal."
         ),
     )
     parser.add_argument(
@@ -106,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         default=None,
-        help="Real-model gate JSON report path. Defaults to a /tmp file.",
+        help="Performance-clean gate JSON report path. Defaults to a /tmp file.",
     )
     parser.add_argument("--latency-warning-ratio", type=float, default=2.5)
     parser.add_argument("--throughput-warning-ratio", type=float, default=0.4)
@@ -115,63 +105,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def default_model_path(model_id: str) -> Path:
-    safe_name = model_id.replace("/", "--")
-    return repo_root() / ".scratch" / "kcmm-vllm" / "real-models" / safe_name
-
-
-def model_path_has_config(model_path: Path) -> bool:
-    if not (model_path / "config.json").exists():
-        return False
-    weight_patterns = (
-        "pytorch_model.bin",
-        "pytorch_model-*.bin",
-        "model.safetensors",
-        "model-*.safetensors",
-    )
-    return any(model_path.glob(pattern) for pattern in weight_patterns)
-
-
-def resolve_real_model_path(
-    *,
-    model_id: str,
-    model_path: str | None,
-    download_model: bool,
-) -> tuple[Path, bool]:
-    if model_path:
-        path = resolve_repo_path(model_path)
-        if not model_path_has_config(path):
-            raise SystemExit(f"model path does not look complete: {path}")
-        return path, False
-
-    path = default_model_path(model_id)
-    if model_path_has_config(path):
-        return path, False
-    if not download_model:
-        raise SystemExit(
-            "real-model gate needs an existing --model-path or "
-            "--download-model to populate "
-            f"{path}"
-        )
-
-    from huggingface_hub import snapshot_download
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=model_id,
-        local_dir=path,
-        allow_patterns=MODEL_DOWNLOAD_ALLOW_PATTERNS,
-    )
-    if not model_path_has_config(path):
-        raise SystemExit(f"downloaded model has no config.json: {path}")
-    return path, True
-
-
 def parse_cases(values: list[str] | None) -> tuple[CompletionCase, ...]:
     cases = (
         tuple(parse_coverage_case(value) for value in values)
         if values
-        else DEFAULT_COVERAGE_CASES
+        else DEFAULT_PERF_CLEAN_CASES
     )
     names = [case.name for case in cases]
     if len(set(names)) != len(names):
@@ -179,7 +117,7 @@ def parse_cases(values: list[str] | None) -> tuple[CompletionCase, ...]:
     return cases
 
 
-def parse_config(argv: list[str] | None = None) -> RealModelGateConfig:
+def parse_config(argv: list[str] | None = None) -> PerfCleanGateConfig:
     parser = build_parser()
     args = parser.parse_args(argv)
     for field in ("max_model_len", "max_num_seqs", "max_num_batched_tokens"):
@@ -202,9 +140,9 @@ def parse_config(argv: list[str] | None = None) -> RealModelGateConfig:
         Path(args.output)
         if args.output
         else Path(tempfile.gettempdir())
-        / f"kcmm-vllm-phase-ii-c-gpu-read-real-model-{timestamp_ms}.json"
+        / f"kcmm-vllm-phase-ii-c-gpu-read-perf-clean-{timestamp_ms}.json"
     )
-    return RealModelGateConfig(
+    return PerfCleanGateConfig(
         ab_gate=GateConfig(
             host=args.host,
             port=args.port,
@@ -225,8 +163,8 @@ def parse_config(argv: list[str] | None = None) -> RealModelGateConfig:
             completion_concurrency=1,
             kv_force_non_default_stream=False,
             kv_read_profile=False,
-            instrument_kv_reads=True,
-            kv_write_verify=True,
+            instrument_kv_reads=False,
+            kv_write_verify=False,
             build_kcmm=args.build_kcmm,
             keep_model=True,
             print_seams=args.print_seams,
@@ -241,19 +179,56 @@ def parse_config(argv: list[str] | None = None) -> RealModelGateConfig:
     )
 
 
-def _positive_int(value: Any) -> int | None:
-    return value if isinstance(value, int) and value > 0 else None
-
-
-def real_model_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
+def _kcmm_contract(report: dict[str, Any]) -> dict[str, Any]:
     modes = report.get("modes")
     if not isinstance(modes, dict):
-        return []
+        return {}
+    kcmm_mode = modes.get("kcmm_gpu_read")
+    if not isinstance(kcmm_mode, dict):
+        return {}
+    contract = kcmm_mode.get("kcmm_gpu_read_contract")
+    return contract if isinstance(contract, dict) else {}
+
+
+def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
+    modes = report.get("modes")
+    kcmm_mode = modes.get("kcmm_gpu_read", {}) if isinstance(modes, dict) else {}
+    contract = _kcmm_contract(report)
+    return {
+        "requested_instrument_kv_reads": report.get("instrument_kv_reads"),
+        "requested_kv_write_verify": report.get("kv_write_verify"),
+        "kcmm_mode_instrument_kv_reads": (
+            kcmm_mode.get("instrument_kv_reads")
+            if isinstance(kcmm_mode, dict)
+            else None
+        ),
+        "kcmm_mode_kv_write_verify": (
+            kcmm_mode.get("kv_write_verify")
+            if isinstance(kcmm_mode, dict)
+            else None
+        ),
+        "write_verification_enabled": contract.get("write_verification_enabled"),
+        "write_verify_rows_per_call": contract.get("write_verify_rows_per_call"),
+        "kcmm_write_verified_rows": contract.get("kcmm_write_verified_rows"),
+        "write_stream_synchronize_for_verification_calls": contract.get(
+            "write_stream_synchronize_for_verification_calls"
+        ),
+        "gpu_kernel_calls": contract.get("gpu_kernel_calls"),
+        "stream_aware_kernel_calls": contract.get("stream_aware_kernel_calls"),
+        "reference_read_bytes": contract.get("reference_read_bytes"),
+    }
+
+
+def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    modes = report.get("modes")
+    if not isinstance(modes, dict):
+        return failures
     kcmm_mode = modes.get("kcmm_gpu_read")
     if not isinstance(kcmm_mode, dict) or not kcmm_mode.get("success"):
-        return []
-    contract = kcmm_mode.get("kcmm_gpu_read_contract")
-    if not isinstance(contract, dict):
+        return failures
+    contract = _kcmm_contract(report)
+    if not contract:
         return [
             {
                 "mode": "kcmm_gpu_read",
@@ -261,35 +236,85 @@ def real_model_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
             }
         ]
 
-    failures: list[dict[str, Any]] = []
-    if _positive_int(contract.get("gpu_kernel_calls")) is None:
+    if report.get("instrument_kv_reads") is not False:
         failures.append(
             {
                 "mode": "kcmm_gpu_read",
-                "reason": "missing_gpu_kernel_calls",
-                "value": contract.get("gpu_kernel_calls"),
+                "reason": "read_trace_instrumentation_not_disabled_in_config",
+                "value": report.get("instrument_kv_reads"),
             }
         )
-    if contract.get("reference_read_bytes") != 0:
+    if kcmm_mode.get("instrument_kv_reads") is not False:
         failures.append(
             {
                 "mode": "kcmm_gpu_read",
-                "reason": "cpu_staged_reference_reads_seen",
-                "reference_read_bytes": contract.get("reference_read_bytes"),
+                "reason": "read_trace_instrumentation_not_disabled_in_smoke",
+                "value": kcmm_mode.get("instrument_kv_reads"),
+            }
+        )
+    if report.get("kv_write_verify") is not False:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_verification_not_disabled_in_config",
+                "value": report.get("kv_write_verify"),
+            }
+        )
+    if kcmm_mode.get("kv_write_verify") is not False:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_verification_not_disabled_in_smoke",
+                "value": kcmm_mode.get("kv_write_verify"),
+            }
+        )
+    if contract.get("write_verification_enabled") is not False:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_verification_enabled_in_report",
+                "value": contract.get("write_verification_enabled"),
+            }
+        )
+    if contract.get("write_verify_rows_per_call") != 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_verify_rows_per_call_nonzero",
+                "value": contract.get("write_verify_rows_per_call"),
+            }
+        )
+    if contract.get("kcmm_write_verified_rows") != 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_verified_rows_nonzero",
+                "value": contract.get("kcmm_write_verified_rows"),
+            }
+        )
+    if contract.get("write_stream_synchronize_for_verification_calls") != 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_verification_synchronizations_nonzero",
+                "value": contract.get(
+                    "write_stream_synchronize_for_verification_calls"
+                ),
             }
         )
     return failures
 
 
-def run_real_model_gate(config: RealModelGateConfig) -> dict[str, Any]:
+def run_perf_clean_gate(config: PerfCleanGateConfig) -> dict[str, Any]:
     report = run_gate(config.ab_gate)
-    report["gate"] = "stock-vs-kcmm-gpu-read-kernel-real-model"
+    report["gate"] = "stock-vs-kcmm-gpu-read-kernel-performance-clean"
     report["real_model"] = {
         "model_id": config.model_id,
         "model_path": str(config.ab_gate.model_path),
         "downloaded_model": config.downloaded_model,
     }
-    failures = real_model_failures(report)
+    report["performance_clean_requirements"] = performance_clean_requirements(report)
+    failures = real_model_failures(report) + performance_clean_failures(report)
     report["correctness_failures"].extend(failures)
     report["passed"] = not report["correctness_failures"]
     return report
@@ -297,7 +322,7 @@ def run_real_model_gate(config: RealModelGateConfig) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     config = parse_config(argv)
-    report = run_real_model_gate(config)
+    report = run_perf_clean_gate(config)
     config.ab_gate.output_path.parent.mkdir(parents=True, exist_ok=True)
     config.ab_gate.output_path.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",

@@ -62,6 +62,8 @@ class GateConfig:
     completion_concurrency: int
     kv_force_non_default_stream: bool
     kv_read_profile: bool
+    instrument_kv_reads: bool
+    kv_write_verify: bool
     build_kcmm: bool
     keep_model: bool
     print_seams: bool
@@ -112,6 +114,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Enable per-call CUDA event profiling for KCMM GPU read kernels "
             "in the KCMM mode."
+        ),
+    )
+    parser.add_argument(
+        "--instrument-kv-reads",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable observer-only paged_attention read tracing in the KCMM "
+            "mode. Disable for performance-clean gates."
+        ),
+    )
+    parser.add_argument(
+        "--kv-write-verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable bounded D2H verification of KCMM KV writes in the KCMM "
+            "mode. Disable for performance-clean gates."
         ),
     )
     parser.add_argument(
@@ -261,6 +281,8 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         completion_concurrency=args.completion_concurrency,
         kv_force_non_default_stream=args.kv_force_non_default_stream,
         kv_read_profile=args.kv_read_profile,
+        instrument_kv_reads=args.instrument_kv_reads,
+        kv_write_verify=args.kv_write_verify,
         build_kcmm=args.build_kcmm,
         keep_model=args.keep_model,
         print_seams=args.print_seams,
@@ -309,13 +331,14 @@ def smoke_config_for_mode(
         print_seams=(config.print_seams and not is_stock),
         instrument_allocators=False,
         instrument_kv_writes=False,
-        instrument_kv_reads=is_gpu_read,
+        instrument_kv_reads=(is_gpu_read and config.instrument_kv_reads),
         kv_read_offset_table=False,
         kv_read_replace_candidate=False,
         kv_read_gpu_kernel_candidate=is_gpu_read,
         kv_read_profile=(is_gpu_read and config.kv_read_profile),
         kv_write_mirror=False,
         kv_write_replace_candidate=is_gpu_read,
+        kv_write_verify=config.kv_write_verify,
         kv_force_non_default_stream=(
             is_gpu_read and config.kv_force_non_default_stream
         ),
@@ -450,6 +473,10 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "replacement_calls": read_report.get("replacement_calls"),
         "offset_table_builds": read_report.get("offset_table_builds"),
         "native_write_skipped_calls": write_report.get("native_skipped_calls"),
+        "write_verification_enabled": write_report.get(
+            "write_verification_enabled"
+        ),
+        "write_verify_rows_per_call": write_report.get("verify_rows_per_call"),
         "kcmm_write_verified_rows": write_report.get("verified_rows"),
         "stream_aware_write_calls": write_report.get("stream_aware_write_calls"),
         "force_non_default_stream": read_report.get("force_non_default_stream"),
@@ -491,6 +518,8 @@ def summarize_success(mode_name: str, result: dict[str, Any]) -> dict[str, Any]:
         "completion_cases": summarize_completion_cases(result),
         "gpu_memory": result.get("gpu_memory"),
         "generated_model": result.get("generated_model"),
+        "instrument_kv_reads": result.get("instrument_kv_reads"),
+        "kv_write_verify": result.get("kv_write_verify"),
         "log_path": result.get("log_path"),
     }
     if mode_name == "kcmm_gpu_read":
@@ -840,6 +869,8 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "completion_concurrency": config.completion_concurrency,
         "kv_force_non_default_stream": config.kv_force_non_default_stream,
         "kv_read_profile": config.kv_read_profile,
+        "instrument_kv_reads": config.instrument_kv_reads,
+        "kv_write_verify": config.kv_write_verify,
         "mode_order": list(MODE_ORDER),
         "modes": modes,
         "correctness_failures": correctness_failures,

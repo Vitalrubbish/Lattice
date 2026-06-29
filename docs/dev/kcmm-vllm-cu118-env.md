@@ -723,6 +723,51 @@ Default warning thresholds:
 - token throughput below `0.5x` stock,
 - peak GPU memory delta above `1.5x` stock and at least `256 MiB` higher.
 
+For performance work, use the performance-clean real-model gate:
+
+```bash
+python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate \
+  --no-build-kcmm \
+  --no-print-seams
+```
+
+This wraps the stock-vs-KCMM GPU read-kernel A/B gate with
+`facebook/opt-125m` by default, but disables correctness-only overhead in the
+KCMM mode:
+
+- KV read trace instrumentation is disabled.
+- KV write D2H row verification is disabled.
+- GPU read-kernel profiling is disabled.
+
+The gate still fails if stock-vs-KCMM completions differ, if the KCMM mode does
+not launch the GPU read kernel, if CPU-staged reference read bytes are observed,
+or if the write report shows any verified rows or verification synchronizations.
+Use the regular correctness/profile gates when debugging contracts; use this
+gate as the cleaner request-level baseline before kernel optimization.
+
+Latest local performance-clean result on 2026-06-29:
+
+- Command:
+  `python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60`
+- Result: `passed=true`
+- Report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-1782722236025.json`
+- Correctness failures: `[]`
+- Performance warnings: `[]`
+- Model: `facebook/opt-125m`
+- Coverage case: `long_decode`, `32` generated tokens
+- Stock/KCMM completion text matched.
+- GPU read kernel calls: `372`
+- Stream-aware read kernel calls: `372`
+- Reference KCMM read bytes: `0`
+- KCMM write verified rows: `0`
+- Stream-level write verification synchronizations: `0`
+- KCMM write verification enabled: `false`
+- Request latency seconds: stock `1.855`, KCMM `3.285`, ratio `1.771`
+- Tokens per second: stock `17.251`, KCMM `9.741`, ratio `0.565`
+- Peak GPU memory delta MiB: stock `5441`, KCMM `5591`, ratio `1.028`
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
 Latest local performance characterization on 2026-06-20:
 
 - Command: `python -m scripts.kcmm.vllm_gpu_read_ab_gate --no-build-kcmm`

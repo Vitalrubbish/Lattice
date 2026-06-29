@@ -480,6 +480,8 @@ class KcmmKvWriteMirrorTracker:
                 "force_non_default_stream": (
                     self._stream_provider.force_non_default
                 ),
+                "write_verification_enabled": self._verify_rows_per_call > 0,
+                "verify_rows_per_call": self._verify_rows_per_call,
                 "slot_formula": "slot = block_id * block_size + offset_in_block",
                 "pool_attached": self._pool is not None,
                 "write_calls": self._write_calls,

@@ -63,6 +63,7 @@ class SmokeConfig:
     kv_read_profile: bool
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
+    kv_write_verify: bool
     kv_force_non_default_stream: bool
     runtime_derived_pool: bool
     shadow_allocations: bool
@@ -221,6 +222,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--kv-write-verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable bounded D2H verification of KCMM KV writes. Disable this "
+            "for performance-clean gates after correctness has been proven."
+        ),
+    )
+    parser.add_argument(
         "--kv-force-non-default-stream",
         action="store_true",
         help=(
@@ -371,6 +381,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         kv_read_profile=args.kv_read_profile,
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
+        kv_write_verify=args.kv_write_verify,
         kv_force_non_default_stream=args.kv_force_non_default_stream,
         runtime_derived_pool=(
             args.runtime_derived_pool
@@ -655,6 +666,8 @@ def vllm_command(config: SmokeConfig) -> list[str]:
                     str(config.kv_write_mirror_report_path),
                 ]
             )
+            if not config.kv_write_verify:
+                command.append("--no-kcmm-kv-write-verify")
         if config.kv_force_non_default_stream:
             command.append("--kcmm-kv-force-non-default-stream")
         if (
@@ -891,7 +904,11 @@ def read_kv_read_trace(path: Path) -> dict[str, Any]:
     }
 
 
-def read_kv_write_mirror_report(path: Path) -> dict[str, Any]:
+def read_kv_write_mirror_report(
+    path: Path,
+    *,
+    expect_verification: bool = True,
+) -> dict[str, Any]:
     if not path.exists():
         raise SmokeFailure(f"KCMM KV write mirror report was not written: {path}")
     with path.open("r", encoding="utf-8") as handle:
@@ -921,9 +938,40 @@ def read_kv_write_mirror_report(path: Path) -> dict[str, Any]:
             "KCMM KV write report used no stream-aware writes: "
             + json.dumps(report, sort_keys=True)
         )
-    if report.get("verified_rows", 0) <= 0:
+    verification_enabled = bool(report.get("write_verification_enabled", True))
+    if expect_verification and not verification_enabled:
+        raise SmokeFailure(
+            "KCMM KV write report unexpectedly disabled verification: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if expect_verification and report.get("verified_rows", 0) <= 0:
         raise SmokeFailure(
             "KCMM KV write report did not verify any rows: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if not expect_verification and verification_enabled:
+        raise SmokeFailure(
+            "KCMM KV write report left verification enabled: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if not expect_verification and report.get("verified_rows", 0) != 0:
+        raise SmokeFailure(
+            "KCMM KV write report verified rows despite disabled verification: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if not expect_verification and report.get("verification_bytes", 0) != 0:
+        raise SmokeFailure(
+            "KCMM KV write report copied verification bytes despite disabled "
+            "verification: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if (
+        not expect_verification
+        and report.get("stream_synchronize_for_verification_calls", 0) != 0
+    ):
+        raise SmokeFailure(
+            "KCMM KV write report synchronized for verification despite disabled "
+            "verification: "
             + json.dumps(report, sort_keys=True)
         )
     return {"path": str(path), **report}
@@ -1420,6 +1468,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "kv_read_profile": config.kv_read_profile,
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,
+            "kv_write_verify": config.kv_write_verify,
             "kv_force_non_default_stream": config.kv_force_non_default_stream,
             "shadow_allocations": config.shadow_allocations,
             "backed_allocations": config.backed_allocations,
@@ -1444,7 +1493,10 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
     if config.instrument_kv_reads:
         result["kv_read_trace"] = read_kv_read_trace(config.kv_read_trace_path)
     if config.kv_write_mirror or config.kv_write_replace_candidate:
-        report = read_kv_write_mirror_report(config.kv_write_mirror_report_path)
+        report = read_kv_write_mirror_report(
+            config.kv_write_mirror_report_path,
+            expect_verification=config.kv_write_verify,
+        )
         if config.kv_force_non_default_stream:
             require_non_default_stream_report(report, name="KCMM KV write")
         if config.kv_write_replace_candidate:
