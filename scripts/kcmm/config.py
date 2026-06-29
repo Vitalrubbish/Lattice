@@ -134,6 +134,8 @@ class ObserverConfig:
     kv_read_gpu_kernel_candidate: bool = False
     kv_read_profile: bool = False
     kv_read_validate_block_tables: bool = True
+    kv_read_fast_current_context_launch: bool = False
+    kv_read_precompile_gpu_kernel: bool = False
     tracker_report_on_update: bool = True
     tracker_host_profile: bool = False
     kv_read_offset_table_report_path: str | None = None
@@ -201,6 +203,12 @@ class ObserverConfig:
             kv_read_profile=_env_bool("KCMM_KV_READ_PROFILE", False),
             kv_read_validate_block_tables=_env_bool(
                 "KCMM_KV_READ_VALIDATE_BLOCK_TABLES", True
+            ),
+            kv_read_fast_current_context_launch=_env_bool(
+                "KCMM_KV_READ_FAST_CURRENT_CONTEXT_LAUNCH", False
+            ),
+            kv_read_precompile_gpu_kernel=_env_bool(
+                "KCMM_KV_READ_PRECOMPILE_GPU_KERNEL", False
             ),
             tracker_report_on_update=_env_bool(
                 "KCMM_TRACKER_REPORT_ON_UPDATE", True
@@ -523,6 +531,25 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "Validate sampled paged-attention block_tables on the host. "
             "Disable for performance-clean gates after correctness coverage passes."
+        ),
+    )
+    parser.add_argument(
+        "--kcmm-kv-read-fast-current-context-launch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use the stream-aware read launch ABI that assumes the caller's "
+            "CUDA context is already current. Intended for vLLM/PyTorch "
+            "performance-clean gates."
+        ),
+    )
+    parser.add_argument(
+        "--kcmm-kv-read-precompile-gpu-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Precompile/load the KCMM paged-attention read kernel when the "
+            "runtime pool attaches, before the measured request."
         ),
     )
     parser.add_argument(

@@ -164,6 +164,8 @@ def parse_config(argv: list[str] | None = None) -> PerfCleanGateConfig:
             kv_force_non_default_stream=False,
             kv_read_profile=False,
             kv_read_validate_block_tables=False,
+            kv_read_fast_current_context_launch=True,
+            kv_read_precompile_gpu_kernel=True,
             instrument_kv_reads=False,
             kv_write_verify=False,
             tracker_report_on_update=False,
@@ -200,6 +202,12 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "requested_instrument_kv_reads": report.get("instrument_kv_reads"),
         "requested_kv_write_verify": report.get("kv_write_verify"),
+        "requested_kv_read_fast_current_context_launch": report.get(
+            "kv_read_fast_current_context_launch"
+        ),
+        "requested_kv_read_precompile_gpu_kernel": report.get(
+            "kv_read_precompile_gpu_kernel"
+        ),
         "kcmm_mode_instrument_kv_reads": (
             kcmm_mode.get("instrument_kv_reads")
             if isinstance(kcmm_mode, dict)
@@ -215,8 +223,33 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
             if isinstance(kcmm_mode, dict)
             else None
         ),
+        "kcmm_mode_kv_read_fast_current_context_launch": (
+            kcmm_mode.get("kv_read_fast_current_context_launch")
+            if isinstance(kcmm_mode, dict)
+            else None
+        ),
+        "kcmm_mode_kv_read_precompile_gpu_kernel": (
+            kcmm_mode.get("kv_read_precompile_gpu_kernel")
+            if isinstance(kcmm_mode, dict)
+            else None
+        ),
         "write_verification_enabled": contract.get("write_verification_enabled"),
         "write_verify_rows_per_call": contract.get("write_verify_rows_per_call"),
+        "read_fast_current_context_launch": contract.get(
+            "read_fast_current_context_launch"
+        ),
+        "read_gpu_kernel_precompile_requested": contract.get(
+            "read_gpu_kernel_precompile_requested"
+        ),
+        "read_gpu_kernel_precompile_succeeded": contract.get(
+            "read_gpu_kernel_precompile_succeeded"
+        ),
+        "read_gpu_kernel_precompile_calls": contract.get(
+            "read_gpu_kernel_precompile_calls"
+        ),
+        "read_gpu_kernel_precompile_elapsed_ms": contract.get(
+            "read_gpu_kernel_precompile_elapsed_ms"
+        ),
         "read_block_table_validation_enabled": contract.get(
             "read_block_table_validation_enabled"
         ),
@@ -294,6 +327,71 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "mode": "kcmm_gpu_read",
                 "reason": "tracker_report_on_update_not_disabled_in_smoke",
                 "value": kcmm_mode.get("tracker_report_on_update"),
+            }
+        )
+    if report.get("kv_read_fast_current_context_launch") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "fast_current_context_launch_not_enabled_in_config",
+                "value": report.get("kv_read_fast_current_context_launch"),
+            }
+        )
+    if kcmm_mode.get("kv_read_fast_current_context_launch") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "fast_current_context_launch_not_enabled_in_smoke",
+                "value": kcmm_mode.get("kv_read_fast_current_context_launch"),
+            }
+        )
+    if contract.get("read_fast_current_context_launch") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "fast_current_context_launch_not_enabled_in_report",
+                "value": contract.get("read_fast_current_context_launch"),
+            }
+        )
+    if report.get("kv_read_precompile_gpu_kernel") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_kernel_precompile_not_enabled_in_config",
+                "value": report.get("kv_read_precompile_gpu_kernel"),
+            }
+        )
+    if kcmm_mode.get("kv_read_precompile_gpu_kernel") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_kernel_precompile_not_enabled_in_smoke",
+                "value": kcmm_mode.get("kv_read_precompile_gpu_kernel"),
+            }
+        )
+    if contract.get("read_gpu_kernel_precompile_requested") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_kernel_precompile_not_requested_in_report",
+                "value": contract.get("read_gpu_kernel_precompile_requested"),
+            }
+        )
+    if contract.get("read_gpu_kernel_precompile_succeeded") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_kernel_precompile_not_succeeded",
+                "value": contract.get("read_gpu_kernel_precompile_succeeded"),
+            }
+        )
+    if contract.get("read_gpu_kernel_precompile_calls") != 1:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_kernel_precompile_call_count_unexpected",
+                "value": contract.get("read_gpu_kernel_precompile_calls"),
+                "expected": 1,
             }
         )
     if contract.get("read_block_table_validation_enabled") is not False:

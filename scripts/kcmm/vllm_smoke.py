@@ -62,6 +62,8 @@ class SmokeConfig:
     kv_read_gpu_kernel_candidate: bool
     kv_read_profile: bool
     kv_read_validate_block_tables: bool
+    kv_read_fast_current_context_launch: bool
+    kv_read_precompile_gpu_kernel: bool
     tracker_report_on_update: bool
     tracker_host_profile: bool
     kv_write_mirror: bool
@@ -226,6 +228,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Validate sampled paged-attention block_tables on the host. "
             "Disable for performance-clean gates after correctness coverage passes."
+        ),
+    )
+    parser.add_argument(
+        "--kv-read-fast-current-context-launch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the KCMM read launch ABI that assumes PyTorch/vLLM already "
+            "made the correct CUDA context current."
+        ),
+    )
+    parser.add_argument(
+        "--kv-read-precompile-gpu-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Precompile/load the KCMM paged-attention read kernel before "
+            "serving the measured request."
         ),
     )
     parser.add_argument(
@@ -407,6 +427,10 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         kv_read_gpu_kernel_candidate=args.kv_read_gpu_kernel_candidate,
         kv_read_profile=args.kv_read_profile,
         kv_read_validate_block_tables=args.kv_read_validate_block_tables,
+        kv_read_fast_current_context_launch=(
+            args.kv_read_fast_current_context_launch
+        ),
+        kv_read_precompile_gpu_kernel=args.kv_read_precompile_gpu_kernel,
         tracker_report_on_update=args.tracker_report_on_update,
         tracker_host_profile=args.tracker_host_profile,
         kv_write_mirror=args.kv_write_mirror,
@@ -722,6 +746,10 @@ def vllm_command(config: SmokeConfig) -> list[str]:
                 command.append("--kcmm-kv-read-profile")
             if not config.kv_read_validate_block_tables:
                 command.append("--no-kcmm-kv-read-validate-block-tables")
+            if config.kv_read_fast_current_context_launch:
+                command.append("--kcmm-kv-read-fast-current-context-launch")
+            if config.kv_read_precompile_gpu_kernel:
+                command.append("--kcmm-kv-read-precompile-gpu-kernel")
         if (
             not config.tracker_report_on_update
             and (
@@ -1521,6 +1549,10 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "kv_read_gpu_kernel_candidate": config.kv_read_gpu_kernel_candidate,
             "kv_read_profile": config.kv_read_profile,
             "kv_read_validate_block_tables": config.kv_read_validate_block_tables,
+            "kv_read_fast_current_context_launch": (
+                config.kv_read_fast_current_context_launch
+            ),
+            "kv_read_precompile_gpu_kernel": config.kv_read_precompile_gpu_kernel,
             "tracker_report_on_update": config.tracker_report_on_update,
             "tracker_host_profile": config.tracker_host_profile,
             "kv_write_mirror": config.kv_write_mirror,

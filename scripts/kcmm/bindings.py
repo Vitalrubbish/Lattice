@@ -181,6 +181,8 @@ class KcmmLibrary:
         _assert_layout()
         self.path = resolve_library_path(str(path) if path else None)
         self.lib = ctypes.CDLL(str(self.path))
+        self.has_current_context_read_launch = False
+        self.has_paged_attn_precompile = False
         self._bind_functions()
 
     def _bind_functions(self) -> None:
@@ -323,6 +325,40 @@ class KcmmLibrary:
             ctypes.c_uint64,
         ]
         lib.kcmm_paged_attn_decode_f16_on_stream.restype = ctypes.c_int
+        try:
+            current_context_read_launch = (
+                lib.kcmm_paged_attn_decode_f16_on_current_context_stream
+            )
+        except AttributeError:
+            current_context_read_launch = None
+        if current_context_read_launch is not None:
+            current_context_read_launch.argtypes = [
+                pool,
+                ctypes.c_uint32,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_float,
+                ctypes.c_uint64,
+            ]
+            current_context_read_launch.restype = ctypes.c_int
+            self.has_current_context_read_launch = True
+        try:
+            precompile_paged_attn = lib.kcmm_precompile_paged_attn_decode_f16
+        except AttributeError:
+            precompile_paged_attn = None
+        if precompile_paged_attn is not None:
+            precompile_paged_attn.argtypes = [pool]
+            precompile_paged_attn.restype = ctypes.c_int
+            self.has_paged_attn_precompile = True
         lib.kcmm_get_block_location.argtypes = [
             pool,
             ctypes.c_uint32,
@@ -349,6 +385,20 @@ class KcmmPool:
         self.library = library
         self.handle = (
             handle if isinstance(handle, ctypes.c_void_p) else ctypes.c_void_p(handle)
+        )
+        self._paged_attn_decode_f16 = library.lib.kcmm_paged_attn_decode_f16
+        self._paged_attn_decode_f16_on_stream = (
+            library.lib.kcmm_paged_attn_decode_f16_on_stream
+        )
+        self._paged_attn_decode_f16_on_current_context_stream = (
+            library.lib.kcmm_paged_attn_decode_f16_on_current_context_stream
+            if library.has_current_context_read_launch
+            else None
+        )
+        self._precompile_paged_attn_decode_f16 = (
+            library.lib.kcmm_precompile_paged_attn_decode_f16
+            if library.has_paged_attn_precompile
+            else None
         )
         self._destroyed = False
 
@@ -572,14 +622,71 @@ class KcmmPool:
             float(scale),
         )
         if stream_ptr is None:
-            rc = self.library.lib.kcmm_paged_attn_decode_f16(*args)
+            rc = self._paged_attn_decode_f16(*args)
             self._check(rc, "kcmm_paged_attn_decode_f16")
         else:
-            rc = self.library.lib.kcmm_paged_attn_decode_f16_on_stream(
+            rc = self._paged_attn_decode_f16_on_stream(
                 *args,
                 int(stream_ptr),
             )
             self._check(rc, "kcmm_paged_attn_decode_f16_on_stream")
+
+    def paged_attn_decode_f16_on_current_context_stream(
+        self,
+        layer_idx: int,
+        query_ptr: int,
+        out_ptr: int,
+        block_tables_ptr: int,
+        seq_lens_ptr: int,
+        block_offsets_f16_ptr: int,
+        batch: int,
+        num_q_heads: int,
+        kv_heads: int,
+        head_dim: int,
+        block_size: int,
+        max_blocks_per_seq: int,
+        scale: float,
+        stream_ptr: int,
+    ) -> None:
+        function = self._paged_attn_decode_f16_on_current_context_stream
+        if function is None:
+            raise KcmmError(
+                "KCMM library does not export "
+                "kcmm_paged_attn_decode_f16_on_current_context_stream; "
+                "rebuild libbaseline_llm_os.so"
+            )
+        rc = function(
+            self.handle,
+            layer_idx,
+            int(query_ptr),
+            int(out_ptr),
+            int(block_tables_ptr),
+            int(seq_lens_ptr),
+            int(block_offsets_f16_ptr),
+            batch,
+            num_q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            float(scale),
+            int(stream_ptr),
+        )
+        self._check(
+            rc,
+            "kcmm_paged_attn_decode_f16_on_current_context_stream",
+        )
+
+    def precompile_paged_attn_decode_f16(self) -> None:
+        function = self._precompile_paged_attn_decode_f16
+        if function is None:
+            raise KcmmError(
+                "KCMM library does not export "
+                "kcmm_precompile_paged_attn_decode_f16; "
+                "rebuild libbaseline_llm_os.so"
+            )
+        rc = function(self.handle)
+        self._check(rc, "kcmm_precompile_paged_attn_decode_f16")
 
     def block_location(self, block_idx: int) -> str:
         out = ctypes.c_uint32()

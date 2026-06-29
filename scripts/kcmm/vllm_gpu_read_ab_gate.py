@@ -63,6 +63,8 @@ class GateConfig:
     kv_force_non_default_stream: bool
     kv_read_profile: bool
     kv_read_validate_block_tables: bool
+    kv_read_fast_current_context_launch: bool
+    kv_read_precompile_gpu_kernel: bool
     instrument_kv_reads: bool
     kv_write_verify: bool
     tracker_report_on_update: bool
@@ -162,6 +164,24 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Collect section-level host timings in KCMM tracker final reports.",
+    )
+    parser.add_argument(
+        "--kv-read-fast-current-context-launch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the read launch ABI that assumes the vLLM/PyTorch CUDA "
+            "context is already current in the KCMM mode."
+        ),
+    )
+    parser.add_argument(
+        "--kv-read-precompile-gpu-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Precompile/load the KCMM paged-attention read kernel before "
+            "the measured request in the KCMM mode."
+        ),
     )
     parser.add_argument(
         "--coverage-case",
@@ -311,6 +331,10 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         kv_force_non_default_stream=args.kv_force_non_default_stream,
         kv_read_profile=args.kv_read_profile,
         kv_read_validate_block_tables=args.kv_read_validate_block_tables,
+        kv_read_fast_current_context_launch=(
+            args.kv_read_fast_current_context_launch
+        ),
+        kv_read_precompile_gpu_kernel=args.kv_read_precompile_gpu_kernel,
         instrument_kv_reads=args.instrument_kv_reads,
         kv_write_verify=args.kv_write_verify,
         tracker_report_on_update=args.tracker_report_on_update,
@@ -369,6 +393,12 @@ def smoke_config_for_mode(
         kv_read_gpu_kernel_candidate=is_gpu_read,
         kv_read_profile=(is_gpu_read and config.kv_read_profile),
         kv_read_validate_block_tables=config.kv_read_validate_block_tables,
+        kv_read_fast_current_context_launch=(
+            is_gpu_read and config.kv_read_fast_current_context_launch
+        ),
+        kv_read_precompile_gpu_kernel=(
+            is_gpu_read and config.kv_read_precompile_gpu_kernel
+        ),
         tracker_report_on_update=config.tracker_report_on_update,
         tracker_host_profile=config.tracker_host_profile,
         kv_write_mirror=False,
@@ -514,6 +544,21 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "read_block_table_validation_enabled": read_report.get(
             "block_table_validation_enabled"
         ),
+        "read_fast_current_context_launch": read_report.get(
+            "fast_current_context_launch"
+        ),
+        "read_gpu_kernel_precompile_requested": read_report.get(
+            "gpu_kernel_precompile_requested"
+        ),
+        "read_gpu_kernel_precompile_succeeded": read_report.get(
+            "gpu_kernel_precompile_succeeded"
+        ),
+        "read_gpu_kernel_precompile_calls": read_report.get(
+            "gpu_kernel_precompile_calls"
+        ),
+        "read_gpu_kernel_precompile_elapsed_ms": read_report.get(
+            "gpu_kernel_precompile_elapsed_ms"
+        ),
         "read_report_on_update": read_report.get("report_on_update"),
         "read_report_write_count": read_report.get("report_write_count"),
         "read_host_profile": read_report.get("host_profile"),
@@ -568,6 +613,12 @@ def summarize_success(mode_name: str, result: dict[str, Any]) -> dict[str, Any]:
         "generated_model": result.get("generated_model"),
         "instrument_kv_reads": result.get("instrument_kv_reads"),
         "kv_write_verify": result.get("kv_write_verify"),
+        "kv_read_fast_current_context_launch": result.get(
+            "kv_read_fast_current_context_launch"
+        ),
+        "kv_read_precompile_gpu_kernel": result.get(
+            "kv_read_precompile_gpu_kernel"
+        ),
         "tracker_report_on_update": result.get("tracker_report_on_update"),
         "tracker_host_profile": result.get("tracker_host_profile"),
         "log_path": result.get("log_path"),
@@ -922,6 +973,10 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "kv_read_validate_block_tables": config.kv_read_validate_block_tables,
         "instrument_kv_reads": config.instrument_kv_reads,
         "kv_write_verify": config.kv_write_verify,
+        "kv_read_fast_current_context_launch": (
+            config.kv_read_fast_current_context_launch
+        ),
+        "kv_read_precompile_gpu_kernel": config.kv_read_precompile_gpu_kernel,
         "tracker_report_on_update": config.tracker_report_on_update,
         "tracker_host_profile": config.tracker_host_profile,
         "mode_order": list(MODE_ORDER),

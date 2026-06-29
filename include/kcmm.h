@@ -529,6 +529,35 @@ int kcmm_paged_attn_decode_f16_on_stream(
     uint32_t kv_heads, uint32_t head_dim, uint32_t block_size,
     uint32_t max_blocks_per_seq, float scale, uint64_t stream_ptr);
 
+/**
+ * Launch KCMM paged-attention decode on a caller-owned CUDA stream without
+ * rebinding the CUDA context.
+ *
+ * This is a narrower performance path for framework-owned seams such as
+ * PyTorch/vLLM. The caller must already have the pool's CUDA context current
+ * on this thread. Generic FFI callers should use
+ * `kcmm_paged_attn_decode_f16_on_stream`.
+ *
+ * @param stream_ptr Raw CUDA stream handle, or 0 for the legacy default stream.
+ * @return 0 on successful enqueue, -1 on error.
+ */
+int kcmm_paged_attn_decode_f16_on_current_context_stream(
+    kcmm_pool_t *pool, uint32_t layer_idx, uint64_t query_ptr, uint64_t out_ptr,
+    uint64_t block_tables_ptr, uint64_t seq_lens_ptr,
+    uint64_t block_offsets_f16_ptr, uint32_t batch, uint32_t num_q_heads,
+    uint32_t kv_heads, uint32_t head_dim, uint32_t block_size,
+    uint32_t max_blocks_per_seq, float scale, uint64_t stream_ptr);
+
+/**
+ * Precompile and load KCMM's vLLM-facing paged-attention decode kernel.
+ *
+ * This is idempotent for a pool. It moves NVRTC/module-load overhead out of the
+ * first request when called during vLLM startup.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int kcmm_precompile_paged_attn_decode_f16(kcmm_pool_t *pool);
+
 /* ===========================================================================
  * Tiering Operations
  * =========================================================================== */

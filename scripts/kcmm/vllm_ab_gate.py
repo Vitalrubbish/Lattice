@@ -177,6 +177,8 @@ def smoke_config_for_mode(
         kv_read_gpu_kernel_candidate=False,
         kv_read_profile=False,
         kv_read_validate_block_tables=True,
+        kv_read_fast_current_context_launch=False,
+        kv_read_precompile_gpu_kernel=False,
         tracker_report_on_update=True,
         tracker_host_profile=False,
         runtime_derived_pool=(is_shadow or is_backed),

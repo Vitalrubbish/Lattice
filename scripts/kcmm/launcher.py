@@ -422,6 +422,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             report_on_update=config.tracker_report_on_update,
             validate_block_tables=config.kv_read_validate_block_tables,
             profile_host_sections=config.tracker_host_profile,
+            fast_current_context_launch=config.kv_read_fast_current_context_launch,
+            precompile_gpu_kernel=config.kv_read_precompile_gpu_kernel,
         )
         kv_read_offset_table_report = apply_kv_read_offset_table(
             _KV_READ_OFFSET_TABLE_TRACKER

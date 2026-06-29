@@ -304,6 +304,8 @@ def gate_config_for_variant(
         kv_force_non_default_stream=False,
         kv_read_profile=False,
         kv_read_validate_block_tables=True,
+        kv_read_fast_current_context_launch=False,
+        kv_read_precompile_gpu_kernel=False,
         instrument_kv_reads=True,
         kv_write_verify=True,
         tracker_report_on_update=True,

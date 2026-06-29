@@ -118,6 +118,34 @@ fn compile_vllm_paged_attn_kernel(handle: &KcmmPoolHandle) -> anyhow::Result<Kcm
     Ok(kernel)
 }
 
+/// Precompile and load KCMM's vLLM-facing paged-attention decode kernel.
+///
+/// This shifts NVRTC/module-load cost out of the first request. The function is
+/// idempotent for a pool and returns immediately after the first successful
+/// compile.
+///
+/// # Safety
+/// `pool` must be a valid KCMM pool handle.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_precompile_paged_attn_decode_f16(
+    pool: *mut kcmm_pool_t,
+) -> i32 {
+    if pool.is_null() {
+        return -1;
+    }
+    let handle = pool_from_ptr(pool);
+    match compile_vllm_paged_attn_kernel(handle) {
+        Ok(_) => 0,
+        Err(e) => {
+            handle.set_error(format!(
+                "kcmm_precompile_paged_attn_decode_f16: compile/load kernel failed: {:#}",
+                e
+            ));
+            -1
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // C-compatible configuration struct
 // ---------------------------------------------------------------------------
@@ -1278,6 +1306,7 @@ pub unsafe extern "C" fn kcmm_paged_attn_decode_f16(
             scale,
             0,
             true,
+            true,
         )
     }
 }
@@ -1327,6 +1356,59 @@ pub unsafe extern "C" fn kcmm_paged_attn_decode_f16_on_stream(
             scale,
             stream_ptr,
             false,
+            true,
+        )
+    }
+}
+
+/// Launch KCMM paged-attention decode on a caller-owned CUDA stream without
+/// rebinding the CUDA context.
+///
+/// This is a narrower performance path for framework-owned seams such as
+/// PyTorch/vLLM, where fetching the current framework stream also guarantees
+/// that the correct CUDA context is current on the calling thread. Use
+/// `kcmm_paged_attn_decode_f16_on_stream` for generic FFI callers.
+///
+/// # Safety
+/// Same as `kcmm_paged_attn_decode_f16_on_stream`, plus the caller must have
+/// already made the pool's CUDA context current on this thread.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_paged_attn_decode_f16_on_current_context_stream(
+    pool: *mut kcmm_pool_t,
+    layer_idx: u32,
+    query_ptr: u64,
+    out_ptr: u64,
+    block_tables_ptr: u64,
+    seq_lens_ptr: u64,
+    block_offsets_f16_ptr: u64,
+    batch: u32,
+    num_q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    max_blocks_per_seq: u32,
+    scale: f32,
+    stream_ptr: u64,
+) -> i32 {
+    unsafe {
+        kcmm_paged_attn_decode_f16_impl(
+            pool,
+            layer_idx,
+            query_ptr,
+            out_ptr,
+            block_tables_ptr,
+            seq_lens_ptr,
+            block_offsets_f16_ptr,
+            batch,
+            num_q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            scale,
+            stream_ptr,
+            false,
+            false,
         )
     }
 }
@@ -1348,6 +1430,7 @@ unsafe fn kcmm_paged_attn_decode_f16_impl(
     scale: f32,
     stream_ptr: u64,
     synchronize_after_launch: bool,
+    bind_context_before_launch: bool,
 ) -> i32 {
     if pool.is_null()
         || query_ptr == 0
@@ -1441,12 +1524,14 @@ unsafe fn kcmm_paged_attn_decode_f16_impl(
     };
     let packed_heads = ((kv_heads as i32) << 16) | (num_q_heads as i32);
     let packed_blocks = ((max_blocks_per_seq as i32) << 16) | (block_size as i32);
-    if let Err(e) = handle.pool.ctx.device.bind_to_thread() {
-        handle.set_error(format!(
-            "kcmm_paged_attn_decode_f16: bind context failed: {:#}",
-            e
-        ));
-        return -1;
+    if bind_context_before_launch {
+        if let Err(e) = handle.pool.ctx.device.bind_to_thread() {
+            handle.set_error(format!(
+                "kcmm_paged_attn_decode_f16: bind context failed: {:#}",
+                e
+            ));
+            return -1;
+        }
     }
     let mut query_ptr_arg = query_ptr;
     let mut va_k_arg = va_k;

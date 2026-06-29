@@ -342,19 +342,23 @@ profiling off. It also disables per-update tracker report writes and relies on
 the final process-exit reports for validation. After correctness coverage has
 passed, it disables host-side read block-table validation and caches the GPU
 `offset_table[block_id] = kcmm_f16_va_offset` tensor across read seams, rebuilding
-only when the KCMM block count grows or the target device changes. The gate still
-requires token-exact stock-vs-KCMM output, GPU read-kernel calls, zero
-CPU-staged reference read bytes, and zero write verification rows/synchronizations.
-It is cleaner than the correctness gates, but it still includes vLLM server,
+only when the KCMM block count grows or the target device changes. It also uses
+the current-context stream launch ABI and precompiles the KCMM paged-attention
+kernel when the runtime pool attaches, moving NVRTC/module-load cost out of the
+first measured request. The gate still requires token-exact stock-vs-KCMM
+output, GPU read-kernel calls, zero CPU-staged reference read bytes, successful
+read-kernel precompile, and zero write verification rows/synchronizations. It
+is cleaner than the correctness gates, but it still includes vLLM server,
 Python monkey-patch, and scheduling overhead.
 
 `python -m scripts.kcmm.vllm_gpu_read_host_profile_gate` wraps that
 performance-clean gate with section-level host wall-clock timing enabled in the
 KCMM read/write trackers. This is diagnostic-only and remains off by default.
-The first local run showed the dominant measured host sections nested under
-read-side replacement and Python/ctypes kernel launch
-(`read_gpu_kernel_ctypes_launch`), not under write verification or per-update
-JSON reporting.
+The first local run showed the dominant measured request-time section nested
+under Python/ctypes kernel launch because the first FFI call compiled/loaded
+the CUDA kernel. After precompile, that cost is visible as a one-time
+`read_gpu_kernel_precompile` attach-time section and
+`read_gpu_kernel_ctypes_launch` is no longer the dominant request-time cost.
 
 `python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate` now covers the
 local tensor-parallel case with `tensor_parallel_size=2` on the dual RTX 3080

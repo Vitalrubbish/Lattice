@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -157,6 +158,8 @@ class KcmmKvReadOffsetTableTracker:
         report_on_update: bool = True,
         validate_block_tables: bool = True,
         profile_host_sections: bool = False,
+        fast_current_context_launch: bool = False,
+        precompile_gpu_kernel: bool = False,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
@@ -168,6 +171,8 @@ class KcmmKvReadOffsetTableTracker:
         self._report_on_update = bool(report_on_update)
         self._validate_block_tables = bool(validate_block_tables)
         self._host_profiler = HostSectionProfiler(profile_host_sections)
+        self._fast_current_context_launch = bool(fast_current_context_launch)
+        self._precompile_gpu_kernel = bool(precompile_gpu_kernel)
         self._stream_provider = KcmmStreamProvider(
             force_non_default=force_non_default_stream
         )
@@ -200,6 +205,10 @@ class KcmmKvReadOffsetTableTracker:
         self._recent_offset_tables: list[Any] = []
         self._offset_table_cache_hits = 0
         self._offset_table_cache_rebuilds = 0
+        self._gpu_kernel_precompile_requested = bool(precompile_gpu_kernel)
+        self._gpu_kernel_precompile_calls = 0
+        self._gpu_kernel_precompile_succeeded = False
+        self._gpu_kernel_precompile_elapsed_ms: float | None = None
 
     @property
     def replace_native(self) -> bool:
@@ -208,6 +217,26 @@ class KcmmKvReadOffsetTableTracker:
     def attach_pool(self, pool: KcmmPool) -> None:
         with self._lock:
             self._pool = pool
+            if self._precompile_gpu_kernel and self._replacement_backend == "gpu_kernel":
+                started_ns = self._host_profiler.start()
+                precompile_started_ns = time.perf_counter_ns()
+                self._gpu_kernel_precompile_calls += 1
+                try:
+                    pool.precompile_paged_attn_decode_f16()
+                except BaseException as exc:
+                    self._record_error(exc)
+                    raise
+                finally:
+                    elapsed_ns = time.perf_counter_ns() - precompile_started_ns
+                    self._gpu_kernel_precompile_elapsed_ms = round(
+                        elapsed_ns / 1_000_000,
+                        6,
+                    )
+                    self._host_profiler.stop(
+                        "read_gpu_kernel_precompile",
+                        started_ns,
+                    )
+                self._gpu_kernel_precompile_succeeded = True
             self._write_report_on_update()
 
     def validate_runtime(self, sizing: Any) -> None:
@@ -789,22 +818,47 @@ class KcmmKvReadOffsetTableTracker:
         block_offsets_f16_ptr = _data_ptr(offset_table, "block_offsets_f16")
         self._host_profiler.stop("read_gpu_kernel_data_ptrs", ptr_started_ns)
         launch_started_ns = self._host_profiler.start()
-        pool.paged_attn_decode_f16(
-            layer_idx=layer_idx,
-            query_ptr=query_ptr,
-            out_ptr=out_ptr,
-            block_tables_ptr=block_tables_ptr,
-            seq_lens_ptr=seq_lens_ptr,
-            block_offsets_f16_ptr=block_offsets_f16_ptr,
-            batch=int(query_shape[0]),
-            num_q_heads=int(query_shape[1]),
-            kv_heads=int(arguments["num_kv_heads"]),
-            head_dim=int(query_shape[2]),
-            block_size=int(arguments["block_size"]),
-            max_blocks_per_seq=int(block_tables_shape[1]),
-            scale=float(arguments["scale"]),
-            stream_ptr=stream_selection.stream_ptr,
-        )
+        batch = int(query_shape[0])
+        num_q_heads = int(query_shape[1])
+        kv_heads = int(arguments["num_kv_heads"])
+        head_dim = int(query_shape[2])
+        block_size = int(arguments["block_size"])
+        max_blocks_per_seq = int(block_tables_shape[1])
+        scale = float(arguments["scale"])
+        if self._fast_current_context_launch:
+            pool.paged_attn_decode_f16_on_current_context_stream(
+                layer_idx,
+                query_ptr,
+                out_ptr,
+                block_tables_ptr,
+                seq_lens_ptr,
+                block_offsets_f16_ptr,
+                batch,
+                num_q_heads,
+                kv_heads,
+                head_dim,
+                block_size,
+                max_blocks_per_seq,
+                scale,
+                stream_selection.stream_ptr,
+            )
+        else:
+            pool.paged_attn_decode_f16(
+                layer_idx=layer_idx,
+                query_ptr=query_ptr,
+                out_ptr=out_ptr,
+                block_tables_ptr=block_tables_ptr,
+                seq_lens_ptr=seq_lens_ptr,
+                block_offsets_f16_ptr=block_offsets_f16_ptr,
+                batch=batch,
+                num_q_heads=num_q_heads,
+                kv_heads=kv_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                max_blocks_per_seq=max_blocks_per_seq,
+                scale=scale,
+                stream_ptr=stream_selection.stream_ptr,
+            )
         self._host_profiler.stop("read_gpu_kernel_ctypes_launch", launch_started_ns)
         if end_event is not None:
             end_event.record(stream_selection.stream)
@@ -862,6 +916,17 @@ class KcmmKvReadOffsetTableTracker:
                 "report_on_update": self._report_on_update,
                 "report_write_count": self._report_write_count,
                 "block_table_validation_enabled": self._validate_block_tables,
+                "fast_current_context_launch": self._fast_current_context_launch,
+                "gpu_kernel_precompile_requested": (
+                    self._gpu_kernel_precompile_requested
+                ),
+                "gpu_kernel_precompile_calls": self._gpu_kernel_precompile_calls,
+                "gpu_kernel_precompile_succeeded": (
+                    self._gpu_kernel_precompile_succeeded
+                ),
+                "gpu_kernel_precompile_elapsed_ms": (
+                    self._gpu_kernel_precompile_elapsed_ms
+                ),
                 "offset_table_contract": "torch.int64[f16_va_offset_by_block_id]",
                 "required_allocator_mode": "kcmm_backed_allocator",
                 "pool_attached": self._pool is not None,
