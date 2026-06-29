@@ -744,18 +744,20 @@ not launch the GPU read kernel, if CPU-staged reference read bytes are observed,
 or if the write report shows any verified rows or verification synchronizations.
 Use the regular correctness/profile gates when debugging contracts; use this
 gate as the cleaner request-level baseline before kernel optimization.
-The performance-clean gate also disables per-update tracker report writes and
-relies on final process-exit reports; correctness gates keep per-update reports
-enabled by default for better failure diagnostics.
+The performance-clean gate also disables per-update tracker report writes,
+disables host-side read block-table validation, caches the GPU offset table
+across read seams, and relies on final process-exit reports. Correctness gates
+keep per-update reports and block-table validation enabled by default for better
+failure diagnostics.
 
 Latest local performance-clean result on 2026-06-29 after deferring tracker
-reports:
+reports and caching the read offset table:
 
 - Command:
   `python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-1782723060120.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-1782743265566.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Model: `facebook/opt-125m`
@@ -765,16 +767,18 @@ reports:
 - Stream-aware read kernel calls: `372`
 - Reference KCMM read bytes: `0`
 - KCMM write verified rows: `0`
+- Read block-table validation enabled: `false`
+- Offset table cache hits/rebuilds: `369/3`
 - Read tracker report writes: `1`
 - Write tracker report writes: `1`
 - Stream-level write verification synchronizations: `0`
 - KCMM write verification enabled: `false`
-- Request latency seconds: stock `1.820`, KCMM `1.951`, ratio `1.072`
-- Tokens per second: stock `17.582`, KCMM `16.402`, ratio `0.933`
+- Request latency seconds: stock `1.814`, KCMM `1.934`, ratio `1.066`
+- Tokens per second: stock `17.641`, KCMM `16.546`, ratio `0.938`
 - Peak GPU memory delta MiB: stock `5441`, KCMM `5591`, ratio `1.028`
 - Compared with the first performance-clean run, KCMM request latency improved
-  from `3.285s` to `1.951s` after per-update tracker report writes were
-  disabled.
+  from `3.285s` to `1.934s` after per-update tracker report writes were
+  disabled and the read offset table was cached.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 Latest local performance characterization on 2026-06-20:

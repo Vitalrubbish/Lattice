@@ -62,6 +62,7 @@ class GateConfig:
     completion_concurrency: int
     kv_force_non_default_stream: bool
     kv_read_profile: bool
+    kv_read_validate_block_tables: bool
     instrument_kv_reads: bool
     kv_write_verify: bool
     tracker_report_on_update: bool
@@ -133,6 +134,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Enable bounded D2H verification of KCMM KV writes in the KCMM "
             "mode. Disable for performance-clean gates."
+        ),
+    )
+    parser.add_argument(
+        "--kv-read-validate-block-tables",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Validate sampled paged-attention block_tables on the host in the "
+            "KCMM mode. Disable for performance-clean gates after correctness "
+            "coverage passes."
         ),
     )
     parser.add_argument(
@@ -292,6 +303,7 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         completion_concurrency=args.completion_concurrency,
         kv_force_non_default_stream=args.kv_force_non_default_stream,
         kv_read_profile=args.kv_read_profile,
+        kv_read_validate_block_tables=args.kv_read_validate_block_tables,
         instrument_kv_reads=args.instrument_kv_reads,
         kv_write_verify=args.kv_write_verify,
         tracker_report_on_update=args.tracker_report_on_update,
@@ -348,6 +360,7 @@ def smoke_config_for_mode(
         kv_read_replace_candidate=False,
         kv_read_gpu_kernel_candidate=is_gpu_read,
         kv_read_profile=(is_gpu_read and config.kv_read_profile),
+        kv_read_validate_block_tables=config.kv_read_validate_block_tables,
         tracker_report_on_update=config.tracker_report_on_update,
         kv_write_mirror=False,
         kv_write_replace_candidate=is_gpu_read,
@@ -485,6 +498,13 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "reference_read_bytes": read_report.get("reference_read_bytes"),
         "replacement_calls": read_report.get("replacement_calls"),
         "offset_table_builds": read_report.get("offset_table_builds"),
+        "offset_table_cache_hits": read_report.get("offset_table_cache_hits"),
+        "offset_table_cache_rebuilds": read_report.get(
+            "offset_table_cache_rebuilds"
+        ),
+        "read_block_table_validation_enabled": read_report.get(
+            "block_table_validation_enabled"
+        ),
         "read_report_on_update": read_report.get("report_on_update"),
         "read_report_write_count": read_report.get("report_write_count"),
         "native_write_skipped_calls": write_report.get("native_skipped_calls"),
@@ -887,6 +907,7 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "completion_concurrency": config.completion_concurrency,
         "kv_force_non_default_stream": config.kv_force_non_default_stream,
         "kv_read_profile": config.kv_read_profile,
+        "kv_read_validate_block_tables": config.kv_read_validate_block_tables,
         "instrument_kv_reads": config.instrument_kv_reads,
         "kv_write_verify": config.kv_write_verify,
         "tracker_report_on_update": config.tracker_report_on_update,

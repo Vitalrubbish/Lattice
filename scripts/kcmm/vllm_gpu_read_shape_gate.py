@@ -303,6 +303,7 @@ def gate_config_for_variant(
         completion_concurrency=1,
         kv_force_non_default_stream=False,
         kv_read_profile=False,
+        kv_read_validate_block_tables=True,
         instrument_kv_reads=True,
         kv_write_verify=True,
         tracker_report_on_update=True,

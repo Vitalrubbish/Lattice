@@ -133,6 +133,7 @@ class ObserverConfig:
     kv_read_replace_candidate: bool = False
     kv_read_gpu_kernel_candidate: bool = False
     kv_read_profile: bool = False
+    kv_read_validate_block_tables: bool = True
     tracker_report_on_update: bool = True
     kv_read_offset_table_report_path: str | None = None
     kv_force_non_default_stream: bool = False
@@ -197,6 +198,9 @@ class ObserverConfig:
                 "KCMM_KV_READ_GPU_KERNEL_CANDIDATE", False
             ),
             kv_read_profile=_env_bool("KCMM_KV_READ_PROFILE", False),
+            kv_read_validate_block_tables=_env_bool(
+                "KCMM_KV_READ_VALIDATE_BLOCK_TABLES", True
+            ),
             tracker_report_on_update=_env_bool(
                 "KCMM_TRACKER_REPORT_ON_UPDATE", True
             ),
@@ -509,6 +513,15 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--kcmm-kv-read-profile",
         action="store_true",
         default=None,
+    )
+    parser.add_argument(
+        "--kcmm-kv-read-validate-block-tables",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Validate sampled paged-attention block_tables on the host. "
+            "Disable for performance-clean gates after correctness coverage passes."
+        ),
     )
     parser.add_argument(
         "--kcmm-tracker-report-on-update",

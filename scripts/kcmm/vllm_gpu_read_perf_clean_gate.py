@@ -163,6 +163,7 @@ def parse_config(argv: list[str] | None = None) -> PerfCleanGateConfig:
             completion_concurrency=1,
             kv_force_non_default_stream=False,
             kv_read_profile=False,
+            kv_read_validate_block_tables=False,
             instrument_kv_reads=False,
             kv_write_verify=False,
             tracker_report_on_update=False,
@@ -215,6 +216,14 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         ),
         "write_verification_enabled": contract.get("write_verification_enabled"),
         "write_verify_rows_per_call": contract.get("write_verify_rows_per_call"),
+        "read_block_table_validation_enabled": contract.get(
+            "read_block_table_validation_enabled"
+        ),
+        "offset_table_builds": contract.get("offset_table_builds"),
+        "offset_table_cache_hits": contract.get("offset_table_cache_hits"),
+        "offset_table_cache_rebuilds": contract.get(
+            "offset_table_cache_rebuilds"
+        ),
         "read_report_on_update": contract.get("read_report_on_update"),
         "read_report_write_count": contract.get("read_report_write_count"),
         "write_report_on_update": contract.get("write_report_on_update"),
@@ -286,6 +295,42 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "value": kcmm_mode.get("tracker_report_on_update"),
             }
         )
+    if contract.get("read_block_table_validation_enabled") is not False:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_block_table_validation_not_disabled",
+                "value": contract.get("read_block_table_validation_enabled"),
+            }
+        )
+    if not isinstance(contract.get("offset_table_cache_hits"), int):
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "offset_table_cache_hits_missing",
+                "value": contract.get("offset_table_cache_hits"),
+            }
+        )
+    if not isinstance(contract.get("offset_table_cache_rebuilds"), int):
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "offset_table_cache_rebuilds_missing",
+                "value": contract.get("offset_table_cache_rebuilds"),
+            }
+        )
+    cache_hits = contract.get("offset_table_cache_hits")
+    cache_rebuilds = contract.get("offset_table_cache_rebuilds")
+    if isinstance(cache_hits, int) and isinstance(cache_rebuilds, int):
+        if cache_hits <= 0:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "offset_table_cache_unused",
+                    "offset_table_cache_hits": cache_hits,
+                    "offset_table_cache_rebuilds": cache_rebuilds,
+                }
+            )
     for key in ("read_report_on_update", "write_report_on_update"):
         if contract.get(key) is not False:
             failures.append(

@@ -61,6 +61,7 @@ class SmokeConfig:
     kv_read_replace_candidate: bool
     kv_read_gpu_kernel_candidate: bool
     kv_read_profile: bool
+    kv_read_validate_block_tables: bool
     tracker_report_on_update: bool
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
@@ -215,6 +216,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Write KCMM tracker reports after every observed seam call. "
             "Disable for performance-clean gates that only need final reports."
+        ),
+    )
+    parser.add_argument(
+        "--kv-read-validate-block-tables",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Validate sampled paged-attention block_tables on the host. "
+            "Disable for performance-clean gates after correctness coverage passes."
         ),
     )
     parser.add_argument(
@@ -389,6 +399,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         kv_read_replace_candidate=args.kv_read_replace_candidate,
         kv_read_gpu_kernel_candidate=args.kv_read_gpu_kernel_candidate,
         kv_read_profile=args.kv_read_profile,
+        kv_read_validate_block_tables=args.kv_read_validate_block_tables,
         tracker_report_on_update=args.tracker_report_on_update,
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
@@ -701,6 +712,8 @@ def vllm_command(config: SmokeConfig) -> list[str]:
             )
             if config.kv_read_profile:
                 command.append("--kcmm-kv-read-profile")
+            if not config.kv_read_validate_block_tables:
+                command.append("--no-kcmm-kv-read-validate-block-tables")
         if (
             not config.tracker_report_on_update
             and (
@@ -1488,6 +1501,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "kv_read_replace_candidate": config.kv_read_replace_candidate,
             "kv_read_gpu_kernel_candidate": config.kv_read_gpu_kernel_candidate,
             "kv_read_profile": config.kv_read_profile,
+            "kv_read_validate_block_tables": config.kv_read_validate_block_tables,
             "tracker_report_on_update": config.tracker_report_on_update,
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,

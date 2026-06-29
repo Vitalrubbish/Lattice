@@ -165,6 +165,7 @@ def parse_config(argv: list[str] | None = None) -> BatchGateConfig:
             completion_concurrency=args.completion_concurrency,
             kv_force_non_default_stream=False,
             kv_read_profile=False,
+            kv_read_validate_block_tables=True,
             instrument_kv_reads=True,
             kv_write_verify=True,
             tracker_report_on_update=True,

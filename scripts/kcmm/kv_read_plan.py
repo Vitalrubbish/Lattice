@@ -45,6 +45,8 @@ class ReadPlanCall:
     missing_block_ids: list[int]
     block_locations_sample: dict[str, str]
     offset_f16_sample: dict[str, int]
+    block_table_validation_enabled: bool
+    offset_table_reused: bool
     native_replaced: bool
     replacement_backend: str
     reference_read_bytes: int
@@ -152,6 +154,7 @@ class KcmmKvReadOffsetTableTracker:
         force_non_default_stream: bool = False,
         profile_gpu_kernel: bool = False,
         report_on_update: bool = True,
+        validate_block_tables: bool = True,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
@@ -161,6 +164,7 @@ class KcmmKvReadOffsetTableTracker:
         self._replacement_backend = replacement_backend
         self._profile_gpu_kernel = bool(profile_gpu_kernel)
         self._report_on_update = bool(report_on_update)
+        self._validate_block_tables = bool(validate_block_tables)
         self._stream_provider = KcmmStreamProvider(
             force_non_default=force_non_default_stream
         )
@@ -189,6 +193,10 @@ class KcmmKvReadOffsetTableTracker:
         self._error_count = 0
         self._last_error: str | None = None
         self._last_offset_table: Any | None = None
+        self._last_offsets_f16: list[int] = []
+        self._recent_offset_tables: list[Any] = []
+        self._offset_table_cache_hits = 0
+        self._offset_table_cache_rebuilds = 0
 
     @property
     def replace_native(self) -> bool:
@@ -257,6 +265,38 @@ class KcmmKvReadOffsetTableTracker:
         )
         return layer_idx
 
+    def _offset_table_for_device(
+        self,
+        *,
+        pool: KcmmPool,
+        device: Any,
+        min_entries: int,
+    ) -> tuple[list[int], Any, bool]:
+        cached_table = self._last_offset_table
+        if (
+            cached_table is not None
+            and self._last_offsets_f16
+            and len(self._last_offsets_f16) >= min_entries
+            and str(getattr(cached_table, "device", None)) == str(device)
+        ):
+            self._offset_table_cache_hits += 1
+            return self._last_offsets_f16, cached_table, True
+
+        import torch
+
+        offsets_f16 = pool.all_block_offsets_f16(min_entries=min_entries)
+        offset_table = torch.tensor(
+            offsets_f16,
+            dtype=torch.int64,
+            device=device,
+        )
+        self._last_offsets_f16 = offsets_f16
+        self._last_offset_table = offset_table
+        self._recent_offset_tables.append(offset_table)
+        self._recent_offset_tables = self._recent_offset_tables[-16:]
+        self._offset_table_cache_rebuilds += 1
+        return offsets_f16, offset_table, False
+
     def _build_plan(
         self,
         function_name: str,
@@ -275,38 +315,45 @@ class KcmmKvReadOffsetTableTracker:
         block_tables_shape = _shape(block_tables)
         seq_lens_shape = _shape(seq_lens)
         batch = query_shape[0] if query_shape else None
-        block_ids = _tensor_block_ids(block_tables)
-        unique_ids = sorted(set(block_ids))
-        max_block_id = max(unique_ids) if unique_ids else None
-        min_entries = (max_block_id + 1) if max_block_id is not None else 1
+        device = getattr(block_tables, "device", "cpu")
+        if self._validate_block_tables:
+            block_ids = _tensor_block_ids(block_tables)
+            unique_ids = sorted(set(block_ids))
+            max_block_id = max(unique_ids) if unique_ids else None
+            min_entries = (max_block_id + 1) if max_block_id is not None else 1
+        else:
+            pool_stats = pool.stats()
+            block_ids = []
+            unique_ids = []
+            max_block_id = None
+            min_entries = max(
+                int(pool_stats.get("total_blocks", 0)),
+                int(pool_stats.get("blocks_in_use", 0)),
+                1,
+            )
 
-        offsets_f16 = pool.all_block_offsets_f16(min_entries=min_entries)
+        offsets_f16, offset_table, offset_table_reused = self._offset_table_for_device(
+            pool=pool,
+            device=device,
+            min_entries=min_entries,
+        )
         missing_block_ids: list[int] = []
         locations: dict[int, str] = {}
-        for block_id in unique_ids:
-            if block_id >= len(offsets_f16):
-                missing_block_ids.append(block_id)
-                continue
-            try:
-                locations[block_id] = pool.block_location(block_id)
-            except Exception:
-                missing_block_ids.append(block_id)
+        if self._validate_block_tables:
+            for block_id in unique_ids:
+                if block_id >= len(offsets_f16):
+                    missing_block_ids.append(block_id)
+                    continue
+                try:
+                    locations[block_id] = pool.block_location(block_id)
+                except Exception:
+                    missing_block_ids.append(block_id)
 
         if missing_block_ids:
             raise KcmmError(
                 "KCMM read offset table is missing block ids observed "
                 f"in vLLM block_tables: {missing_block_ids[:16]}"
             )
-
-        import torch
-
-        device = getattr(block_tables, "device", "cpu")
-        offset_table = torch.tensor(
-            offsets_f16,
-            dtype=torch.int64,
-            device=device,
-        )
-        self._last_offset_table = offset_table
 
         sample_ids = unique_ids[:16]
         call = ReadPlanCall(
@@ -340,6 +387,8 @@ class KcmmKvReadOffsetTableTracker:
             offset_f16_sample={
                 str(block_id): int(offsets_f16[block_id]) for block_id in sample_ids
             },
+            block_table_validation_enabled=self._validate_block_tables,
+            offset_table_reused=offset_table_reused,
             native_replaced=self._replace_native,
             replacement_backend=self._replacement_backend,
             reference_read_bytes=0,
@@ -749,6 +798,7 @@ class KcmmKvReadOffsetTableTracker:
                 ),
                 "report_on_update": self._report_on_update,
                 "report_write_count": self._report_write_count,
+                "block_table_validation_enabled": self._validate_block_tables,
                 "offset_table_contract": "torch.int64[f16_va_offset_by_block_id]",
                 "required_allocator_mode": "kcmm_backed_allocator",
                 "pool_attached": self._pool is not None,
@@ -761,6 +811,8 @@ class KcmmKvReadOffsetTableTracker:
                     self._forced_non_default_stream_calls
                 ),
                 "offset_table_builds": self._offset_table_builds,
+                "offset_table_cache_hits": self._offset_table_cache_hits,
+                "offset_table_cache_rebuilds": self._offset_table_cache_rebuilds,
                 "reference_read_bytes": self._reference_read_bytes,
                 "total_block_table_entries": self._total_block_table_entries,
                 "unique_block_ids_seen": len(self._unique_block_ids_seen),
