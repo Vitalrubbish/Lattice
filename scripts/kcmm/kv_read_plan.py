@@ -151,6 +151,7 @@ class KcmmKvReadOffsetTableTracker:
         replacement_backend: str = "reference",
         force_non_default_stream: bool = False,
         profile_gpu_kernel: bool = False,
+        report_on_update: bool = True,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
@@ -159,6 +160,7 @@ class KcmmKvReadOffsetTableTracker:
             raise ValueError(f"unsupported replacement backend: {replacement_backend}")
         self._replacement_backend = replacement_backend
         self._profile_gpu_kernel = bool(profile_gpu_kernel)
+        self._report_on_update = bool(report_on_update)
         self._stream_provider = KcmmStreamProvider(
             force_non_default=force_non_default_stream
         )
@@ -183,6 +185,7 @@ class KcmmKvReadOffsetTableTracker:
         self._gpu_kernel_profile_samples_ms: list[float] = []
         self._counts_by_function: dict[str, int] = {}
         self._recent_calls: list[ReadPlanCall] = []
+        self._report_write_count = 0
         self._error_count = 0
         self._last_error: str | None = None
         self._last_offset_table: Any | None = None
@@ -194,7 +197,7 @@ class KcmmKvReadOffsetTableTracker:
     def attach_pool(self, pool: KcmmPool) -> None:
         with self._lock:
             self._pool = pool
-            self.write_report()
+            self._write_report_on_update()
 
     def validate_runtime(self, sizing: Any) -> None:
         if getattr(sizing, "vllm_version", None) != "0.6.1.post1":
@@ -217,6 +220,10 @@ class KcmmKvReadOffsetTableTracker:
         self._error_count += 1
         self._last_error = f"{type(exc).__name__}: {exc}"
         self.write_report()
+
+    def _write_report_on_update(self) -> None:
+        if self._report_on_update:
+            self.write_report()
 
     def _cuda_driver(self) -> _CudaDriver:
         if self._driver is None:
@@ -417,7 +424,7 @@ class KcmmKvReadOffsetTableTracker:
                     )
                 self._recent_calls.append(call)
                 self._recent_calls = self._recent_calls[-16:]
-                self.write_report()
+                self._write_report_on_update()
             except BaseException as exc:
                 self._record_error(exc)
                 raise
@@ -487,7 +494,7 @@ class KcmmKvReadOffsetTableTracker:
                     )
                 self._recent_calls.append(call)
                 self._recent_calls = self._recent_calls[-16:]
-                self.write_report()
+                self._write_report_on_update()
             except BaseException as exc:
                 self._record_error(exc)
                 raise
@@ -740,6 +747,8 @@ class KcmmKvReadOffsetTableTracker:
                 "force_non_default_stream": (
                     self._stream_provider.force_non_default
                 ),
+                "report_on_update": self._report_on_update,
+                "report_write_count": self._report_write_count,
                 "offset_table_contract": "torch.int64[f16_va_offset_by_block_id]",
                 "required_allocator_mode": "kcmm_backed_allocator",
                 "pool_attached": self._pool is not None,
@@ -780,6 +789,7 @@ class KcmmKvReadOffsetTableTracker:
         if self._report_path is None:
             return
         self._report_path.parent.mkdir(parents=True, exist_ok=True)
+        self._report_write_count += 1
         self._report_path.write_text(
             json.dumps(self.report(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

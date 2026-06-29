@@ -338,10 +338,12 @@ coverage inside the current kernel envelope.
 baseline for performance work after correctness has been proven. It runs the
 same stock-vs-KCMM real-model comparison, but disables test-only KV read trace
 instrumentation, disables KV write D2H row verification, and leaves read-kernel
-profiling off. The gate still requires token-exact stock-vs-KCMM output, GPU
-read-kernel calls, zero CPU-staged reference read bytes, and zero write
-verification rows/synchronizations. It is cleaner than the correctness gates,
-but it still includes vLLM server, Python monkey-patch, and scheduling overhead.
+profiling off. It also disables per-update tracker report writes and relies on
+the final process-exit reports for validation. The gate still requires
+token-exact stock-vs-KCMM output, GPU read-kernel calls, zero CPU-staged
+reference read bytes, and zero write verification rows/synchronizations. It is
+cleaner than the correctness gates, but it still includes vLLM server, Python
+monkey-patch, and scheduling overhead.
 
 `python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate` now covers the
 local tensor-parallel case with `tensor_parallel_size=2` on the dual RTX 3080

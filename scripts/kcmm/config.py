@@ -133,6 +133,7 @@ class ObserverConfig:
     kv_read_replace_candidate: bool = False
     kv_read_gpu_kernel_candidate: bool = False
     kv_read_profile: bool = False
+    tracker_report_on_update: bool = True
     kv_read_offset_table_report_path: str | None = None
     kv_force_non_default_stream: bool = False
     shadow_allocations: bool = False
@@ -196,6 +197,9 @@ class ObserverConfig:
                 "KCMM_KV_READ_GPU_KERNEL_CANDIDATE", False
             ),
             kv_read_profile=_env_bool("KCMM_KV_READ_PROFILE", False),
+            tracker_report_on_update=_env_bool(
+                "KCMM_TRACKER_REPORT_ON_UPDATE", True
+            ),
             kv_read_offset_table_report_path=(
                 os.environ.get("KCMM_KV_READ_OFFSET_TABLE_REPORT_PATH") or None
             ),
@@ -505,6 +509,15 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--kcmm-kv-read-profile",
         action="store_true",
         default=None,
+    )
+    parser.add_argument(
+        "--kcmm-tracker-report-on-update",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Write KCMM tracker reports after every observed seam call. "
+            "Disable for performance-clean gates that only need final reports."
+        ),
     )
     parser.add_argument("--kcmm-kv-read-offset-table-report-path", default=None)
     parser.add_argument(

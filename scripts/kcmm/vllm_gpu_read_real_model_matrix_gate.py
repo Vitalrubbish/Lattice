@@ -205,6 +205,7 @@ def parse_config(argv: list[str] | None = None) -> RealModelMatrixConfig:
             kv_read_profile=False,
             instrument_kv_reads=True,
             kv_write_verify=True,
+            tracker_report_on_update=True,
             build_kcmm=args.build_kcmm,
             keep_model=True,
             print_seams=args.print_seams,

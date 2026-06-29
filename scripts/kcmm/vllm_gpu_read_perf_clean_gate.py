@@ -165,6 +165,7 @@ def parse_config(argv: list[str] | None = None) -> PerfCleanGateConfig:
             kv_read_profile=False,
             instrument_kv_reads=False,
             kv_write_verify=False,
+            tracker_report_on_update=False,
             build_kcmm=args.build_kcmm,
             keep_model=True,
             print_seams=args.print_seams,
@@ -207,8 +208,17 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
             if isinstance(kcmm_mode, dict)
             else None
         ),
+        "kcmm_mode_tracker_report_on_update": (
+            kcmm_mode.get("tracker_report_on_update")
+            if isinstance(kcmm_mode, dict)
+            else None
+        ),
         "write_verification_enabled": contract.get("write_verification_enabled"),
         "write_verify_rows_per_call": contract.get("write_verify_rows_per_call"),
+        "read_report_on_update": contract.get("read_report_on_update"),
+        "read_report_write_count": contract.get("read_report_write_count"),
+        "write_report_on_update": contract.get("write_report_on_update"),
+        "write_report_write_count": contract.get("write_report_write_count"),
         "kcmm_write_verified_rows": contract.get("kcmm_write_verified_rows"),
         "write_stream_synchronize_for_verification_calls": contract.get(
             "write_stream_synchronize_for_verification_calls"
@@ -268,6 +278,34 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "value": kcmm_mode.get("kv_write_verify"),
             }
         )
+    if kcmm_mode.get("tracker_report_on_update") is not False:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "tracker_report_on_update_not_disabled_in_smoke",
+                "value": kcmm_mode.get("tracker_report_on_update"),
+            }
+        )
+    for key in ("read_report_on_update", "write_report_on_update"):
+        if contract.get(key) is not False:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": f"{key}_not_disabled",
+                    "value": contract.get(key),
+                }
+            )
+    for key in ("read_report_write_count", "write_report_write_count"):
+        value = contract.get(key)
+        if not isinstance(value, int) or value > 2:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": f"{key}_too_high",
+                    "value": value,
+                    "threshold": 2,
+                }
+            )
     if contract.get("write_verification_enabled") is not False:
         failures.append(
             {

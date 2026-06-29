@@ -102,12 +102,14 @@ class KcmmKvWriteMirrorTracker:
         report_path: str | None = None,
         *,
         verify_rows_per_call: int = 4,
+        report_on_update: bool = True,
         replace_native: bool = False,
         force_non_default_stream: bool = False,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
         self._verify_rows_per_call = max(0, int(verify_rows_per_call))
+        self._report_on_update = bool(report_on_update)
         self._replace_native = bool(replace_native)
         self._stream_provider = KcmmStreamProvider(
             force_non_default=force_non_default_stream
@@ -136,6 +138,7 @@ class KcmmKvWriteMirrorTracker:
         self._max_batch_seen = 0
         self._counts_by_function: dict[str, int] = {}
         self._recent_calls: list[dict[str, Any]] = []
+        self._report_write_count = 0
         self._error_count = 0
         self._last_error: str | None = None
 
@@ -152,7 +155,7 @@ class KcmmKvWriteMirrorTracker:
     def attach_pool(self, pool: KcmmPool) -> None:
         with self._lock:
             self._pool = pool
-            self.write_report()
+            self._write_report_on_update()
 
     def _require_pool(self) -> KcmmPool:
         if self._pool is None:
@@ -316,6 +319,10 @@ class KcmmKvWriteMirrorTracker:
         self._last_error = f"{type(exc).__name__}: {exc}"
         self.write_report()
 
+    def _write_report_on_update(self) -> None:
+        if self._report_on_update:
+            self.write_report()
+
     def mirror_call(
         self,
         call_key: str,
@@ -340,7 +347,7 @@ class KcmmKvWriteMirrorTracker:
             if self._pool is None:
                 if native_written:
                     self._skipped_no_pool_calls += 1
-                    self.write_report()
+                    self._write_report_on_update()
                     return
                 exc = KcmmError(
                     "KCMM KV write replacement cannot skip native write before "
@@ -356,7 +363,7 @@ class KcmmKvWriteMirrorTracker:
                 self._max_batch_seen = max(self._max_batch_seen, batch)
                 if batch == 0:
                     self._skipped_empty_batches += 1
-                    self.write_report()
+                    self._write_report_on_update()
                     return
 
                 pool = self._require_pool()
@@ -449,7 +456,7 @@ class KcmmKvWriteMirrorTracker:
                     }
                 )
                 self._recent_calls = self._recent_calls[-16:]
-                self.write_report()
+                self._write_report_on_update()
             except BaseException as exc:
                 self._record_error(exc)
                 raise
@@ -482,6 +489,8 @@ class KcmmKvWriteMirrorTracker:
                 ),
                 "write_verification_enabled": self._verify_rows_per_call > 0,
                 "verify_rows_per_call": self._verify_rows_per_call,
+                "report_on_update": self._report_on_update,
+                "report_write_count": self._report_write_count,
                 "slot_formula": "slot = block_id * block_size + offset_in_block",
                 "pool_attached": self._pool is not None,
                 "write_calls": self._write_calls,
@@ -526,6 +535,7 @@ class KcmmKvWriteMirrorTracker:
         if self._report_path is None:
             return
         self._report_path.parent.mkdir(parents=True, exist_ok=True)
+        self._report_write_count += 1
         self._report_path.write_text(
             json.dumps(self.report(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

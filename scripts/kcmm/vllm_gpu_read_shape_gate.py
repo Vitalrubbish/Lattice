@@ -305,6 +305,7 @@ def gate_config_for_variant(
         kv_read_profile=False,
         instrument_kv_reads=True,
         kv_write_verify=True,
+        tracker_report_on_update=True,
         build_kcmm=config.build_kcmm,
         keep_model=True,
         print_seams=config.print_seams,

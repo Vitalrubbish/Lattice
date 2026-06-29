@@ -744,14 +744,18 @@ not launch the GPU read kernel, if CPU-staged reference read bytes are observed,
 or if the write report shows any verified rows or verification synchronizations.
 Use the regular correctness/profile gates when debugging contracts; use this
 gate as the cleaner request-level baseline before kernel optimization.
+The performance-clean gate also disables per-update tracker report writes and
+relies on final process-exit reports; correctness gates keep per-update reports
+enabled by default for better failure diagnostics.
 
-Latest local performance-clean result on 2026-06-29:
+Latest local performance-clean result on 2026-06-29 after deferring tracker
+reports:
 
 - Command:
   `python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-1782722236025.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-1782723060120.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Model: `facebook/opt-125m`
@@ -761,11 +765,16 @@ Latest local performance-clean result on 2026-06-29:
 - Stream-aware read kernel calls: `372`
 - Reference KCMM read bytes: `0`
 - KCMM write verified rows: `0`
+- Read tracker report writes: `1`
+- Write tracker report writes: `1`
 - Stream-level write verification synchronizations: `0`
 - KCMM write verification enabled: `false`
-- Request latency seconds: stock `1.855`, KCMM `3.285`, ratio `1.771`
-- Tokens per second: stock `17.251`, KCMM `9.741`, ratio `0.565`
+- Request latency seconds: stock `1.820`, KCMM `1.951`, ratio `1.072`
+- Tokens per second: stock `17.582`, KCMM `16.402`, ratio `0.933`
 - Peak GPU memory delta MiB: stock `5441`, KCMM `5591`, ratio `1.028`
+- Compared with the first performance-clean run, KCMM request latency improved
+  from `3.285s` to `1.951s` after per-update tracker report writes were
+  disabled.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 Latest local performance characterization on 2026-06-20:
