@@ -28,6 +28,22 @@ DEFAULT_COVERAGE_CASES = (
     CompletionCase(name="hello", prompt="Hello", max_tokens=2),
     CompletionCase(name="math", prompt="Question: 2 + 2 =", max_tokens=2),
 )
+MODEL_DOWNLOAD_ALLOW_PATTERNS = (
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "tokenizer.model",
+    "pytorch_model.bin",
+    "pytorch_model-*.bin",
+    "pytorch_model.bin.index.json",
+    "model.safetensors",
+    "model-*.safetensors",
+    "model.safetensors.index.json",
+)
 
 
 @dataclass(frozen=True)
@@ -105,7 +121,15 @@ def default_model_path(model_id: str) -> Path:
 
 
 def model_path_has_config(model_path: Path) -> bool:
-    return (model_path / "config.json").exists()
+    if not (model_path / "config.json").exists():
+        return False
+    weight_patterns = (
+        "pytorch_model.bin",
+        "pytorch_model-*.bin",
+        "model.safetensors",
+        "model-*.safetensors",
+    )
+    return any(model_path.glob(pattern) for pattern in weight_patterns)
 
 
 def resolve_real_model_path(
@@ -136,13 +160,7 @@ def resolve_real_model_path(
     snapshot_download(
         repo_id=model_id,
         local_dir=path,
-        allow_patterns=(
-            "*.json",
-            "*.txt",
-            "*.model",
-            "*.safetensors",
-            "*.bin",
-        ),
+        allow_patterns=MODEL_DOWNLOAD_ALLOW_PATTERNS,
     )
     if not model_path_has_config(path):
         raise SystemExit(f"downloaded model has no config.json: {path}")

@@ -1094,6 +1094,75 @@ Latest local real-model result on 2026-06-29:
 - Request latency seconds: stock `1.729`, KCMM `2.233`, ratio `1.291`
 - Tokens per second: stock `2.313`, KCMM `1.791`, ratio `0.774`
 
+## Phase II.C GPU read-kernel real-model matrix gate
+
+Run the multi-model real-model gate:
+
+```bash
+python -m scripts.kcmm.vllm_gpu_read_real_model_matrix_gate \
+  --download-model \
+  --no-build-kcmm
+```
+
+The default matrix currently covers:
+
+- `facebook/opt-125m`
+- `distilgpt2`
+
+The default coverage cases are:
+
+- `hello`: `Hello`, `max_tokens=2`
+- `math`: `Question: 2 + 2 =`, `max_tokens=2`
+- `long_context`: a 20-token Greek-letter prompt, `max_tokens=2`
+
+The longer prompt forces multi-block read behavior on real Hugging Face models
+without making the local gate expensive. Missing models are downloaded into
+`.scratch/kcmm-vllm/real-models/` only when `--download-model` is passed. The
+download filter is restricted to vLLM-required model/tokenizer files so it does
+not pull unrelated CoreML, TensorFlow, or Flax artifacts.
+
+Latest local real-model matrix result on 2026-06-29:
+
+- Command:
+  `python -m scripts.kcmm.vllm_gpu_read_real_model_matrix_gate --download-model --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60`
+- Result: `passed=true`
+- Report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-real-model-matrix-1782721112360.json`
+- Failed models: `[]`
+- Correctness failures: `[]`
+- Performance warnings: `[]`
+- Model order: `facebook/opt-125m`, `distilgpt2`
+
+`facebook/opt-125m` matrix result:
+
+- Report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-real-model-matrix-1782721112360-reports/real-facebook-opt-125m.json`
+- `hello` completion: `", I"`
+- `math` completion: `" -2"`
+- `long_context` completion: `" rho"`
+- GPU read kernel calls: `36`
+- Stream-aware read kernel calls: `36`
+- Reference KCMM read bytes: `0`
+- Native KV write calls skipped: `72`
+- KCMM write verified rows: `156`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+
+`distilgpt2` matrix result:
+
+- Report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-real-model-matrix-1782721112360-reports/real-distilgpt2.json`
+- `hello` completion: `" The first"`
+- `math` completion: `" 1 +"`
+- `long_context` completion: `" pia"`
+- GPU read kernel calls: `18`
+- Stream-aware read kernel calls: `18`
+- Reference KCMM read bytes: `0`
+- Native KV write calls skipped: `36`
+- KCMM write verified rows: `72`
+- Final KCMM pool stats recorded `blocks_in_use=0`.
+
+GPU memory returned to 0 MiB on both RTX 3080 GPUs after the matrix gate.
+
 The manual steps below are the expanded form of the single-model GPU
 read-kernel check.
 

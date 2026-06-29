@@ -324,12 +324,15 @@ scheduling revalidation if vLLM starts invoking the patched seams from
 non-default current streams, broader real-model coverage beyond the first
 OPT-125m gate, broader TP coverage, and performance optimization.
 
-`python -m scripts.kcmm.vllm_gpu_read_real_model_gate` now adds the first
-non-generated model gate. The local run downloaded and served
-`facebook/opt-125m`, compared short deterministic stock-vs-KCMM completions,
-and verified the KCMM path used the stream-aware GPU read kernel with zero
-CPU-staged reference read bytes. This moves Phase II.C beyond generated tiny
-OPT models, but it is still only the first real-model coverage slice.
+`python -m scripts.kcmm.vllm_gpu_read_real_model_gate` added the first
+non-generated model gate with `facebook/opt-125m`. The broader
+`python -m scripts.kcmm.vllm_gpu_read_real_model_matrix_gate` now covers both
+`facebook/opt-125m` and `distilgpt2`, including a longer prompt that spans
+multiple KV blocks. The local matrix run compared deterministic stock-vs-KCMM
+completions for every model and verified the KCMM path used the stream-aware GPU
+read kernel with zero CPU-staged reference read bytes. This moves Phase II.C
+beyond generated tiny OPT models, but the matrix is still local single-GPU
+coverage inside the current kernel envelope.
 
 `python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate` now covers the
 local tensor-parallel case with `tensor_parallel_size=2` on the dual RTX 3080
@@ -369,9 +372,9 @@ It does not claim the current vLLM eager scheduler naturally invokes the seams
 from non-default current streams. The remaining Phase II.C work is tensor
 parallel coverage beyond the local two-GPU gate, framework-originated
 non-default stream revalidation if vLLM changes scheduling behavior, broader
-real-model coverage beyond the first `facebook/opt-125m` gate, and performance
-optimization using the per-call profiling data beyond the local tiny OPT and
-first real-model gates.
+real-model/workload coverage beyond the local OPT-125m/distilgpt2 matrix, and
+performance optimization using the per-call profiling data beyond the local tiny
+OPT and first real-model gates.
 
 ### CUDA context sharing risk
 
