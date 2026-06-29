@@ -107,6 +107,14 @@ def profile_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                     "value": profile.get(key),
                 }
             )
+    if _number(profile.get("first_call_ms")) is None:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "gpu_kernel_profile_first_call_ms_missing",
+                "value": profile.get("first_call_ms"),
+            }
+        )
 
     samples = profile.get("samples_ms")
     if not isinstance(samples, list) or not samples:
@@ -125,6 +133,45 @@ def profile_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "sample_count": len(samples),
             }
         )
+
+    if profile_count is not None and profile_count > 1:
+        warmup_excluded_count = profile.get("warmup_excluded_count")
+        if warmup_excluded_count != 1:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "gpu_kernel_profile_warmup_excluded_count_invalid",
+                    "value": warmup_excluded_count,
+                }
+            )
+        steady_state = profile.get("steady_state")
+        if not isinstance(steady_state, dict):
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "gpu_kernel_profile_steady_state_missing",
+                }
+            )
+        else:
+            steady_state_count = steady_state.get("count")
+            if steady_state_count != profile_count - 1:
+                failures.append(
+                    {
+                        "mode": "kcmm_gpu_read",
+                        "reason": "gpu_kernel_profile_steady_state_count_mismatch",
+                        "steady_state_count": steady_state_count,
+                        "expected_count": profile_count - 1,
+                    }
+                )
+            for key in ("min_ms", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms"):
+                if _number(steady_state.get(key)) is None:
+                    failures.append(
+                        {
+                            "mode": "kcmm_gpu_read",
+                            "reason": f"gpu_kernel_profile_steady_state_{key}_missing",
+                            "value": steady_state.get(key),
+                        }
+                    )
     return failures
 
 

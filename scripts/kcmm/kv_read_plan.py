@@ -348,28 +348,41 @@ class KcmmKvReadOffsetTableTracker:
 
     def _gpu_kernel_profile_summary(self) -> dict[str, Any]:
         samples = list(self._gpu_kernel_profile_samples_ms)
-        sorted_samples = sorted(samples)
 
         def rounded(value: float | None) -> float | None:
             return round(value, 6) if value is not None else None
 
-        def percentile(percentile_value: int) -> float | None:
-            if not sorted_samples:
-                return None
-            rank = (percentile_value * len(sorted_samples) + 99) // 100
-            index = min(max(rank - 1, 0), len(sorted_samples) - 1)
-            return sorted_samples[index]
+        def sample_stats(values: list[float]) -> dict[str, Any]:
+            sorted_values = sorted(values)
+
+            def percentile(percentile_value: int) -> float | None:
+                if not sorted_values:
+                    return None
+                rank = (percentile_value * len(sorted_values) + 99) // 100
+                index = min(max(rank - 1, 0), len(sorted_values) - 1)
+                return sorted_values[index]
+
+            return {
+                "count": len(values),
+                "min_ms": rounded(min(values) if values else None),
+                "avg_ms": rounded((sum(values) / len(values)) if values else None),
+                "p50_ms": rounded(percentile(50)),
+                "p95_ms": rounded(percentile(95)),
+                "p99_ms": rounded(percentile(99)),
+                "max_ms": rounded(max(values) if values else None),
+            }
+
+        warmup_excluded_count = 1 if len(samples) > 1 else 0
+        steady_state_samples = samples[warmup_excluded_count:]
+        stats = sample_stats(samples)
 
         return {
             "enabled": self._profile_gpu_kernel,
             "unit": "ms",
-            "count": len(samples),
-            "min_ms": rounded(min(samples) if samples else None),
-            "avg_ms": rounded((sum(samples) / len(samples)) if samples else None),
-            "p50_ms": rounded(percentile(50)),
-            "p95_ms": rounded(percentile(95)),
-            "p99_ms": rounded(percentile(99)),
-            "max_ms": rounded(max(samples) if samples else None),
+            **stats,
+            "first_call_ms": rounded(samples[0] if samples else None),
+            "warmup_excluded_count": warmup_excluded_count,
+            "steady_state": sample_stats(steady_state_samples),
             "samples_ms": [rounded(sample) for sample in samples],
         }
 

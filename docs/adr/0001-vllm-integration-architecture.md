@@ -291,9 +291,11 @@ to `kcmm_paged_attn_decode_f16_on_stream`, and
 `python -m scripts.kcmm.vllm_gpu_read_profile_gate` wraps the A/B gate with that
 profiling enabled only for the KCMM mode. The resulting read report includes
 per-call `gpu_kernel_elapsed_ms` values and a `gpu_kernel_profile` summary with
-count, min, avg, p50, p95, p99, max, and raw samples in milliseconds. Profiling
-is intentionally disabled by default because event timing synchronizes the end
-event and is diagnostic rather than the normal correctness path.
+count, min, avg, p50, p95, p99, max, `first_call_ms`, raw samples, and a
+`steady_state` summary that excludes the first sample when multiple samples are
+available. Profiling is intentionally disabled by default because event timing
+synchronizes the end event and is diagnostic rather than the normal correctness
+path.
 
 `python -m scripts.kcmm.vllm_gpu_read_shape_gate` now broadens that gate across
 six tiny OPT shape variants inside the currently supported local envelope:

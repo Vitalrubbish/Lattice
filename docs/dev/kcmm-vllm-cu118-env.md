@@ -751,7 +751,9 @@ report does not include timing samples. The lower-level smoke/A-B flag is
 Profiling records CUDA events on the same stream passed to
 `kcmm_paged_attn_decode_f16_on_stream`. The report includes per-call
 `gpu_kernel_elapsed_ms` values in `recent_calls` and a `gpu_kernel_profile`
-summary with count, min, avg, p50, p95, p99, max, and raw `samples_ms`.
+summary with count, min, avg, p50, p95, p99, max, `first_call_ms`,
+`warmup_excluded_count`, a `steady_state` summary that excludes the first sample
+when multiple samples exist, and raw `samples_ms`.
 
 This is a diagnostic mode, not the default correctness path: reading CUDA event
 timing synchronizes the event and adds overhead. Use it to guide kernel
@@ -764,21 +766,27 @@ Latest local GPU read-kernel profiling result on 2026-06-29:
   `python -m scripts.kcmm.vllm_gpu_read_profile_gate --no-build-kcmm --no-print-seams --timeout-seconds 240 --shutdown-timeout-seconds 45`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-profile-1782717377628.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-profile-1782718561901.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - GPU read kernel calls: `16`
 - Profile sample count: `16`
-- Profile summary: min `0.029696 ms`, avg `6.36448 ms`,
-  p50 `0.05632 ms`, p95 `100.549629 ms`, p99 `100.549629 ms`,
-  max `100.549629 ms`
+- First call: `100.57933 ms`
+- Warm-up excluded count: `1`
+- Overall profile summary: min `0.029696 ms`, avg `6.367104 ms`,
+  p50 `0.05632 ms`, p95 `100.57933 ms`, p99 `100.57933 ms`,
+  max `100.57933 ms`
+- Steady-state summary after excluding the first sample: count `15`,
+  min `0.029696 ms`, avg `0.086289 ms`, p50 `0.05632 ms`,
+  p95 `0.1536 ms`, p99 `0.1536 ms`, max `0.1536 ms`
 - Raw samples:
-  `[100.549629, 0.029696, 0.032768, 0.031744, 0.03584, 0.034816, 0.05632, 0.057344, 0.0512, 0.052224, 0.146432, 0.145408, 0.150528, 0.149504, 0.154624, 0.1536]`
+  `[100.57933, 0.029696, 0.031744, 0.032768, 0.03584, 0.03584, 0.05632, 0.062464, 0.0512, 0.0512, 0.146432, 0.1536, 0.150528, 0.149504, 0.1536, 0.1536]`
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
-The first profiled call recorded `100.549629 ms`; later calls were in the
-`0.03-0.15 ms` range. Treat the first sample as a cold-start/module warm-up
-outlier until a follow-up profiling pass proves otherwise.
+The first profiled call recorded about `100.5 ms` in two consecutive profile
+runs, while steady-state calls stayed in the `0.03-0.15 ms` range on the tiny
+local OPT gate. Treat the first sample as a cold-start/module warm-up outlier
+when choosing steady-state kernel optimization work.
 
 ## Phase II.C GPU read-kernel shape coverage gate
 
