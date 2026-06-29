@@ -66,6 +66,7 @@ class GateConfig:
     instrument_kv_reads: bool
     kv_write_verify: bool
     tracker_report_on_update: bool
+    tracker_host_profile: bool
     build_kcmm: bool
     keep_model: bool
     print_seams: bool
@@ -155,6 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
             "KCMM mode. Disable for performance-clean gates that only need "
             "final reports."
         ),
+    )
+    parser.add_argument(
+        "--tracker-host-profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Collect section-level host timings in KCMM tracker final reports.",
     )
     parser.add_argument(
         "--coverage-case",
@@ -307,6 +314,7 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         instrument_kv_reads=args.instrument_kv_reads,
         kv_write_verify=args.kv_write_verify,
         tracker_report_on_update=args.tracker_report_on_update,
+        tracker_host_profile=args.tracker_host_profile,
         build_kcmm=args.build_kcmm,
         keep_model=args.keep_model,
         print_seams=args.print_seams,
@@ -362,6 +370,7 @@ def smoke_config_for_mode(
         kv_read_profile=(is_gpu_read and config.kv_read_profile),
         kv_read_validate_block_tables=config.kv_read_validate_block_tables,
         tracker_report_on_update=config.tracker_report_on_update,
+        tracker_host_profile=config.tracker_host_profile,
         kv_write_mirror=False,
         kv_write_replace_candidate=is_gpu_read,
         kv_write_verify=config.kv_write_verify,
@@ -507,6 +516,7 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         ),
         "read_report_on_update": read_report.get("report_on_update"),
         "read_report_write_count": read_report.get("report_write_count"),
+        "read_host_profile": read_report.get("host_profile"),
         "native_write_skipped_calls": write_report.get("native_skipped_calls"),
         "write_verification_enabled": write_report.get(
             "write_verification_enabled"
@@ -514,6 +524,7 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "write_verify_rows_per_call": write_report.get("verify_rows_per_call"),
         "write_report_on_update": write_report.get("report_on_update"),
         "write_report_write_count": write_report.get("report_write_count"),
+        "write_host_profile": write_report.get("host_profile"),
         "kcmm_write_verified_rows": write_report.get("verified_rows"),
         "stream_aware_write_calls": write_report.get("stream_aware_write_calls"),
         "force_non_default_stream": read_report.get("force_non_default_stream"),
@@ -558,6 +569,7 @@ def summarize_success(mode_name: str, result: dict[str, Any]) -> dict[str, Any]:
         "instrument_kv_reads": result.get("instrument_kv_reads"),
         "kv_write_verify": result.get("kv_write_verify"),
         "tracker_report_on_update": result.get("tracker_report_on_update"),
+        "tracker_host_profile": result.get("tracker_host_profile"),
         "log_path": result.get("log_path"),
     }
     if mode_name == "kcmm_gpu_read":
@@ -911,6 +923,7 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "instrument_kv_reads": config.instrument_kv_reads,
         "kv_write_verify": config.kv_write_verify,
         "tracker_report_on_update": config.tracker_report_on_update,
+        "tracker_host_profile": config.tracker_host_profile,
         "mode_order": list(MODE_ORDER),
         "modes": modes,
         "correctness_failures": correctness_failures,

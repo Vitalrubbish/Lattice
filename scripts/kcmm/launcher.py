@@ -387,6 +387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config.kv_write_mirror_report_path,
             verify_rows_per_call=4 if config.kv_write_verify else 0,
             report_on_update=config.tracker_report_on_update,
+            profile_host_sections=config.tracker_host_profile,
             replace_native=config.kv_write_replace_candidate,
             force_non_default_stream=config.kv_force_non_default_stream,
         )
@@ -420,6 +421,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile_gpu_kernel=config.kv_read_profile,
             report_on_update=config.tracker_report_on_update,
             validate_block_tables=config.kv_read_validate_block_tables,
+            profile_host_sections=config.tracker_host_profile,
         )
         kv_read_offset_table_report = apply_kv_read_offset_table(
             _KV_READ_OFFSET_TABLE_TRACKER

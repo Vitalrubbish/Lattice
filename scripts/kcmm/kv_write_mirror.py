@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .bindings import KcmmError, KcmmPool
+from .host_profile import HostSectionProfiler
 from .streaming import KcmmStreamProvider
 
 
@@ -103,6 +104,7 @@ class KcmmKvWriteMirrorTracker:
         *,
         verify_rows_per_call: int = 4,
         report_on_update: bool = True,
+        profile_host_sections: bool = False,
         replace_native: bool = False,
         force_non_default_stream: bool = False,
     ):
@@ -110,6 +112,7 @@ class KcmmKvWriteMirrorTracker:
         self._report_path = Path(report_path) if report_path else None
         self._verify_rows_per_call = max(0, int(verify_rows_per_call))
         self._report_on_update = bool(report_on_update)
+        self._host_profiler = HostSectionProfiler(profile_host_sections)
         self._replace_native = bool(replace_native)
         self._stream_provider = KcmmStreamProvider(
             force_non_default=force_non_default_stream
@@ -168,12 +171,15 @@ class KcmmKvWriteMirrorTracker:
         return self._driver
 
     def _ensure_slot_blocks(self, pool: KcmmPool, slots: list[int]) -> None:
+        started_ns = self._host_profiler.start()
         if not self._replace_native:
+            self._host_profiler.stop("write_ensure_slot_blocks", started_ns)
             return
         stats = pool.stats()
         block_size = int(stats["block_size"])
         block_ids = sorted({slot // block_size for slot in slots if slot >= 0})
         if not block_ids:
+            self._host_profiler.stop("write_ensure_slot_blocks", started_ns)
             return
 
         allocated_blocks = 0
@@ -195,6 +201,7 @@ class KcmmKvWriteMirrorTracker:
         if allocated_blocks:
             self._external_block_ensure_calls += 1
             self._external_blocks_allocated += allocated_blocks
+        self._host_profiler.stop("write_ensure_slot_blocks", started_ns)
 
     def _layer_for_cache(
         self,
@@ -334,6 +341,7 @@ class KcmmKvWriteMirrorTracker:
         *,
         native_written: bool,
     ) -> None:
+        call_started_ns = self._host_profiler.start()
         with self._lock:
             self._write_calls += 1
             if native_written:
@@ -357,8 +365,12 @@ class KcmmKvWriteMirrorTracker:
                 raise exc
 
             try:
+                validate_started_ns = self._host_profiler.start()
                 self._validate_dtype(key, value)
+                self._host_profiler.stop("write_validate_dtype", validate_started_ns)
+                slot_started_ns = self._host_profiler.start()
                 slots = self._slot_mapping_to_list(slot_mapping)
+                self._host_profiler.stop("write_slot_mapping_to_host", slot_started_ns)
                 batch = len(slots)
                 self._max_batch_seen = max(self._max_batch_seen, batch)
                 if batch == 0:
@@ -367,13 +379,19 @@ class KcmmKvWriteMirrorTracker:
                     return
 
                 pool = self._require_pool()
+                layer_started_ns = self._host_profiler.start()
                 layer_idx = self._layer_for_cache(key_cache, value_cache)
+                self._host_profiler.stop("write_layer_for_cache", layer_started_ns)
+                rows_started_ns = self._host_profiler.start()
                 k_rows, v_rows = self._prepare_rows(key, value, batch)
+                self._host_profiler.stop("write_prepare_rows", rows_started_ns)
                 row_width = int(k_rows.shape[1])
+                stats_started_ns = self._host_profiler.start()
                 stats = pool.stats()
                 block_size = int(stats["block_size"])
                 block_bytes = int(stats["block_bytes"])
                 step_elements = block_bytes // block_size // 2
+                self._host_profiler.stop("write_pool_stats_shape_check", stats_started_ns)
                 if row_width != step_elements:
                     raise KcmmError(
                         "key/value row width does not match KCMM pool shape: "
@@ -386,20 +404,32 @@ class KcmmKvWriteMirrorTracker:
 
                 self._ensure_slot_blocks(pool, slots)
 
+                stream_started_ns = self._host_profiler.start()
                 stream_selection = self._stream_provider.select(device_index)
+                self._host_profiler.stop("write_select_stream", stream_started_ns)
+                record_started_ns = self._host_profiler.start()
                 self._stream_provider.record_tensors(
                     stream_selection,
                     k_rows,
                     v_rows,
                 )
+                self._host_profiler.stop("write_record_tensors", record_started_ns)
+                ptr_started_ns = self._host_profiler.start()
+                k_src_ptr = int(k_rows.data_ptr())
+                v_src_ptr = int(v_rows.data_ptr())
+                self._host_profiler.stop("write_data_ptrs", ptr_started_ns)
+                launch_started_ns = self._host_profiler.start()
                 pool.append_kv_slots(
                     layer_idx=layer_idx,
                     slot_mapping=slots,
-                    k_src_ptr=int(k_rows.data_ptr()),
-                    v_src_ptr=int(v_rows.data_ptr()),
+                    k_src_ptr=k_src_ptr,
+                    v_src_ptr=v_src_ptr,
                     stream_ptr=stream_selection.stream_ptr,
                 )
+                self._host_profiler.stop("write_ctypes_launch", launch_started_ns)
+                complete_started_ns = self._host_profiler.start()
                 self._stream_provider.complete(stream_selection)
+                self._host_profiler.stop("write_complete_stream", complete_started_ns)
 
                 padding_slots = sum(1 for slot in slots if slot < 0)
                 mirrored_rows = batch - padding_slots
@@ -457,6 +487,7 @@ class KcmmKvWriteMirrorTracker:
                 )
                 self._recent_calls = self._recent_calls[-16:]
                 self._write_report_on_update()
+                self._host_profiler.stop("write_mirror_call_total", call_started_ns)
             except BaseException as exc:
                 self._record_error(exc)
                 raise
@@ -491,6 +522,7 @@ class KcmmKvWriteMirrorTracker:
                 "verify_rows_per_call": self._verify_rows_per_call,
                 "report_on_update": self._report_on_update,
                 "report_write_count": self._report_write_count,
+                "host_profile": self._host_profiler.report(),
                 "slot_formula": "slot = block_id * block_size + offset_in_block",
                 "pool_attached": self._pool is not None,
                 "write_calls": self._write_calls,

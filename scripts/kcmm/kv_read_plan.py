@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .bindings import KcmmError, KcmmPool
+from .host_profile import HostSectionProfiler
 from .streaming import KcmmStreamProvider
 
 
@@ -155,6 +156,7 @@ class KcmmKvReadOffsetTableTracker:
         profile_gpu_kernel: bool = False,
         report_on_update: bool = True,
         validate_block_tables: bool = True,
+        profile_host_sections: bool = False,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
@@ -165,6 +167,7 @@ class KcmmKvReadOffsetTableTracker:
         self._profile_gpu_kernel = bool(profile_gpu_kernel)
         self._report_on_update = bool(report_on_update)
         self._validate_block_tables = bool(validate_block_tables)
+        self._host_profiler = HostSectionProfiler(profile_host_sections)
         self._stream_provider = KcmmStreamProvider(
             force_non_default=force_non_default_stream
         )
@@ -272,6 +275,7 @@ class KcmmKvReadOffsetTableTracker:
         device: Any,
         min_entries: int,
     ) -> tuple[list[int], Any, bool]:
+        started_ns = self._host_profiler.start()
         cached_table = self._last_offset_table
         if (
             cached_table is not None
@@ -280,6 +284,7 @@ class KcmmKvReadOffsetTableTracker:
             and str(getattr(cached_table, "device", None)) == str(device)
         ):
             self._offset_table_cache_hits += 1
+            self._host_profiler.stop("read_offset_table_cache_hit", started_ns)
             return self._last_offsets_f16, cached_table, True
 
         import torch
@@ -295,6 +300,7 @@ class KcmmKvReadOffsetTableTracker:
         self._recent_offset_tables.append(offset_table)
         self._recent_offset_tables = self._recent_offset_tables[-16:]
         self._offset_table_cache_rebuilds += 1
+        self._host_profiler.stop("read_offset_table_rebuild", started_ns)
         return offsets_f16, offset_table, False
 
     def _build_plan(
@@ -302,6 +308,7 @@ class KcmmKvReadOffsetTableTracker:
         function_name: str,
         arguments: dict[str, Any],
     ) -> tuple[ReadPlanCall, list[int], list[int]]:
+        build_started_ns = self._host_profiler.start()
         pool = self._require_pool()
         block_tables = arguments["block_tables"]
         query = arguments.get("query")
@@ -309,19 +316,29 @@ class KcmmKvReadOffsetTableTracker:
         seq_lens = arguments.get("seq_lens")
         key_cache = arguments["key_cache"]
         value_cache = arguments["value_cache"]
+        layer_started_ns = self._host_profiler.start()
         layer_idx = self._layer_for_cache(key_cache, value_cache)
+        self._host_profiler.stop("read_layer_for_cache", layer_started_ns)
+        shape_started_ns = self._host_profiler.start()
         query_shape = _shape(query)
         out_shape = _shape(out)
         block_tables_shape = _shape(block_tables)
         seq_lens_shape = _shape(seq_lens)
         batch = query_shape[0] if query_shape else None
         device = getattr(block_tables, "device", "cpu")
+        self._host_profiler.stop("read_tensor_shape_capture", shape_started_ns)
         if self._validate_block_tables:
+            block_ids_started_ns = self._host_profiler.start()
             block_ids = _tensor_block_ids(block_tables)
             unique_ids = sorted(set(block_ids))
             max_block_id = max(unique_ids) if unique_ids else None
             min_entries = (max_block_id + 1) if max_block_id is not None else 1
+            self._host_profiler.stop(
+                "read_block_tables_to_host",
+                block_ids_started_ns,
+            )
         else:
+            stats_started_ns = self._host_profiler.start()
             pool_stats = pool.stats()
             block_ids = []
             unique_ids = []
@@ -331,15 +348,19 @@ class KcmmKvReadOffsetTableTracker:
                 int(pool_stats.get("blocks_in_use", 0)),
                 1,
             )
+            self._host_profiler.stop("read_pool_stats_for_min_entries", stats_started_ns)
 
+        offset_started_ns = self._host_profiler.start()
         offsets_f16, offset_table, offset_table_reused = self._offset_table_for_device(
             pool=pool,
             device=device,
             min_entries=min_entries,
         )
+        self._host_profiler.stop("read_offset_table_lookup", offset_started_ns)
         missing_block_ids: list[int] = []
         locations: dict[int, str] = {}
         if self._validate_block_tables:
+            validate_started_ns = self._host_profiler.start()
             for block_id in unique_ids:
                 if block_id >= len(offsets_f16):
                     missing_block_ids.append(block_id)
@@ -348,6 +369,10 @@ class KcmmKvReadOffsetTableTracker:
                     locations[block_id] = pool.block_location(block_id)
                 except Exception:
                     missing_block_ids.append(block_id)
+            self._host_profiler.stop(
+                "read_block_location_validation",
+                validate_started_ns,
+            )
 
         if missing_block_ids:
             raise KcmmError(
@@ -400,6 +425,7 @@ class KcmmKvReadOffsetTableTracker:
             default_stream_ptr=None,
             gpu_kernel_elapsed_ms=None,
         )
+        self._host_profiler.stop("read_build_plan_total", build_started_ns)
         return call, offsets_f16, unique_ids
 
     def _gpu_kernel_profile_summary(self) -> dict[str, Any]:
@@ -448,6 +474,7 @@ class KcmmKvReadOffsetTableTracker:
         function_name: str,
         arguments: dict[str, Any],
     ) -> None:
+        call_started_ns = self._host_profiler.start()
         with self._lock:
             self._read_calls += 1
             self._counts_by_function[call_key] = (
@@ -474,6 +501,7 @@ class KcmmKvReadOffsetTableTracker:
                 self._recent_calls.append(call)
                 self._recent_calls = self._recent_calls[-16:]
                 self._write_report_on_update()
+                self._host_profiler.stop("read_plan_call_total", call_started_ns)
             except BaseException as exc:
                 self._record_error(exc)
                 raise
@@ -484,20 +512,31 @@ class KcmmKvReadOffsetTableTracker:
         function_name: str,
         arguments: dict[str, Any],
     ) -> None:
+        call_started_ns = self._host_profiler.start()
         with self._lock:
             self._read_calls += 1
             self._counts_by_function[call_key] = (
                 self._counts_by_function.get(call_key, 0) + 1
             )
             try:
+                build_started_ns = self._host_profiler.start()
                 call, offsets_f16, unique_ids = self._build_plan(
                     function_name,
                     arguments,
                 )
+                self._host_profiler.stop(
+                    "read_replace_build_plan",
+                    build_started_ns,
+                )
                 if self._replacement_backend == "gpu_kernel":
+                    kernel_started_ns = self._host_profiler.start()
                     stream_info = self._run_gpu_kernel_attention(
                         layer_idx=call.layer_idx,
                         arguments=arguments,
+                    )
+                    self._host_profiler.stop(
+                        "read_replace_gpu_kernel_host",
+                        kernel_started_ns,
                     )
                     read_bytes = 0
                     call.gpu_kernel_launched = True
@@ -544,6 +583,7 @@ class KcmmKvReadOffsetTableTracker:
                 self._recent_calls.append(call)
                 self._recent_calls = self._recent_calls[-16:]
                 self._write_report_on_update()
+                self._host_profiler.stop("read_replace_call_total", call_started_ns)
             except BaseException as exc:
                 self._record_error(exc)
                 raise
@@ -669,7 +709,10 @@ class KcmmKvReadOffsetTableTracker:
         layer_idx: int,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
+        total_started_ns = self._host_profiler.start()
+        validate_started_ns = self._host_profiler.start()
         self._validate_replacement_args(arguments)
+        self._host_profiler.stop("read_gpu_kernel_validate_args", validate_started_ns)
 
         import torch
 
@@ -709,6 +752,7 @@ class KcmmKvReadOffsetTableTracker:
         # The KCMM kernel indexes tensors by raw pointer and therefore requires
         # compact layouts. These copies enqueue on PyTorch's current stream, and
         # forced non-default stream mode waits on that stream before launch.
+        prepare_started_ns = self._host_profiler.start()
         query = query.contiguous()
         block_tables = block_tables.contiguous()
         seq_lens = seq_lens.contiguous()
@@ -716,8 +760,12 @@ class KcmmKvReadOffsetTableTracker:
             out_tmp = torch.empty_like(out, memory_format=torch.contiguous_format)
         else:
             out_tmp = out
+        self._host_profiler.stop("read_gpu_kernel_prepare_tensors", prepare_started_ns)
 
+        stream_started_ns = self._host_profiler.start()
         stream_selection = self._stream_provider.select(device_index)
+        self._host_profiler.stop("read_gpu_kernel_select_stream", stream_started_ns)
+        record_started_ns = self._host_profiler.start()
         self._stream_provider.record_tensors(
             stream_selection,
             query,
@@ -726,19 +774,28 @@ class KcmmKvReadOffsetTableTracker:
             offset_table,
             out_tmp,
         )
+        self._host_profiler.stop("read_gpu_kernel_record_tensors", record_started_ns)
         start_event = None
         end_event = None
         if self._profile_gpu_kernel:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record(stream_selection.stream)
+        ptr_started_ns = self._host_profiler.start()
+        query_ptr = _data_ptr(query, "query")
+        out_ptr = _data_ptr(out_tmp, "out")
+        block_tables_ptr = _data_ptr(block_tables, "block_tables")
+        seq_lens_ptr = _data_ptr(seq_lens, "seq_lens")
+        block_offsets_f16_ptr = _data_ptr(offset_table, "block_offsets_f16")
+        self._host_profiler.stop("read_gpu_kernel_data_ptrs", ptr_started_ns)
+        launch_started_ns = self._host_profiler.start()
         pool.paged_attn_decode_f16(
             layer_idx=layer_idx,
-            query_ptr=_data_ptr(query, "query"),
-            out_ptr=_data_ptr(out_tmp, "out"),
-            block_tables_ptr=_data_ptr(block_tables, "block_tables"),
-            seq_lens_ptr=_data_ptr(seq_lens, "seq_lens"),
-            block_offsets_f16_ptr=_data_ptr(offset_table, "block_offsets_f16"),
+            query_ptr=query_ptr,
+            out_ptr=out_ptr,
+            block_tables_ptr=block_tables_ptr,
+            seq_lens_ptr=seq_lens_ptr,
+            block_offsets_f16_ptr=block_offsets_f16_ptr,
             batch=int(query_shape[0]),
             num_q_heads=int(query_shape[1]),
             kv_heads=int(arguments["num_kv_heads"]),
@@ -748,15 +805,21 @@ class KcmmKvReadOffsetTableTracker:
             scale=float(arguments["scale"]),
             stream_ptr=stream_selection.stream_ptr,
         )
+        self._host_profiler.stop("read_gpu_kernel_ctypes_launch", launch_started_ns)
         if end_event is not None:
             end_event.record(stream_selection.stream)
+        complete_started_ns = self._host_profiler.start()
         self._stream_provider.complete(stream_selection)
+        self._host_profiler.stop("read_gpu_kernel_complete_stream", complete_started_ns)
         if out_tmp is not out:
+            copy_started_ns = self._host_profiler.start()
             out.copy_(out_tmp)
+            self._host_profiler.stop("read_gpu_kernel_copy_out", copy_started_ns)
         elapsed_ms = None
         if start_event is not None and end_event is not None:
             end_event.synchronize()
             elapsed_ms = float(start_event.elapsed_time(end_event))
+        self._host_profiler.stop("read_gpu_kernel_host_total", total_started_ns)
         return {
             "stream_ptr": stream_selection.stream_ptr,
             "original_stream_ptr": stream_selection.original_stream_ptr,
@@ -822,6 +885,7 @@ class KcmmKvReadOffsetTableTracker:
                 "last_original_stream_ptr": self._last_original_stream_ptr,
                 "last_default_stream_ptr": self._last_default_stream_ptr,
                 "gpu_kernel_profile": self._gpu_kernel_profile_summary(),
+                "host_profile": self._host_profiler.report(),
                 "counts_by_function": dict(sorted(self._counts_by_function.items())),
                 "cache_layers": [
                     asdict(layer)

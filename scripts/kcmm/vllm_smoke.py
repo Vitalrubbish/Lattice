@@ -63,6 +63,7 @@ class SmokeConfig:
     kv_read_profile: bool
     kv_read_validate_block_tables: bool
     tracker_report_on_update: bool
+    tracker_host_profile: bool
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
     kv_write_verify: bool
@@ -226,6 +227,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Validate sampled paged-attention block_tables on the host. "
             "Disable for performance-clean gates after correctness coverage passes."
         ),
+    )
+    parser.add_argument(
+        "--tracker-host-profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Collect section-level host timings in KCMM tracker final reports.",
     )
     parser.add_argument(
         "--kv-write-mirror",
@@ -401,6 +408,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         kv_read_profile=args.kv_read_profile,
         kv_read_validate_block_tables=args.kv_read_validate_block_tables,
         tracker_report_on_update=args.tracker_report_on_update,
+        tracker_host_profile=args.tracker_host_profile,
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
         kv_write_verify=args.kv_write_verify,
@@ -725,6 +733,17 @@ def vllm_command(config: SmokeConfig) -> list[str]:
             )
         ):
             command.append("--no-kcmm-tracker-report-on-update")
+        if (
+            config.tracker_host_profile
+            and (
+                config.kv_write_mirror
+                or config.kv_write_replace_candidate
+                or config.kv_read_offset_table
+                or config.kv_read_replace_candidate
+                or config.kv_read_gpu_kernel_candidate
+            )
+        ):
+            command.append("--kcmm-tracker-host-profile")
     if config.instrument_allocators:
         command.extend(
             [
@@ -1503,6 +1522,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "kv_read_profile": config.kv_read_profile,
             "kv_read_validate_block_tables": config.kv_read_validate_block_tables,
             "tracker_report_on_update": config.tracker_report_on_update,
+            "tracker_host_profile": config.tracker_host_profile,
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,
             "kv_write_verify": config.kv_write_verify,

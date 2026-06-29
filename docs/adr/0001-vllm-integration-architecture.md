@@ -348,6 +348,14 @@ CPU-staged reference read bytes, and zero write verification rows/synchronizatio
 It is cleaner than the correctness gates, but it still includes vLLM server,
 Python monkey-patch, and scheduling overhead.
 
+`python -m scripts.kcmm.vllm_gpu_read_host_profile_gate` wraps that
+performance-clean gate with section-level host wall-clock timing enabled in the
+KCMM read/write trackers. This is diagnostic-only and remains off by default.
+The first local run showed the dominant measured host sections nested under
+read-side replacement and Python/ctypes kernel launch
+(`read_gpu_kernel_ctypes_launch`), not under write verification or per-update
+JSON reporting.
+
 `python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate` now covers the
 local tensor-parallel case with `tensor_parallel_size=2` on the dual RTX 3080
 machine. vLLM TP worker subprocesses inherit the KCMM monkey patches but do not

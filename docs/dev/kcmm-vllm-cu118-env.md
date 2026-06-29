@@ -781,6 +781,50 @@ reports and caching the read offset table:
   disabled and the read offset table was cached.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
+For host-side attribution, use the diagnostic host-profile wrapper:
+
+```bash
+python -m scripts.kcmm.vllm_gpu_read_host_profile_gate \
+  --no-build-kcmm \
+  --no-print-seams \
+  --timeout-seconds 420 \
+  --shutdown-timeout-seconds 60
+```
+
+This wrapper keeps the performance-clean settings and forces
+`--kcmm-tracker-host-profile` in the KCMM mode. It records section-level
+wall-clock timing in the read/write tracker final reports without enabling CUDA
+event profiling or per-update report writes. The timings are nested diagnostic
+sections; do not sum them as independent request-level costs.
+
+Latest local host-profile result on 2026-06-29:
+
+- Command:
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_host_profile_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-latest.json`
+- Result: `passed=true`
+- Report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-latest.json`
+- Correctness failures: `[]`
+- Performance warnings: `[]`
+- GPU read kernel calls: `372`
+- Stream-aware read kernel calls: `372`
+- Reference KCMM read bytes: `0`
+- Offset table cache hits/rebuilds: `369/3`
+- Request latency seconds: stock `1.822`, KCMM `2.179`, ratio `1.196`
+- Tokens per second: stock `17.563`, KCMM `14.686`, ratio `0.836`
+- Top read host sections: `read_replace_call_total=143.137ms`,
+  `read_replace_gpu_kernel_host=120.486ms`,
+  `read_gpu_kernel_host_total=119.364ms`,
+  `read_gpu_kernel_ctypes_launch=106.949ms`,
+  `read_replace_build_plan=19.093ms`.
+- Top write host sections: `write_mirror_call_total=53.675ms`,
+  `write_slot_mapping_to_host=11.554ms`, `write_ctypes_launch=8.029ms`,
+  `write_select_stream=5.004ms`, `write_ensure_slot_blocks=4.597ms`.
+- The dominant measured host sections are under read replacement, especially
+  Python/ctypes launch. This points the next optimization at reducing per-read
+  host launch overhead before changing CUDA kernel math.
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
 Latest local performance characterization on 2026-06-20:
 
 - Command: `python -m scripts.kcmm.vllm_gpu_read_ab_gate --no-build-kcmm`

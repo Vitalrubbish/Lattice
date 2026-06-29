@@ -167,6 +167,7 @@ def parse_config(argv: list[str] | None = None) -> PerfCleanGateConfig:
             instrument_kv_reads=False,
             kv_write_verify=False,
             tracker_report_on_update=False,
+            tracker_host_profile=False,
             build_kcmm=args.build_kcmm,
             keep_model=True,
             print_seams=args.print_seams,
