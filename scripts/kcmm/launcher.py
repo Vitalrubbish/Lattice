@@ -415,6 +415,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else "reference"
             ),
             force_non_default_stream=config.kv_force_non_default_stream,
+            profile_gpu_kernel=config.kv_read_profile,
         )
         kv_read_offset_table_report = apply_kv_read_offset_table(
             _KV_READ_OFFSET_TABLE_TRACKER

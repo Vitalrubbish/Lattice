@@ -131,6 +131,7 @@ class ObserverConfig:
     kv_read_offset_table: bool = False
     kv_read_replace_candidate: bool = False
     kv_read_gpu_kernel_candidate: bool = False
+    kv_read_profile: bool = False
     kv_read_offset_table_report_path: str | None = None
     kv_force_non_default_stream: bool = False
     shadow_allocations: bool = False
@@ -192,6 +193,7 @@ class ObserverConfig:
             kv_read_gpu_kernel_candidate=_env_bool(
                 "KCMM_KV_READ_GPU_KERNEL_CANDIDATE", False
             ),
+            kv_read_profile=_env_bool("KCMM_KV_READ_PROFILE", False),
             kv_read_offset_table_report_path=(
                 os.environ.get("KCMM_KV_READ_OFFSET_TABLE_REPORT_PATH") or None
             ),
@@ -346,6 +348,11 @@ class ObserverConfig:
                 "KCMM KV read GPU kernel candidate requires KCMM KV writes via "
                 "--kcmm-kv-write-mirror or --kcmm-kv-write-replace-candidate"
             )
+        if self.kv_read_profile and not self.kv_read_gpu_kernel_candidate:
+            raise ValueError(
+                "KCMM KV read profiling requires "
+                "--kcmm-kv-read-gpu-kernel-candidate"
+            )
         if self.kv_force_non_default_stream and not (
             self.kv_write_mirror
             or self.kv_write_replace_candidate
@@ -480,6 +487,11 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kcmm-kv-read-gpu-kernel-candidate",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--kcmm-kv-read-profile",
         action="store_true",
         default=None,
     )

@@ -162,6 +162,7 @@ def parse_config(argv: list[str] | None = None) -> BatchGateConfig:
             tensor_parallel_size=1,
             completion_concurrency=args.completion_concurrency,
             kv_force_non_default_stream=False,
+            kv_read_profile=False,
             build_kcmm=args.build_kcmm,
             keep_model=args.keep_model,
             print_seams=args.print_seams,

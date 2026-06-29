@@ -300,6 +300,7 @@ def gate_config_for_variant(
         tensor_parallel_size=1,
         completion_concurrency=1,
         kv_force_non_default_stream=False,
+        kv_read_profile=False,
         build_kcmm=config.build_kcmm,
         keep_model=True,
         print_seams=config.print_seams,

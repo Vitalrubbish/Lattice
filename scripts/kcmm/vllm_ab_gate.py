@@ -174,6 +174,7 @@ def smoke_config_for_mode(
         kv_read_offset_table=False,
         kv_read_replace_candidate=False,
         kv_read_gpu_kernel_candidate=False,
+        kv_read_profile=False,
         runtime_derived_pool=(is_shadow or is_backed),
         kv_write_mirror=False,
         kv_write_replace_candidate=False,

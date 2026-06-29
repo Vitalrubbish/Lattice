@@ -59,6 +59,7 @@ class GateConfig:
     tensor_parallel_size: int
     completion_concurrency: int
     kv_force_non_default_stream: bool
+    kv_read_profile: bool
     build_kcmm: bool
     keep_model: bool
     print_seams: bool
@@ -91,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Run KCMM write/read replacement launches through a dedicated "
             "non-default CUDA stream with explicit stream waits."
+        ),
+    )
+    parser.add_argument(
+        "--kv-read-profile",
+        action="store_true",
+        help=(
+            "Enable per-call CUDA event profiling for KCMM GPU read kernels "
+            "in the KCMM mode."
         ),
     )
     parser.add_argument(
@@ -235,6 +244,7 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         tensor_parallel_size=args.tensor_parallel_size,
         completion_concurrency=args.completion_concurrency,
         kv_force_non_default_stream=args.kv_force_non_default_stream,
+        kv_read_profile=args.kv_read_profile,
         build_kcmm=args.build_kcmm,
         keep_model=args.keep_model,
         print_seams=args.print_seams,
@@ -285,6 +295,7 @@ def smoke_config_for_mode(
         kv_read_offset_table=False,
         kv_read_replace_candidate=False,
         kv_read_gpu_kernel_candidate=is_gpu_read,
+        kv_read_profile=(is_gpu_read and config.kv_read_profile),
         kv_write_mirror=False,
         kv_write_replace_candidate=is_gpu_read,
         kv_force_non_default_stream=(
@@ -430,6 +441,7 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "read_last_stream_ptr": read_report.get("last_stream_ptr"),
         "read_last_original_stream_ptr": read_report.get("last_original_stream_ptr"),
         "read_last_default_stream_ptr": read_report.get("last_default_stream_ptr"),
+        "gpu_kernel_profile": read_report.get("gpu_kernel_profile"),
         "write_forced_non_default_stream_calls": write_report.get(
             "forced_non_default_stream_calls"
         ),
@@ -803,6 +815,7 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "tensor_parallel_size": config.tensor_parallel_size,
         "completion_concurrency": config.completion_concurrency,
         "kv_force_non_default_stream": config.kv_force_non_default_stream,
+        "kv_read_profile": config.kv_read_profile,
         "mode_order": list(MODE_ORDER),
         "modes": modes,
         "correctness_failures": correctness_failures,

@@ -54,6 +54,7 @@ class ReadPlanCall:
     forced_non_default_stream: bool
     original_stream_ptr: int | None
     default_stream_ptr: int | None
+    gpu_kernel_elapsed_ms: float | None
 
 
 @dataclass
@@ -149,6 +150,7 @@ class KcmmKvReadOffsetTableTracker:
         replace_native: bool = False,
         replacement_backend: str = "reference",
         force_non_default_stream: bool = False,
+        profile_gpu_kernel: bool = False,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
@@ -156,6 +158,7 @@ class KcmmKvReadOffsetTableTracker:
         if replacement_backend not in {"reference", "gpu_kernel"}:
             raise ValueError(f"unsupported replacement backend: {replacement_backend}")
         self._replacement_backend = replacement_backend
+        self._profile_gpu_kernel = bool(profile_gpu_kernel)
         self._stream_provider = KcmmStreamProvider(
             force_non_default=force_non_default_stream
         )
@@ -177,6 +180,7 @@ class KcmmKvReadOffsetTableTracker:
         self._last_stream_ptr: int | None = None
         self._last_original_stream_ptr: int | None = None
         self._last_default_stream_ptr: int | None = None
+        self._gpu_kernel_profile_samples_ms: list[float] = []
         self._counts_by_function: dict[str, int] = {}
         self._recent_calls: list[ReadPlanCall] = []
         self._error_count = 0
@@ -338,8 +342,36 @@ class KcmmKvReadOffsetTableTracker:
             forced_non_default_stream=False,
             original_stream_ptr=None,
             default_stream_ptr=None,
+            gpu_kernel_elapsed_ms=None,
         )
         return call, offsets_f16, unique_ids
+
+    def _gpu_kernel_profile_summary(self) -> dict[str, Any]:
+        samples = list(self._gpu_kernel_profile_samples_ms)
+        sorted_samples = sorted(samples)
+
+        def rounded(value: float | None) -> float | None:
+            return round(value, 6) if value is not None else None
+
+        def percentile(percentile_value: int) -> float | None:
+            if not sorted_samples:
+                return None
+            rank = (percentile_value * len(sorted_samples) + 99) // 100
+            index = min(max(rank - 1, 0), len(sorted_samples) - 1)
+            return sorted_samples[index]
+
+        return {
+            "enabled": self._profile_gpu_kernel,
+            "unit": "ms",
+            "count": len(samples),
+            "min_ms": rounded(min(samples) if samples else None),
+            "avg_ms": rounded((sum(samples) / len(samples)) if samples else None),
+            "p50_ms": rounded(percentile(50)),
+            "p95_ms": rounded(percentile(95)),
+            "p99_ms": rounded(percentile(99)),
+            "max_ms": rounded(max(samples) if samples else None),
+            "samples_ms": [rounded(sample) for sample in samples],
+        }
 
     def plan_call(
         self,
@@ -407,6 +439,10 @@ class KcmmKvReadOffsetTableTracker:
                     ]
                     call.original_stream_ptr = stream_info["original_stream_ptr"]
                     call.default_stream_ptr = stream_info["default_stream_ptr"]
+                    elapsed_ms = stream_info.get("gpu_kernel_elapsed_ms")
+                    if isinstance(elapsed_ms, (int, float)):
+                        call.gpu_kernel_elapsed_ms = float(elapsed_ms)
+                        self._gpu_kernel_profile_samples_ms.append(float(elapsed_ms))
                     self._gpu_kernel_calls += 1
                     self._stream_aware_kernel_calls += 1
                     if call.forced_non_default_stream:
@@ -621,6 +657,12 @@ class KcmmKvReadOffsetTableTracker:
             offset_table,
             out_tmp,
         )
+        start_event = None
+        end_event = None
+        if self._profile_gpu_kernel:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream_selection.stream)
         pool.paged_attn_decode_f16(
             layer_idx=layer_idx,
             query_ptr=_data_ptr(query, "query"),
@@ -637,14 +679,21 @@ class KcmmKvReadOffsetTableTracker:
             scale=float(arguments["scale"]),
             stream_ptr=stream_selection.stream_ptr,
         )
+        if end_event is not None:
+            end_event.record(stream_selection.stream)
         self._stream_provider.complete(stream_selection)
         if out_tmp is not out:
             out.copy_(out_tmp)
+        elapsed_ms = None
+        if start_event is not None and end_event is not None:
+            end_event.synchronize()
+            elapsed_ms = float(start_event.elapsed_time(end_event))
         return {
             "stream_ptr": stream_selection.stream_ptr,
             "original_stream_ptr": stream_selection.original_stream_ptr,
             "default_stream_ptr": stream_selection.default_stream_ptr,
             "forced_non_default_stream": stream_selection.forced_non_default,
+            "gpu_kernel_elapsed_ms": elapsed_ms,
         }
 
     def report(self) -> dict[str, Any]:
@@ -698,6 +747,7 @@ class KcmmKvReadOffsetTableTracker:
                 "last_stream_ptr": self._last_stream_ptr,
                 "last_original_stream_ptr": self._last_original_stream_ptr,
                 "last_default_stream_ptr": self._last_default_stream_ptr,
+                "gpu_kernel_profile": self._gpu_kernel_profile_summary(),
                 "counts_by_function": dict(sorted(self._counts_by_function.items())),
                 "cache_layers": [
                     asdict(layer)

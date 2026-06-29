@@ -285,6 +285,16 @@ the default `hello`, `math`, and `long_context` cases. It also records startup
 latency, request latency, generated-token throughput, peak GPU memory delta,
 and warning classifications for KCMM-vs-stock regressions.
 
+For kernel optimization work, the GPU read path also has an opt-in per-call
+profiler. `--kcmm-kv-read-profile` records CUDA events on the same stream passed
+to `kcmm_paged_attn_decode_f16_on_stream`, and
+`python -m scripts.kcmm.vllm_gpu_read_profile_gate` wraps the A/B gate with that
+profiling enabled only for the KCMM mode. The resulting read report includes
+per-call `gpu_kernel_elapsed_ms` values and a `gpu_kernel_profile` summary with
+count, min, avg, p50, p95, p99, max, and raw samples in milliseconds. Profiling
+is intentionally disabled by default because event timing synchronizes the end
+event and is diagnostic rather than the normal correctness path.
+
 `python -m scripts.kcmm.vllm_gpu_read_shape_gate` now broadens that gate across
 six tiny OPT shape variants inside the currently supported local envelope:
 `head64_layers2`, `head80_layers2`, `head96_layers2`, `head128_layers2`,
@@ -350,8 +360,9 @@ It does not claim the current vLLM eager scheduler naturally invokes the seams
 from non-default current streams. The remaining Phase II.C work is tensor
 parallel coverage beyond the local two-GPU gate, framework-originated
 non-default stream revalidation if vLLM changes scheduling behavior, broader
-real-model coverage, and performance optimization beyond the tiny local OPT
-shape, batch/concurrency, and tensor-parallel gates.
+real-model coverage, and performance optimization using the per-call profiling
+data beyond the tiny local OPT shape, batch/concurrency, and tensor-parallel
+gates.
 
 ### CUDA context sharing risk
 

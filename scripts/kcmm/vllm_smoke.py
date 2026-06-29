@@ -59,6 +59,7 @@ class SmokeConfig:
     kv_read_offset_table: bool
     kv_read_replace_candidate: bool
     kv_read_gpu_kernel_candidate: bool
+    kv_read_profile: bool
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
     kv_force_non_default_stream: bool
@@ -183,6 +184,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Skip native paged_attention and fill output with KCMM's GPU "
             "paged-attention kernel."
+        ),
+    )
+    parser.add_argument(
+        "--kv-read-profile",
+        action="store_true",
+        help=(
+            "Record per-call CUDA event timing for the KCMM GPU read kernel. "
+            "Requires --kv-read-gpu-kernel-candidate."
         ),
     )
     parser.add_argument(
@@ -344,6 +353,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         kv_read_offset_table=args.kv_read_offset_table,
         kv_read_replace_candidate=args.kv_read_replace_candidate,
         kv_read_gpu_kernel_candidate=args.kv_read_gpu_kernel_candidate,
+        kv_read_profile=args.kv_read_profile,
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
         kv_force_non_default_stream=args.kv_force_non_default_stream,
@@ -356,6 +366,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
             or args.kv_read_offset_table
             or args.kv_read_replace_candidate
             or args.kv_read_gpu_kernel_candidate
+            or args.kv_read_profile
             or args.kv_force_non_default_stream
         ),
         shadow_allocations=args.shadow_allocations,
@@ -637,6 +648,8 @@ def vllm_command(config: SmokeConfig) -> list[str]:
                     str(config.kv_read_offset_table_report_path),
                 ]
             )
+            if config.kv_read_profile:
+                command.append("--kcmm-kv-read-profile")
     if config.instrument_allocators:
         command.extend(
             [
@@ -923,6 +936,7 @@ def read_kv_read_offset_table_report(
     *,
     expect_replacement: bool,
     expect_gpu_kernel: bool = False,
+    expect_profile: bool = False,
 ) -> dict[str, Any]:
     if not path.exists():
         raise SmokeFailure(
@@ -992,6 +1006,28 @@ def read_kv_read_offset_table_report(
                     "KCMM KV read GPU kernel candidate used CPU-staged reads: "
                     + json.dumps(report, sort_keys=True)
                 )
+            profile = report.get("gpu_kernel_profile")
+            if expect_profile:
+                if not isinstance(profile, dict):
+                    raise SmokeFailure(
+                        "KCMM KV read profile summary was not written: "
+                        + json.dumps(report, sort_keys=True)
+                    )
+                if not profile.get("enabled", False):
+                    raise SmokeFailure(
+                        "KCMM KV read profile summary was not enabled: "
+                        + json.dumps(report, sort_keys=True)
+                    )
+                if profile.get("count", 0) <= 0:
+                    raise SmokeFailure(
+                        "KCMM KV read profile recorded no samples: "
+                        + json.dumps(report, sort_keys=True)
+                    )
+                if not isinstance(profile.get("avg_ms"), (int, float)):
+                    raise SmokeFailure(
+                        "KCMM KV read profile recorded no average duration: "
+                        + json.dumps(report, sort_keys=True)
+                    )
         elif report.get("reference_read_bytes", 0) <= 0:
             raise SmokeFailure(
                 "KCMM KV read replacement candidate read no KCMM bytes: "
@@ -1296,6 +1332,8 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "--kv-read-gpu-kernel-candidate requires --kv-write-mirror or "
             "--kv-write-replace-candidate"
         )
+    if config.kv_read_profile and not config.kv_read_gpu_kernel_candidate:
+        raise SmokeFailure("--kv-read-profile requires --kv-read-gpu-kernel-candidate")
     if config.kv_force_non_default_stream and not (
         config.kv_write_mirror
         or config.kv_write_replace_candidate
@@ -1350,6 +1388,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "kv_read_offset_table": config.kv_read_offset_table,
             "kv_read_replace_candidate": config.kv_read_replace_candidate,
             "kv_read_gpu_kernel_candidate": config.kv_read_gpu_kernel_candidate,
+            "kv_read_profile": config.kv_read_profile,
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,
             "kv_force_non_default_stream": config.kv_force_non_default_stream,
@@ -1395,6 +1434,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
                 or config.kv_read_gpu_kernel_candidate
             ),
             expect_gpu_kernel=config.kv_read_gpu_kernel_candidate,
+            expect_profile=config.kv_read_profile,
         )
         if config.kv_force_non_default_stream and config.kv_read_gpu_kernel_candidate:
             require_non_default_stream_report(
