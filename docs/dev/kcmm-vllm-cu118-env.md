@@ -747,20 +747,20 @@ gate as the cleaner request-level baseline before kernel optimization.
 The performance-clean gate also disables per-update tracker report writes,
 disables host-side read block-table validation, caches the GPU offset table
 across read seams, uses the current-context stream launch ABI, precompiles the
-GPU read kernel when the runtime pool attaches, and relies on final process-exit
-reports. Correctness gates keep per-update reports, block-table validation, and
-the generic context-binding ABI enabled by default for better failure
-diagnostics.
+GPU read kernel when the runtime pool attaches, caches stable write-side KCMM
+pool shape metadata at attach time, and relies on final process-exit reports.
+Correctness gates keep per-update reports, block-table validation, and the
+generic context-binding ABI enabled by default for better failure diagnostics.
 
-Latest local performance-clean result on 2026-06-29 after deferring tracker
+Latest local performance-clean result on 2026-06-30 after deferring tracker
 reports, caching the read offset table, enabling current-context launch, and
-precompiling the read kernel:
+precompiling the read kernel, and caching write-side pool shape metadata:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-fast-precompile-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-write-shape-cache-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-fast-precompile-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-write-shape-cache-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Model: `facebook/opt-125m`
@@ -773,19 +773,22 @@ precompiling the read kernel:
 - Read block-table validation enabled: `false`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `99.706ms`
+- Read GPU kernel precompile elapsed: `96.446ms`
+- Write pool shape cached/refreshes: `true/1`
+- Cached write pool shape: `block_size=16`, `block_bytes=24576`,
+  `step_elements=768`, `num_layers=12`
 - Offset table cache hits/rebuilds: `369/3`
 - Read tracker report writes: `1`
 - Write tracker report writes: `1`
 - Stream-level write verification synchronizations: `0`
 - KCMM write verification enabled: `false`
-- Request latency seconds: stock `1.849`, KCMM `1.825`, ratio `0.987`
-- Tokens per second: stock `17.307`, KCMM `17.534`, ratio `1.013`
+- Request latency seconds: stock `1.824`, KCMM `1.827`, ratio `1.002`
+- Tokens per second: stock `17.544`, KCMM `17.515`, ratio `0.998`
 - Peak GPU memory delta MiB: stock `5441`, KCMM `5591`, ratio `1.028`
 - Compared with the first performance-clean run, KCMM request latency improved
-  from `3.285s` to `1.825s` after per-update tracker report writes were
+  from `3.285s` to `1.827s` after per-update tracker report writes were
   disabled, the read offset table was cached, and the read kernel was
-  precompiled.
+  precompiled. In this latest run, request latency was within `0.2%` of stock.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 For host-side attribution, use the diagnostic host-profile wrapper:
@@ -805,13 +808,13 @@ tracker final reports without enabling CUDA event profiling or per-update report
 writes. The timings are nested diagnostic sections; do not sum them as
 independent request-level costs.
 
-Latest local host-profile result on 2026-06-29:
+Latest local host-profile result on 2026-06-30:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_host_profile_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-fast-precompile-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_host_profile_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-write-shape-cache-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-fast-precompile-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-write-shape-cache-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - GPU read kernel calls: `372`
@@ -819,22 +822,27 @@ Latest local host-profile result on 2026-06-29:
 - Reference KCMM read bytes: `0`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `97.574ms`
+- Read GPU kernel precompile elapsed: `96.555ms`
+- Write pool shape cached/refreshes: `true/1`
+- Cached write pool shape: `block_size=16`, `block_bytes=24576`,
+  `step_elements=768`, `num_layers=12`
 - Offset table cache hits/rebuilds: `369/3`
-- Request latency seconds: stock `1.836`, KCMM `1.874`, ratio `1.021`
-- Tokens per second: stock `17.429`, KCMM `17.076`, ratio `0.980`
-- Top read host sections: `read_gpu_kernel_precompile=97.587ms`,
-  `read_replace_call_total=40.176ms`,
-  `read_replace_gpu_kernel_host=19.129ms`,
-  `read_gpu_kernel_host_total=18.076ms`,
-  `read_gpu_kernel_ctypes_launch=6.337ms`.
-- Top write host sections: `write_mirror_call_total=49.715ms`,
-  `write_slot_mapping_to_host=11.115ms`, `write_ctypes_launch=7.021ms`,
-  `write_select_stream=4.632ms`, `write_ensure_slot_blocks=4.328ms`.
-- Compared with the previous host-profile run, the read kernel launch cold
-  start moved from the first request to pool attach:
-  `read_gpu_kernel_ctypes_launch` dropped from `106.949ms` total to `6.337ms`
-  total.
+- Request latency seconds: stock `1.840`, KCMM `1.857`, ratio `1.009`
+- Tokens per second: stock `17.391`, KCMM `17.232`, ratio `0.991`
+- Top read host sections: `read_gpu_kernel_precompile=96.565ms`,
+  `read_replace_call_total=40.749ms`,
+  `read_replace_gpu_kernel_host=19.327ms`,
+  `read_gpu_kernel_host_total=18.254ms`,
+  `read_gpu_kernel_ctypes_launch=6.456ms`.
+- Top write host sections: `write_mirror_call_total=45.316ms`,
+  `write_slot_mapping_to_host=11.156ms`, `write_ctypes_launch=7.181ms`,
+  `write_select_stream=4.602ms`, `write_ensure_slot_blocks=3.535ms`,
+  `write_pool_stats_shape_check=0.436ms`.
+- Compared with the previous host-profile run,
+  `write_pool_stats_shape_check` dropped from `3.831ms` total to `0.436ms`
+  total, `write_ensure_slot_blocks` dropped from `4.328ms` total to
+  `3.535ms` total, and `write_mirror_call_total` dropped from `49.715ms`
+  total to `45.316ms` total.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 Latest local performance characterization on 2026-06-20:

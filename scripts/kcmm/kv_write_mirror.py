@@ -119,6 +119,11 @@ class KcmmKvWriteMirrorTracker:
         )
         self._lock = threading.RLock()
         self._cache_layers: dict[tuple[int, int], CacheLayer] = {}
+        self._pool_block_size: int | None = None
+        self._pool_block_bytes: int | None = None
+        self._pool_step_elements: int | None = None
+        self._pool_num_layers: int | None = None
+        self._pool_shape_refreshes = 0
         self._driver: _CudaDriver | None = None
         self._write_calls = 0
         self._native_passthrough_calls = 0
@@ -158,6 +163,7 @@ class KcmmKvWriteMirrorTracker:
     def attach_pool(self, pool: KcmmPool) -> None:
         with self._lock:
             self._pool = pool
+            self._refresh_pool_shape(pool)
             self._write_report_on_update()
 
     def _require_pool(self) -> KcmmPool:
@@ -165,18 +171,59 @@ class KcmmKvWriteMirrorTracker:
             raise KcmmError("KCMM KV write mirror has no attached pool")
         return self._pool
 
+    def _refresh_pool_shape(self, pool: KcmmPool) -> None:
+        stats = pool.stats()
+        block_size = int(stats["block_size"])
+        block_bytes = int(stats["block_bytes"])
+        if block_size <= 0:
+            raise KcmmError(f"KCMM pool has invalid block_size={block_size}")
+        if block_bytes <= 0:
+            raise KcmmError(f"KCMM pool has invalid block_bytes={block_bytes}")
+
+        self._pool_block_size = block_size
+        self._pool_block_bytes = block_bytes
+        self._pool_step_elements = block_bytes // block_size // 2
+        self._pool_num_layers = int(stats.get("num_layers", 0))
+        self._pool_shape_refreshes += 1
+
+    def _pool_shape(self, pool: KcmmPool) -> tuple[int, int, int, int]:
+        if (
+            self._pool_block_size is None
+            or self._pool_block_bytes is None
+            or self._pool_step_elements is None
+            or self._pool_num_layers is None
+        ):
+            self._refresh_pool_shape(pool)
+
+        block_size = self._pool_block_size
+        block_bytes = self._pool_block_bytes
+        step_elements = self._pool_step_elements
+        num_layers = self._pool_num_layers
+        if (
+            block_size is None
+            or block_bytes is None
+            or step_elements is None
+            or num_layers is None
+        ):
+            raise KcmmError("KCMM pool shape cache is unavailable")
+        return block_size, block_bytes, step_elements, num_layers
+
     def _cuda_driver(self) -> _CudaDriver:
         if self._driver is None:
             self._driver = _CudaDriver()
         return self._driver
 
-    def _ensure_slot_blocks(self, pool: KcmmPool, slots: list[int]) -> None:
+    def _ensure_slot_blocks(
+        self,
+        pool: KcmmPool,
+        slots: list[int],
+        *,
+        block_size: int,
+    ) -> None:
         started_ns = self._host_profiler.start()
         if not self._replace_native:
             self._host_profiler.stop("write_ensure_slot_blocks", started_ns)
             return
-        stats = pool.stats()
-        block_size = int(stats["block_size"])
         block_ids = sorted({slot // block_size for slot in slots if slot >= 0})
         if not block_ids:
             self._host_profiler.stop("write_ensure_slot_blocks", started_ns)
@@ -216,8 +263,7 @@ class KcmmKvWriteMirrorTracker:
         if existing is not None:
             return existing.layer_idx
 
-        pool_stats = pool.stats()
-        num_layers = int(pool_stats.get("num_layers", 0))
+        _, _, _, num_layers = self._pool_shape(pool)
         layer_idx = len(self._cache_layers)
         if layer_idx >= num_layers:
             raise KcmmError(
@@ -387,10 +433,7 @@ class KcmmKvWriteMirrorTracker:
                 self._host_profiler.stop("write_prepare_rows", rows_started_ns)
                 row_width = int(k_rows.shape[1])
                 stats_started_ns = self._host_profiler.start()
-                stats = pool.stats()
-                block_size = int(stats["block_size"])
-                block_bytes = int(stats["block_bytes"])
-                step_elements = block_bytes // block_size // 2
+                block_size, _, step_elements, _ = self._pool_shape(pool)
                 self._host_profiler.stop("write_pool_stats_shape_check", stats_started_ns)
                 if row_width != step_elements:
                     raise KcmmError(
@@ -402,7 +445,7 @@ class KcmmKvWriteMirrorTracker:
                 if _device_index(v_rows, "value") != device_index:
                     raise KcmmError("key and value are on different CUDA devices")
 
-                self._ensure_slot_blocks(pool, slots)
+                self._ensure_slot_blocks(pool, slots, block_size=block_size)
 
                 stream_started_ns = self._host_profiler.start()
                 stream_selection = self._stream_provider.select(device_index)
@@ -525,6 +568,12 @@ class KcmmKvWriteMirrorTracker:
                 "host_profile": self._host_profiler.report(),
                 "slot_formula": "slot = block_id * block_size + offset_in_block",
                 "pool_attached": self._pool is not None,
+                "pool_shape_cached": self._pool_step_elements is not None,
+                "pool_shape_refreshes": self._pool_shape_refreshes,
+                "pool_block_size": self._pool_block_size,
+                "pool_block_bytes": self._pool_block_bytes,
+                "pool_step_elements": self._pool_step_elements,
+                "pool_num_layers": self._pool_num_layers,
                 "write_calls": self._write_calls,
                 "native_calls": self._native_passthrough_calls,
                 "native_passthrough_calls": self._native_passthrough_calls,

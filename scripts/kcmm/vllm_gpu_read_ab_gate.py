@@ -572,6 +572,12 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "write_host_profile": write_report.get("host_profile"),
         "kcmm_write_verified_rows": write_report.get("verified_rows"),
         "stream_aware_write_calls": write_report.get("stream_aware_write_calls"),
+        "write_pool_shape_cached": write_report.get("pool_shape_cached"),
+        "write_pool_shape_refreshes": write_report.get("pool_shape_refreshes"),
+        "write_pool_block_size": write_report.get("pool_block_size"),
+        "write_pool_block_bytes": write_report.get("pool_block_bytes"),
+        "write_pool_step_elements": write_report.get("pool_step_elements"),
+        "write_pool_num_layers": write_report.get("pool_num_layers"),
         "force_non_default_stream": read_report.get("force_non_default_stream"),
         "read_forced_non_default_stream_calls": read_report.get(
             "forced_non_default_stream_calls"
