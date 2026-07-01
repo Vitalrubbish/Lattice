@@ -370,6 +370,8 @@ class KcmmLibrary:
         lib.kcmm_get_metrics.restype = ctypes.c_int
         lib.kcmm_get_pool_stats.argtypes = [pool, ctypes.POINTER(KcmmPoolStats)]
         lib.kcmm_get_pool_stats.restype = ctypes.c_int
+        lib.kcmm_total_blocks.argtypes = [pool]
+        lib.kcmm_total_blocks.restype = ctypes.c_uint32
         lib.kcmm_synchronize.argtypes = [pool]
         lib.kcmm_synchronize.restype = ctypes.c_int
 
@@ -513,6 +515,9 @@ class KcmmPool:
         )
         self._check(rc, "kcmm_get_all_block_offsets_f16")
         return [int(out[i]) for i in range(int(count.value))]
+
+    def total_blocks(self) -> int:
+        return int(self.library.lib.kcmm_total_blocks(self.handle))
 
     def block_va_offset(self, block_idx: int) -> int:
         return int(

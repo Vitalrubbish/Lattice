@@ -350,11 +350,13 @@ shape metadata at pool attach so per-write row-width validation and slot block
 ensure logic do not call `pool.stats()` on the hot path. It also caches slot
 block IDs after first successful `block_location` validation or lazy worker-local
 allocation, avoiding repeated block-location checks for the same physical
-blocks. The gate still requires token-exact stock-vs-KCMM output, GPU
-read-kernel calls, zero CPU-staged reference read bytes, successful read-kernel
-precompile, and zero write verification rows/synchronizations. It is cleaner
-than the correctness gates, but it still includes vLLM server, Python
-monkey-patch, and scheduling overhead.
+blocks. When host-side block-table validation is disabled, the read planner uses
+the lightweight `kcmm_total_blocks()` ABI to size the offset table instead of
+building a full pool stats snapshot on every read seam. The gate still requires
+token-exact stock-vs-KCMM output, GPU read-kernel calls, zero CPU-staged
+reference read bytes, successful read-kernel precompile, and zero write
+verification rows/synchronizations. It is cleaner than the correctness gates,
+but it still includes vLLM server, Python monkey-patch, and scheduling overhead.
 
 `python -m scripts.kcmm.vllm_gpu_read_host_profile_gate` wraps that
 performance-clean gate with section-level host wall-clock timing enabled in the

@@ -205,6 +205,7 @@ class KcmmKvReadOffsetTableTracker:
         self._recent_offset_tables: list[Any] = []
         self._offset_table_cache_hits = 0
         self._offset_table_cache_rebuilds = 0
+        self._min_entries_total_blocks_calls = 0
         self._gpu_kernel_precompile_requested = bool(precompile_gpu_kernel)
         self._gpu_kernel_precompile_calls = 0
         self._gpu_kernel_precompile_succeeded = False
@@ -368,15 +369,11 @@ class KcmmKvReadOffsetTableTracker:
             )
         else:
             stats_started_ns = self._host_profiler.start()
-            pool_stats = pool.stats()
             block_ids = []
             unique_ids = []
             max_block_id = None
-            min_entries = max(
-                int(pool_stats.get("total_blocks", 0)),
-                int(pool_stats.get("blocks_in_use", 0)),
-                1,
-            )
+            min_entries = max(pool.total_blocks(), 1)
+            self._min_entries_total_blocks_calls += 1
             self._host_profiler.stop("read_pool_stats_for_min_entries", stats_started_ns)
 
         offset_started_ns = self._host_profiler.start()
@@ -941,6 +938,9 @@ class KcmmKvReadOffsetTableTracker:
                 "offset_table_builds": self._offset_table_builds,
                 "offset_table_cache_hits": self._offset_table_cache_hits,
                 "offset_table_cache_rebuilds": self._offset_table_cache_rebuilds,
+                "min_entries_total_blocks_calls": (
+                    self._min_entries_total_blocks_calls
+                ),
                 "reference_read_bytes": self._reference_read_bytes,
                 "total_block_table_entries": self._total_block_table_entries,
                 "unique_block_ids_seen": len(self._unique_block_ids_seen),

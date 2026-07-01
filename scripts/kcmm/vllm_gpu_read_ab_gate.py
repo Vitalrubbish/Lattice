@@ -541,6 +541,9 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "offset_table_cache_rebuilds": read_report.get(
             "offset_table_cache_rebuilds"
         ),
+        "read_min_entries_total_blocks_calls": read_report.get(
+            "min_entries_total_blocks_calls"
+        ),
         "read_block_table_validation_enabled": read_report.get(
             "block_table_validation_enabled"
         ),
