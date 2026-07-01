@@ -578,6 +578,13 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "write_pool_block_bytes": write_report.get("pool_block_bytes"),
         "write_pool_step_elements": write_report.get("pool_step_elements"),
         "write_pool_num_layers": write_report.get("pool_num_layers"),
+        "write_known_slot_blocks": write_report.get("known_slot_blocks"),
+        "write_slot_block_ensure_cache_hits": write_report.get(
+            "slot_block_ensure_cache_hits"
+        ),
+        "write_slot_block_ensure_cache_misses": write_report.get(
+            "slot_block_ensure_cache_misses"
+        ),
         "force_non_default_stream": read_report.get("force_non_default_stream"),
         "read_forced_non_default_stream_calls": read_report.get(
             "forced_non_default_stream_calls"

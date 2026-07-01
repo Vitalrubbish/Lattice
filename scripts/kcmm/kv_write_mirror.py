@@ -124,6 +124,9 @@ class KcmmKvWriteMirrorTracker:
         self._pool_step_elements: int | None = None
         self._pool_num_layers: int | None = None
         self._pool_shape_refreshes = 0
+        self._known_slot_blocks: set[int] = set()
+        self._slot_block_ensure_cache_hits = 0
+        self._slot_block_ensure_cache_misses = 0
         self._driver: _CudaDriver | None = None
         self._write_calls = 0
         self._native_passthrough_calls = 0
@@ -224,7 +227,19 @@ class KcmmKvWriteMirrorTracker:
         if not self._replace_native:
             self._host_profiler.stop("write_ensure_slot_blocks", started_ns)
             return
-        block_ids = sorted({slot // block_size for slot in slots if slot >= 0})
+        observed_block_ids = sorted({slot // block_size for slot in slots if slot >= 0})
+        if not observed_block_ids:
+            self._host_profiler.stop("write_ensure_slot_blocks", started_ns)
+            return
+        block_ids = [
+            block_id
+            for block_id in observed_block_ids
+            if block_id not in self._known_slot_blocks
+        ]
+        self._slot_block_ensure_cache_hits += (
+            len(observed_block_ids) - len(block_ids)
+        )
+        self._slot_block_ensure_cache_misses += len(block_ids)
         if not block_ids:
             self._host_profiler.stop("write_ensure_slot_blocks", started_ns)
             return
@@ -234,6 +249,7 @@ class KcmmKvWriteMirrorTracker:
             for _attempt in range(block_id + 2):
                 try:
                     pool.block_location(block_id)
+                    self._known_slot_blocks.add(block_id)
                     break
                 except KcmmError:
                     total_blocks = int(pool.stats().get("total_blocks", 0))
@@ -285,7 +301,7 @@ class KcmmKvWriteMirrorTracker:
         import torch
 
         tensor = slot_mapping.detach().to(device="cpu", dtype=torch.int64).flatten()
-        return [int(item) for item in tensor.tolist()]
+        return tensor.tolist()
 
     @staticmethod
     def _validate_dtype(key: Any, value: Any) -> None:
@@ -574,6 +590,11 @@ class KcmmKvWriteMirrorTracker:
                 "pool_block_bytes": self._pool_block_bytes,
                 "pool_step_elements": self._pool_step_elements,
                 "pool_num_layers": self._pool_num_layers,
+                "known_slot_blocks": len(self._known_slot_blocks),
+                "slot_block_ensure_cache_hits": self._slot_block_ensure_cache_hits,
+                "slot_block_ensure_cache_misses": (
+                    self._slot_block_ensure_cache_misses
+                ),
                 "write_calls": self._write_calls,
                 "native_calls": self._native_passthrough_calls,
                 "native_passthrough_calls": self._native_passthrough_calls,
