@@ -799,6 +799,49 @@ total-block lookups:
   latency.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
+For concurrent real-model performance-clean coverage, use the stress wrapper:
+
+```bash
+python -m scripts.kcmm.vllm_gpu_read_perf_clean_stress_gate \
+  --no-build-kcmm \
+  --no-print-seams \
+  --timeout-seconds 420 \
+  --shutdown-timeout-seconds 60
+```
+
+This wrapper keeps the same performance-clean settings as the single-request
+gate but runs two real-model completion cases with `completion_concurrency=2`,
+`max_num_seqs=2`, and `max_num_batched_tokens=192`. It fails if the KCMM read
+report does not observe a decode batch of at least `2`, so it validates that the
+fast path is exercised under concurrent vLLM scheduling.
+
+Latest local performance-clean stress result on 2026-07-01:
+
+- Command:
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_stress_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-latest.json`
+- Result: `passed=true`
+- Report:
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-latest.json`
+- Correctness failures: `[]`
+- Performance warnings: `[]`
+- Coverage cases: `stress_history`, `stress_memory`
+- Completion concurrency: `2`
+- Observed max read batch: `2`
+- Observed max write batch: `9`
+- GPU read kernel calls: `276`
+- Stream-aware read kernel calls: `276`
+- Reference KCMM read bytes: `0`
+- Read fast current-context launch: `true`
+- Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
+- Read GPU kernel precompile elapsed: `111.443ms`
+- Offset table cache hits/rebuilds: `273/3`
+- Write verification enabled: `false`
+- KCMM write verified rows: `0`
+- Request latency seconds: stock `2.116`, KCMM `1.964`, ratio `0.928`
+- Tokens per second: stock `22.684`, KCMM `24.440`, ratio `1.077`
+- Peak GPU memory delta MiB: stock `5443`, KCMM `5593`, ratio `1.028`
+- GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
+
 For host-side attribution, use the diagnostic host-profile wrapper:
 
 ```bash
