@@ -273,6 +273,9 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         "write_device_slot_block_state_epoch_queries": contract.get(
             "write_device_slot_block_state_epoch_queries"
         ),
+        "write_device_slot_table_device_index": contract.get(
+            "write_device_slot_table_device_index"
+        ),
         "write_device_slot_offset_table_cache_hits": contract.get(
             "write_device_slot_offset_table_cache_hits"
         ),
@@ -761,6 +764,15 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                     "threshold_exclusive": max_expected_epoch_queries,
                 }
             )
+    table_device_index = contract.get("write_device_slot_table_device_index")
+    if not isinstance(table_device_index, int) or table_device_index < 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_device_slot_table_device_index_missing",
+                "value": table_device_index,
+            }
+        )
     status_checks = contract.get("write_device_slot_status_checks")
     if not isinstance(status_checks, int) or status_checks <= 0:
         failures.append(

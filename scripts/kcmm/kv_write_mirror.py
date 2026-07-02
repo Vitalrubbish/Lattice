@@ -135,6 +135,7 @@ class KcmmKvWriteMirrorTracker:
         self._last_device_slot_valid_flags: list[int] = []
         self._last_device_slot_valid_table: Any | None = None
         self._last_device_slot_table_epoch: int | None = None
+        self._last_device_slot_table_device_index: int | None = None
         self._device_slot_total_blocks: int | None = None
         self._device_slot_total_blocks_refreshes = 0
         self._device_slot_block_state_epoch_queries = 0
@@ -382,10 +383,10 @@ class KcmmKvWriteMirrorTracker:
         *,
         pool: KcmmPool,
         device: Any,
+        device_index: int,
     ) -> tuple[Any, Any]:
         import torch
 
-        table_device = str(device)
         epoch = self._device_slot_block_state_epoch(pool)
         cached_offsets = self._last_device_slot_offset_table
         cached_valid = self._last_device_slot_valid_table
@@ -394,8 +395,7 @@ class KcmmKvWriteMirrorTracker:
             and cached_valid is not None
             and self._last_device_slot_offsets
             and self._last_device_slot_valid_flags
-            and str(getattr(cached_offsets, "device", None)) == table_device
-            and str(getattr(cached_valid, "device", None)) == table_device
+            and self._last_device_slot_table_device_index == device_index
             and self._last_device_slot_table_epoch == epoch
         ):
             self._device_slot_offset_table_cache_hits += 1
@@ -441,6 +441,7 @@ class KcmmKvWriteMirrorTracker:
         self._last_device_slot_valid_flags = valid_flags
         self._last_device_slot_valid_table = valid_table
         self._last_device_slot_table_epoch = epoch
+        self._last_device_slot_table_device_index = device_index
         self._recent_device_slot_tables.append(offset_table)
         self._recent_device_slot_tables.append(valid_table)
         self._recent_device_slot_tables = self._recent_device_slot_tables[-16:]
@@ -667,6 +668,7 @@ class KcmmKvWriteMirrorTracker:
                     offset_table, valid_table = self._device_slot_tables_for_device(
                         pool=pool,
                         device=slot_tensor.device,
+                        device_index=device_index,
                     )
                     self._host_profiler.stop(
                         "write_device_slot_table_lookup",
@@ -904,6 +906,9 @@ class KcmmKvWriteMirrorTracker:
                     self._device_slot_kernel_precompile_elapsed_ms
                 ),
                 "device_slot_table_epoch": self._last_device_slot_table_epoch,
+                "device_slot_table_device_index": (
+                    self._last_device_slot_table_device_index
+                ),
                 "device_slot_total_blocks": self._device_slot_total_blocks,
                 "device_slot_total_blocks_refreshes": (
                     self._device_slot_total_blocks_refreshes

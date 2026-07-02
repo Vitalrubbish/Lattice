@@ -629,6 +629,9 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "write_device_slot_block_state_epoch_queries": write_report.get(
             "device_slot_block_state_epoch_queries"
         ),
+        "write_device_slot_table_device_index": write_report.get(
+            "device_slot_table_device_index"
+        ),
         "write_device_slot_offset_table_cache_hits": write_report.get(
             "device_slot_offset_table_cache_hits"
         ),
