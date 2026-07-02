@@ -168,6 +168,7 @@ def parse_config(argv: list[str] | None = None) -> PerfCleanGateConfig:
             kv_read_precompile_gpu_kernel=True,
             instrument_kv_reads=False,
             kv_write_verify=False,
+            kv_write_device_slots=True,
             tracker_report_on_update=False,
             tracker_host_profile=False,
             build_kcmm=args.build_kcmm,
@@ -202,6 +203,7 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "requested_instrument_kv_reads": report.get("instrument_kv_reads"),
         "requested_kv_write_verify": report.get("kv_write_verify"),
+        "requested_kv_write_device_slots": report.get("kv_write_device_slots"),
         "requested_kv_read_fast_current_context_launch": report.get(
             "kv_read_fast_current_context_launch"
         ),
@@ -215,6 +217,11 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         ),
         "kcmm_mode_kv_write_verify": (
             kcmm_mode.get("kv_write_verify")
+            if isinstance(kcmm_mode, dict)
+            else None
+        ),
+        "kcmm_mode_kv_write_device_slots": (
+            kcmm_mode.get("kv_write_device_slots")
             if isinstance(kcmm_mode, dict)
             else None
         ),
@@ -235,6 +242,28 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         ),
         "write_verification_enabled": contract.get("write_verification_enabled"),
         "write_verify_rows_per_call": contract.get("write_verify_rows_per_call"),
+        "write_device_slot_enabled": contract.get("write_device_slot_enabled"),
+        "write_device_slot_active": contract.get("write_device_slot_active"),
+        "write_device_slot_calls": contract.get("write_device_slot_calls"),
+        "write_host_slot_calls": contract.get("write_host_slot_calls"),
+        "write_device_slot_status_checks": contract.get(
+            "write_device_slot_status_checks"
+        ),
+        "write_device_slot_status_error_count": contract.get(
+            "write_device_slot_status_error_count"
+        ),
+        "write_device_slot_offset_table_cache_hits": contract.get(
+            "write_device_slot_offset_table_cache_hits"
+        ),
+        "write_device_slot_offset_table_cache_rebuilds": contract.get(
+            "write_device_slot_offset_table_cache_rebuilds"
+        ),
+        "write_device_slot_valid_table_cache_hits": contract.get(
+            "write_device_slot_valid_table_cache_hits"
+        ),
+        "write_device_slot_valid_table_cache_rebuilds": contract.get(
+            "write_device_slot_valid_table_cache_rebuilds"
+        ),
         "read_fast_current_context_launch": contract.get(
             "read_fast_current_context_launch"
         ),
@@ -319,6 +348,22 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "mode": "kcmm_gpu_read",
                 "reason": "write_verification_not_disabled_in_smoke",
                 "value": kcmm_mode.get("kv_write_verify"),
+            }
+        )
+    if report.get("kv_write_device_slots") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "device_slot_write_not_enabled_in_config",
+                "value": report.get("kv_write_device_slots"),
+            }
+        )
+    if kcmm_mode.get("kv_write_device_slots") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "device_slot_write_not_enabled_in_smoke",
+                "value": kcmm_mode.get("kv_write_device_slots"),
             }
         )
     if kcmm_mode.get("tracker_report_on_update") is not False:
@@ -464,6 +509,56 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "mode": "kcmm_gpu_read",
                 "reason": "write_verify_rows_per_call_nonzero",
                 "value": contract.get("write_verify_rows_per_call"),
+            }
+        )
+    if contract.get("write_device_slot_enabled") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "device_slot_write_not_enabled_in_report",
+                "value": contract.get("write_device_slot_enabled"),
+            }
+        )
+    if contract.get("write_device_slot_active") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "device_slot_write_not_active_in_report",
+                "value": contract.get("write_device_slot_active"),
+            }
+        )
+    device_calls = contract.get("write_device_slot_calls")
+    if not isinstance(device_calls, int) or device_calls <= 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "device_slot_write_calls_missing",
+                "value": device_calls,
+            }
+        )
+    if contract.get("write_host_slot_calls") != 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "host_slot_writes_used_in_device_slot_mode",
+                "value": contract.get("write_host_slot_calls"),
+            }
+        )
+    if contract.get("write_device_slot_status_error_count") != 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "device_slot_status_errors_seen",
+                "value": contract.get("write_device_slot_status_error_count"),
+            }
+        )
+    status_checks = contract.get("write_device_slot_status_checks")
+    if not isinstance(status_checks, int) or status_checks <= 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "device_slot_status_checks_missing",
+                "value": status_checks,
             }
         )
     if contract.get("kcmm_write_verified_rows") != 0:

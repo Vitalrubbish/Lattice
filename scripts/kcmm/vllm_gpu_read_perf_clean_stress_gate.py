@@ -182,6 +182,7 @@ def parse_config(argv: list[str] | None = None) -> tuple[PerfCleanGateConfig, in
                 kv_read_precompile_gpu_kernel=True,
                 instrument_kv_reads=False,
                 kv_write_verify=False,
+                kv_write_device_slots=True,
                 tracker_report_on_update=False,
                 tracker_host_profile=False,
                 build_kcmm=args.build_kcmm,

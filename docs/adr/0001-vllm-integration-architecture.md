@@ -204,11 +204,14 @@ KCMM bytes back to host.
 
 A later Phase II.C cleanup added a low-level device-slot write ABI,
 `kcmm_append_kv_device_slots_on_stream`, that consumes vLLM's CUDA
-`slot_mapping` tensor plus a CUDA f16-offset table directly. This ABI is
-validated by `kv_write_ffi_smoke`, but it is not yet the default vLLM tracker
-path because replacement-mode safety still needs a device-side valid-block
-contract before `_slot_mapping_to_list()` can be removed from the integrated
-write tracker.
+`slot_mapping` tensor plus CUDA f16-offset and valid-block tables directly. The
+kernel skips negative padding slots, reports status `1` for out-of-range block
+ids, and reports status `2` for in-range block ids marked inactive. The
+performance-clean write tracker can use this ABI behind
+`--kcmm-kv-write-device-slots` when row verification is disabled; correctness
+paths still default to the host-slot writer because D2H row verification needs a
+host slot list. The tracker caches device offset/valid tables by KCMM
+block-state epoch so block reuse or VA remapping invalidates stale tables.
 
 ### Why A1 is not valid at the vLLM Python custom-op seam (intercept 3)
 
@@ -360,11 +363,14 @@ block IDs after first successful `block_location` validation or lazy worker-loca
 allocation, avoiding repeated block-location checks for the same physical
 blocks. When host-side block-table validation is disabled, the read planner uses
 the lightweight `kcmm_total_blocks()` ABI to size the offset table instead of
-building a full pool stats snapshot on every read seam. The gate still requires
-token-exact stock-vs-KCMM output, GPU read-kernel calls, zero CPU-staged
-reference read bytes, successful read-kernel precompile, and zero write
-verification rows/synchronizations. It is cleaner than the correctness gates,
-but it still includes vLLM server, Python monkey-patch, and scheduling overhead.
+building a full pool stats snapshot on every read seam. The gate also enables
+device-slot KV writes so vLLM's CUDA `slot_mapping` tensor stays on device; it
+requires device write calls, zero host-slot write calls, status checks, and zero
+device status errors. The gate still requires token-exact stock-vs-KCMM output,
+GPU read-kernel calls, zero CPU-staged reference read bytes, successful
+read-kernel precompile, and zero write verification rows/synchronizations. It is
+cleaner than the correctness gates, but it still includes vLLM server, Python
+monkey-patch, and scheduling overhead.
 
 `python -m scripts.kcmm.vllm_gpu_read_host_profile_gate` wraps that
 performance-clean gate with section-level host wall-clock timing enabled in the

@@ -390,6 +390,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile_host_sections=config.tracker_host_profile,
             replace_native=config.kv_write_replace_candidate,
             force_non_default_stream=config.kv_force_non_default_stream,
+            use_device_slot_write=config.kv_write_device_slots,
         )
         kv_write_mirror_report = apply_kv_write_mirror(_KV_WRITE_MIRROR_TRACKER)
         _print_json({"kcmm_kv_write_mirror_patch": kv_write_mirror_report})

@@ -34,12 +34,14 @@ device-slot ABI so a later tracker slice can keep the slot contract on GPU.
 
 ## Boundaries
 
-- This does not yet switch the vLLM write tracker to the device-slot ABI.
-- The new ABI trusts the caller-provided offset table for in-use block
-  semantics. It can flag block ids outside the offset-table length through the
-  optional device status tensor, but it does not yet validate inactive block ids
-  whose table entry is present.
-- The old host-slot ABI remains the stable vLLM path and low-level fallback.
+- This issue introduced the low-level ABI. Issue 32 wires it into the
+  performance-clean vLLM write tracker.
+- The ABI now accepts both a caller-provided offset table and a caller-provided
+  valid-block table. The optional device status tensor reports status `1` for a
+  block id outside the offset-table length and status `2` for an in-range block
+  marked inactive.
+- The old host-slot ABI remains the default correctness path and low-level
+  fallback.
 
 ## Implementation
 
@@ -61,18 +63,20 @@ device-slot ABI so a later tracker slice can keep the slot contract on GPU.
 
 - Date: 2026-07-02
 - Result: `passed=true`
-- Report: `/tmp/kcmm-kv-write-device-slot-smoke.json`
+- Report: `/tmp/kcmm-kv-write-device-slot-epoch-smoke.json`
 - Host direct-slot ABI still passed for slots `2`, `7`, and padding `-1`.
 - Device direct-slot ABI passed for slots `1`, `4`, and padding `-1`.
 - Device slot mapping pointer was CUDA memory.
-- Device block-offset table entries: `2`.
+- Device block-offset table entries: `3`.
+- Device valid-block table: `[1, 1, 0]`.
 - Invalid host slot `16` still failed through the old synchronous error path.
 - Invalid device slot `16` set device status to `1`.
+- Inactive device slot `8` set device status to `2`.
 - Final KCMM stats recorded `blocks_in_use=0`.
 
 ## Follow-up
 
-The next slice should integrate this ABI into `KcmmKvWriteMirrorTracker`
-behind an opt-in or performance-clean condition. That requires a first-class
-device valid-block/status contract so the tracker can stop calling
-`_slot_mapping_to_list()` without weakening replacement-mode safety.
+Completed by Issue 32: the performance-clean tracker can now use
+`kcmm_append_kv_device_slots_on_stream(...)` behind an explicit
+`--kcmm-kv-write-device-slots` flag, while correctness paths keep the host-slot
+writer by default.

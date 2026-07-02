@@ -182,11 +182,15 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
     library = KcmmLibrary(config.kcmm_lib_path)
     pool = library.create_pool(observer_config(config).to_c_config())
     blocks: list[int] = []
+    inactive_block: int | None = None
     seq_idx: int | None = None
     registered_seq_idx: int | None = None
     started_at = time.monotonic()
     try:
-        blocks = pool.alloc_blocks(2)
+        allocated_blocks = pool.alloc_blocks(3)
+        inactive_block = allocated_blocks[2]
+        pool.free_blocks([inactive_block])
+        blocks = allocated_blocks[:2]
         seq_idx = pool.register_sequence(blocks)
         registered_seq_idx = seq_idx
         if pool.block_table(seq_idx, 4) != blocks:
@@ -340,6 +344,21 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
                 "block offset table shorter than allocated blocks: "
                 f"entries={len(block_offsets_f16)} blocks={blocks}"
             )
+        block_valid_flags = pool.all_block_valid_flags()
+        if len(block_valid_flags) != len(block_offsets_f16):
+            raise KvWriteSmokeFailure(
+                "block valid table length did not match offset table length: "
+                f"valid={len(block_valid_flags)} offsets={len(block_offsets_f16)}"
+            )
+        for block in blocks:
+            if block_valid_flags[block] != 1:
+                raise KvWriteSmokeFailure(
+                    f"allocated block {block} was not marked valid"
+                )
+        if inactive_block is None or block_valid_flags[inactive_block] != 0:
+            raise KvWriteSmokeFailure(
+                f"inactive block {inactive_block} was not marked invalid"
+            )
         device_slot_tensor = torch.tensor(
             device_slots,
             dtype=torch.int64,
@@ -350,11 +369,17 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
             dtype=torch.int64,
             device=device,
         )
+        block_valid_tensor = torch.tensor(
+            block_valid_flags,
+            dtype=torch.uint8,
+            device=device,
+        )
         device_slot_status = torch.zeros(1, dtype=torch.int32, device=device)
         pool.append_kv_device_slots_on_stream(
             layer_idx=0,
             slot_mapping_ptr=int(device_slot_tensor.data_ptr()),
             block_offsets_f16_ptr=int(block_offsets_f16_tensor.data_ptr()),
+            valid_blocks_ptr=int(block_valid_tensor.data_ptr()),
             block_offsets_f16_len=len(block_offsets_f16),
             batch=device_slot_batch,
             k_src_ptr=int(device_slot_k_src.data_ptr()),
@@ -405,6 +430,7 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
             )
 
         invalid_slot = config.max_blocks * config.block_size
+        inactive_slot = inactive_block * config.block_size
         invalid_error = None
         try:
             pool.append_kv_slots(
@@ -421,6 +447,33 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
                 f"direct-slot write unexpectedly accepted invalid slot {invalid_slot}"
             )
 
+        inactive_device_slots = torch.tensor(
+            [inactive_slot],
+            dtype=torch.int64,
+            device=device,
+        )
+        inactive_device_status = torch.zeros(1, dtype=torch.int32, device=device)
+        pool.append_kv_device_slots_on_stream(
+            layer_idx=0,
+            slot_mapping_ptr=int(inactive_device_slots.data_ptr()),
+            block_offsets_f16_ptr=int(block_offsets_f16_tensor.data_ptr()),
+            valid_blocks_ptr=int(block_valid_tensor.data_ptr()),
+            block_offsets_f16_len=len(block_offsets_f16),
+            batch=1,
+            k_src_ptr=int(device_slot_k_src[:1].data_ptr()),
+            v_src_ptr=int(device_slot_v_src[:1].data_ptr()),
+            status_ptr=int(inactive_device_status.data_ptr()),
+            stream_ptr=slot_stream_ptr,
+        )
+        slot_stream.synchronize()
+        inactive_device_status_value = int(inactive_device_status.cpu().item())
+        if inactive_device_status_value != 2:
+            raise KvWriteSmokeFailure(
+                "device-slot write did not report inactive slot "
+                f"{inactive_slot} through status tensor: "
+                f"{inactive_device_status_value}"
+            )
+
         invalid_device_slots = torch.tensor(
             [invalid_slot],
             dtype=torch.int64,
@@ -431,6 +484,7 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
             layer_idx=0,
             slot_mapping_ptr=int(invalid_device_slots.data_ptr()),
             block_offsets_f16_ptr=int(block_offsets_f16_tensor.data_ptr()),
+            valid_blocks_ptr=int(block_valid_tensor.data_ptr()),
             block_offsets_f16_len=len(block_offsets_f16),
             batch=1,
             k_src_ptr=int(device_slot_k_src[:1].data_ptr()),
@@ -473,6 +527,7 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
                 "step_elements": step,
             },
             "allocated_blocks": blocks,
+            "inactive_block": inactive_block,
             "registered_seq_idx": registered_seq_idx,
             "comparisons": comparisons,
             "direct_slot_writes": {
@@ -493,7 +548,11 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
                 "block_offsets_f16_device_ptr": int(
                     block_offsets_f16_tensor.data_ptr()
                 ),
+                "valid_blocks_device_ptr": int(block_valid_tensor.data_ptr()),
+                "valid_blocks": block_valid_flags,
                 "status_device_ptr": int(device_slot_status.data_ptr()),
+                "inactive_slot": inactive_slot,
+                "inactive_slot_status": inactive_device_status_value,
                 "invalid_slot": invalid_slot,
                 "invalid_slot_status": invalid_device_status_value,
             },

@@ -308,6 +308,7 @@ def gate_config_for_variant(
         kv_read_precompile_gpu_kernel=False,
         instrument_kv_reads=True,
         kv_write_verify=True,
+        kv_write_device_slots=False,
         tracker_report_on_update=True,
         tracker_host_profile=False,
         build_kcmm=config.build_kcmm,

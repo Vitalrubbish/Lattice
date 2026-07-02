@@ -198,17 +198,18 @@ blocks, writes known FP16 K/V rows through `kcmm_append_kv_step`, then verifies
 the vLLM-style physical-slot writer `kcmm_append_kv_slots_on_stream` with
 `slot = block_id * block_size + offset_in_block`. It also verifies the
 device-slot writer `kcmm_append_kv_device_slots_on_stream`, which consumes a
-CUDA int64 `slot_mapping` tensor pointer plus a CUDA int64 f16-offset table
-indexed by block id. It reads the destination KCMM VA bytes back to host and
-compares them with the source CUDA tensors. This verifies the C ABI, VA
-accessors, D2D write paths, host-slot and device-slot decoding, caller stream
-enqueue, padding skip behavior, invalid-slot handling, and D2H byte-level
-comparison without downloading a model or starting vLLM.
+CUDA int64 `slot_mapping` tensor pointer, a CUDA int64 f16-offset table indexed
+by block id, and a CUDA u8 valid-block table. It reads the destination KCMM VA
+bytes back to host and compares them with the source CUDA tensors. This verifies
+the C ABI, VA accessors, D2D write paths, host-slot and device-slot decoding,
+caller stream enqueue, padding skip behavior, invalid-slot handling, inactive
+block handling, and D2H byte-level comparison without downloading a model or
+starting vLLM.
 
-The device-slot writer is a low-level ABI only at this point. The vLLM write
-tracker still uses the stable host-slot path until the replacement-mode safety
-contract can avoid `_slot_mapping_to_list()` without losing in-use block
-validation.
+The performance-clean vLLM write tracker can use the device-slot writer behind
+`--kcmm-kv-write-device-slots` when row verification is disabled. Correctness
+gates still use the stable host-slot path by default because bounded D2H row
+verification needs the host slot list.
 
 Latest local Phase II.B preflight result on 2026-07-02:
 
@@ -226,7 +227,9 @@ Latest local Phase II.B preflight result on 2026-07-02:
   formula.
 - Device direct-slot padding slot `-1` was skipped.
 - Device direct-slot invalid slot `16` set the device status tensor to `1`.
-- Device direct-slot offset table entries: `2`.
+- Device direct-slot inactive slot `8` set the device status tensor to `2`.
+- Device direct-slot offset table entries: `3`.
+- Device direct-slot valid-block table: `[1, 1, 0]`.
 - Final KCMM stats recorded `blocks_in_use=0`.
 
 ## Phase II.B vLLM write contract trace
@@ -758,26 +761,25 @@ or if the write report shows any verified rows or verification synchronizations.
 Use the regular correctness/profile gates when debugging contracts; use this
 gate as the cleaner request-level baseline before kernel optimization.
 The performance-clean gate also disables per-update tracker report writes,
-disables host-side read block-table validation, caches the GPU offset table
+disables host-side read block-table validation, caches the GPU read offset table
 across read seams, uses the current-context stream launch ABI, precompiles the
 GPU read kernel when the runtime pool attaches, caches stable write-side KCMM
-pool shape metadata at attach time, caches write-side slot block ensure checks,
-uses the lightweight `kcmm_total_blocks()` ABI for read offset-table minimum
-entry sizing, and relies on final process-exit reports. Correctness gates keep
-per-update reports, block-table validation, and the generic context-binding ABI
-enabled by default for better failure diagnostics.
+pool shape metadata at attach time, uses the lightweight `kcmm_total_blocks()`
+ABI for read offset-table minimum entry sizing, and enables device-slot KV
+writes. Device-slot writes keep vLLM's CUDA `slot_mapping` tensor on device and
+cache the KCMM write offset/valid-block tables by `kcmm_block_state_epoch()`.
+Correctness gates keep per-update reports, block-table validation, row
+verification, and the host-slot writer enabled by default for better failure
+diagnostics.
 
-Latest local performance-clean result on 2026-07-01 after deferring tracker
-reports, caching the read offset table, enabling current-context launch, and
-precompiling the read kernel, caching write-side pool shape metadata, and
-caching write-side slot block ensure checks, and using lightweight read
-total-block lookups:
+Latest local performance-clean result on 2026-07-02 after enabling device-slot
+KV writes:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-total-blocks-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-device-slots-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-total-blocks-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-device-slots-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Model: `facebook/opt-125m`
@@ -790,26 +792,28 @@ total-block lookups:
 - Read block-table validation enabled: `false`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `96.324ms`
+- Read GPU kernel precompile elapsed: `99.217ms`
 - Lightweight read total-block calls: `372`
 - Write pool shape cached/refreshes: `true/1`
 - Cached write pool shape: `block_size=16`, `block_bytes=24576`,
   `step_elements=768`, `num_layers=12`
-- Known write slot blocks: `3`
-- Write slot block ensure cache hits/misses: `381/3`
+- Device-slot write enabled/active: `true/true`
+- Device-slot write calls: `384`
+- Host-slot write calls: `0`
+- Device-slot status checks/errors: `384/0`
+- Device-slot status codes: `{"0": 384}`
+- Device-slot offset table cache hits/rebuilds: `381/3`
+- Device-slot valid table cache hits/rebuilds: `381/3`
 - Offset table cache hits/rebuilds: `369/3`
 - Read tracker report writes: `1`
 - Write tracker report writes: `1`
 - Stream-level write verification synchronizations: `0`
 - KCMM write verification enabled: `false`
-- Request latency seconds: stock `1.825`, KCMM `1.824`, ratio `0.999`
-- Tokens per second: stock `17.534`, KCMM `17.544`, ratio `1.001`
+- Request latency seconds: stock `1.808`, KCMM `1.912`, ratio `1.058`
+- Tokens per second: stock `17.699`, KCMM `16.736`, ratio `0.946`
 - Peak GPU memory delta MiB: stock `5441`, KCMM `5591`, ratio `1.028`
-- Compared with the first performance-clean run, KCMM request latency improved
-  from `3.285s` to `1.824s` after per-update tracker report writes were
-  disabled, the read offset table was cached, and the read kernel was
-  precompiled. In this latest run, KCMM was effectively equal to stock request
-  latency.
+- This run proves the clean device-slot contract, not a request-latency win:
+  KCMM was `5.8%` slower than stock on the single local run.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 For concurrent real-model performance-clean coverage, use the stress wrapper:
@@ -826,15 +830,16 @@ This wrapper keeps the same performance-clean settings as the single-request
 gate but runs two real-model completion cases with `completion_concurrency=2`,
 `max_num_seqs=2`, and `max_num_batched_tokens=192`. It fails if the KCMM read
 report does not observe a decode batch of at least `2`, so it validates that the
-fast path is exercised under concurrent vLLM scheduling.
+fast path is exercised under concurrent vLLM scheduling. It also inherits the
+device-slot KV write requirement from the performance-clean gate.
 
-Latest local performance-clean stress result on 2026-07-01:
+Latest local performance-clean stress result on 2026-07-02:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_stress_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_stress_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-device-slots-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-device-slots-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Coverage cases: `stress_history`, `stress_memory`
@@ -846,12 +851,19 @@ Latest local performance-clean stress result on 2026-07-01:
 - Reference KCMM read bytes: `0`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `111.443ms`
+- Read GPU kernel precompile elapsed: `99.076ms`
 - Offset table cache hits/rebuilds: `273/3`
+- Device-slot write enabled/active: `true/true`
+- Device-slot write calls: `300`
+- Host-slot write calls: `0`
+- Device-slot status checks/errors: `300/0`
+- Device-slot status codes: `{"0": 300}`
+- Device-slot offset table cache hits/rebuilds: `296/4`
+- Device-slot valid table cache hits/rebuilds: `296/4`
 - Write verification enabled: `false`
 - KCMM write verified rows: `0`
-- Request latency seconds: stock `2.116`, KCMM `1.964`, ratio `0.928`
-- Tokens per second: stock `22.684`, KCMM `24.440`, ratio `1.077`
+- Request latency seconds: stock `1.824`, KCMM `1.887`, ratio `1.035`
+- Tokens per second: stock `26.316`, KCMM `25.437`, ratio `0.967`
 - Peak GPU memory delta MiB: stock `5443`, KCMM `5593`, ratio `1.028`
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 

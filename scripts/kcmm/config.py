@@ -126,6 +126,7 @@ class ObserverConfig:
     kv_write_replace_candidate: bool = False
     kv_write_mirror_report_path: str | None = None
     kv_write_verify: bool = True
+    kv_write_device_slots: bool = False
     instrument_kv_reads: bool = False
     kv_read_trace_path: str | None = None
     require_kv_read_seams: bool = False
@@ -190,6 +191,7 @@ class ObserverConfig:
                 os.environ.get("KCMM_KV_WRITE_MIRROR_REPORT_PATH") or None
             ),
             kv_write_verify=_env_bool("KCMM_KV_WRITE_VERIFY", True),
+            kv_write_device_slots=_env_bool("KCMM_KV_WRITE_DEVICE_SLOTS", False),
             instrument_kv_reads=_env_bool("KCMM_INSTRUMENT_KV_READS", False),
             kv_read_trace_path=os.environ.get("KCMM_KV_READ_TRACE_PATH") or None,
             require_kv_read_seams=_env_bool("KCMM_REQUIRE_KV_READ_SEAMS", False),
@@ -305,6 +307,18 @@ class ObserverConfig:
         if self.kv_write_replace_candidate and not self.backed_allocations:
             raise ValueError(
                 "KCMM KV write replacement candidate requires --kcmm-backed-allocations"
+            )
+        if self.kv_write_device_slots and not (
+            self.kv_write_mirror or self.kv_write_replace_candidate
+        ):
+            raise ValueError(
+                "KCMM device-slot KV write requires --kcmm-kv-write-mirror or "
+                "--kcmm-kv-write-replace-candidate"
+            )
+        if self.kv_write_device_slots and self.kv_write_verify:
+            raise ValueError(
+                "KCMM device-slot KV write requires --no-kcmm-kv-write-verify; "
+                "bounded D2H row verification still uses the host slot list"
             )
         if self.kv_read_offset_table and self.pool_mode != "runtime":
             raise ValueError(
@@ -491,6 +505,16 @@ def add_kcmm_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "Enable bounded D2H verification of KCMM KV write rows. "
             "Disable with --no-kcmm-kv-write-verify for performance-clean gates."
+        ),
+    )
+    parser.add_argument(
+        "--kcmm-kv-write-device-slots",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use the device-resident vLLM slot_mapping tensor for KCMM KV "
+            "writes. Requires --no-kcmm-kv-write-verify and is intended for "
+            "performance-clean gates after correctness coverage passes."
         ),
     )
     parser.add_argument(

@@ -184,6 +184,8 @@ class KcmmLibrary:
         self.has_current_context_read_launch = False
         self.has_paged_attn_precompile = False
         self.has_device_slot_write = False
+        self.has_all_block_valid = False
+        self.has_block_state_epoch = False
         self._bind_functions()
 
     def _bind_functions(self) -> None:
@@ -255,6 +257,19 @@ class KcmmLibrary:
             ctypes.POINTER(ctypes.c_uint32),
         ]
         lib.kcmm_get_all_block_offsets_f16.restype = ctypes.c_int
+        try:
+            get_all_block_valid = lib.kcmm_get_all_block_valid
+        except AttributeError:
+            get_all_block_valid = None
+        if get_all_block_valid is not None:
+            get_all_block_valid.argtypes = [
+                pool,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            get_all_block_valid.restype = ctypes.c_int
+            self.has_all_block_valid = True
 
         lib.kcmm_get_block_va_offset.argtypes = [pool, ctypes.c_uint32]
         lib.kcmm_get_block_va_offset.restype = ctypes.c_uint64
@@ -299,6 +314,7 @@ class KcmmLibrary:
             append_device_slots.argtypes = [
                 pool,
                 ctypes.c_uint32,
+                ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_uint32,
@@ -392,6 +408,14 @@ class KcmmLibrary:
         lib.kcmm_get_pool_stats.restype = ctypes.c_int
         lib.kcmm_total_blocks.argtypes = [pool]
         lib.kcmm_total_blocks.restype = ctypes.c_uint32
+        try:
+            block_state_epoch = lib.kcmm_block_state_epoch
+        except AttributeError:
+            block_state_epoch = None
+        if block_state_epoch is not None:
+            block_state_epoch.argtypes = [pool]
+            block_state_epoch.restype = ctypes.c_uint64
+            self.has_block_state_epoch = True
         lib.kcmm_synchronize.argtypes = [pool]
         lib.kcmm_synchronize.restype = ctypes.c_int
 
@@ -541,8 +565,40 @@ class KcmmPool:
         self._check(rc, "kcmm_get_all_block_offsets_f16")
         return [int(out[i]) for i in range(int(count.value))]
 
+    def all_block_valid_flags(self, min_entries: int = 0) -> list[int]:
+        if not self.library.has_all_block_valid:
+            raise KcmmError(
+                "KCMM library does not export kcmm_get_all_block_valid; rebuild "
+                "libbaseline_llm_os.so"
+            )
+        stats = self.stats()
+        max_blocks = max(
+            int(stats.get("total_blocks", 0)),
+            int(stats.get("blocks_in_use", 0)),
+            int(min_entries),
+            1,
+        )
+        out = (ctypes.c_uint8 * max_blocks)()
+        count = ctypes.c_uint32()
+        rc = self.library.lib.kcmm_get_all_block_valid(
+            self.handle,
+            out,
+            max_blocks,
+            ctypes.byref(count),
+        )
+        self._check(rc, "kcmm_get_all_block_valid")
+        return [int(out[i]) for i in range(int(count.value))]
+
     def total_blocks(self) -> int:
         return int(self.library.lib.kcmm_total_blocks(self.handle))
+
+    def block_state_epoch(self) -> int:
+        if not self.library.has_block_state_epoch:
+            raise KcmmError(
+                "KCMM library does not export kcmm_block_state_epoch; rebuild "
+                "libbaseline_llm_os.so"
+            )
+        return int(self.library.lib.kcmm_block_state_epoch(self.handle))
 
     def block_va_offset(self, block_idx: int) -> int:
         return int(
@@ -623,6 +679,7 @@ class KcmmPool:
         layer_idx: int,
         slot_mapping_ptr: int,
         block_offsets_f16_ptr: int,
+        valid_blocks_ptr: int,
         block_offsets_f16_len: int,
         batch: int,
         k_src_ptr: int,
@@ -646,6 +703,7 @@ class KcmmPool:
             layer_idx,
             int(slot_mapping_ptr),
             int(block_offsets_f16_ptr),
+            int(valid_blocks_ptr),
             int(block_offsets_f16_len),
             int(batch),
             int(k_src_ptr),

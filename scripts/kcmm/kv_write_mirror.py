@@ -107,6 +107,7 @@ class KcmmKvWriteMirrorTracker:
         profile_host_sections: bool = False,
         replace_native: bool = False,
         force_non_default_stream: bool = False,
+        use_device_slot_write: bool = False,
     ):
         self._pool: KcmmPool | None = None
         self._report_path = Path(report_path) if report_path else None
@@ -114,6 +115,7 @@ class KcmmKvWriteMirrorTracker:
         self._report_on_update = bool(report_on_update)
         self._host_profiler = HostSectionProfiler(profile_host_sections)
         self._replace_native = bool(replace_native)
+        self._use_device_slot_write = bool(use_device_slot_write)
         self._stream_provider = KcmmStreamProvider(
             force_non_default=force_non_default_stream
         )
@@ -127,6 +129,13 @@ class KcmmKvWriteMirrorTracker:
         self._known_slot_blocks: set[int] = set()
         self._slot_block_ensure_cache_hits = 0
         self._slot_block_ensure_cache_misses = 0
+        self._last_device_slot_offsets: list[int] = []
+        self._last_device_slot_offset_table: Any | None = None
+        self._last_device_slot_valid_flags: list[int] = []
+        self._last_device_slot_valid_table: Any | None = None
+        self._last_device_slot_table_epoch: int | None = None
+        self._recent_device_slot_tables: list[Any] = []
+        self._pending_device_slot_statuses: list[Any] = []
         self._driver: _CudaDriver | None = None
         self._write_calls = 0
         self._native_passthrough_calls = 0
@@ -140,6 +149,17 @@ class KcmmKvWriteMirrorTracker:
         self._external_blocks_allocated = 0
         self._verified_rows = 0
         self._verification_bytes = 0
+        self._host_slot_write_calls = 0
+        self._device_slot_write_calls = 0
+        self._device_slot_status_checks = 0
+        self._device_slot_status_error_count = 0
+        self._device_slot_status_codes: dict[int, int] = {}
+        self._last_device_slot_status: int | None = None
+        self._device_slot_offset_table_cache_hits = 0
+        self._device_slot_offset_table_cache_rebuilds = 0
+        self._device_slot_valid_table_cache_hits = 0
+        self._device_slot_valid_table_cache_rebuilds = 0
+        self._device_slot_padding_slots_unknown_calls = 0
         self._stream_aware_write_calls = 0
         self._forced_non_default_stream_calls = 0
         self._stream_synchronize_for_verification_calls = 0
@@ -304,6 +324,122 @@ class KcmmKvWriteMirrorTracker:
         return tensor.tolist()
 
     @staticmethod
+    def _slot_mapping_numel(slot_mapping: Any) -> int:
+        method = getattr(slot_mapping, "numel", None)
+        if callable(method):
+            return int(method())
+        shape = _shape(slot_mapping)
+        if shape is None:
+            raise KcmmError("KCMM KV write mirror requires tensor-shaped slot_mapping")
+        count = 1
+        for dim in shape:
+            count *= int(dim)
+        return count
+
+    def _should_use_device_slot_write(self) -> bool:
+        return self._use_device_slot_write and self._verify_rows_per_call == 0
+
+    def _device_slot_tables_for_device(
+        self,
+        *,
+        pool: KcmmPool,
+        device: Any,
+        min_entries: int,
+    ) -> tuple[Any, Any]:
+        import torch
+
+        table_device = str(device)
+        epoch = pool.block_state_epoch()
+        cached_offsets = self._last_device_slot_offset_table
+        cached_valid = self._last_device_slot_valid_table
+        if (
+            cached_offsets is not None
+            and cached_valid is not None
+            and self._last_device_slot_offsets
+            and self._last_device_slot_valid_flags
+            and len(self._last_device_slot_offsets) >= min_entries
+            and len(self._last_device_slot_valid_flags) >= min_entries
+            and str(getattr(cached_offsets, "device", None)) == table_device
+            and str(getattr(cached_valid, "device", None)) == table_device
+            and self._last_device_slot_table_epoch == epoch
+            and pool.block_state_epoch() == epoch
+        ):
+            self._device_slot_offset_table_cache_hits += 1
+            self._device_slot_valid_table_cache_hits += 1
+            return cached_offsets, cached_valid
+
+        for _attempt in range(3):
+            epoch = pool.block_state_epoch()
+            offsets_started_ns = self._host_profiler.start()
+            offsets_f16 = pool.all_block_offsets_f16(min_entries=min_entries)
+            offset_table = torch.tensor(
+                offsets_f16,
+                dtype=torch.int64,
+                device=device,
+            )
+            self._host_profiler.stop(
+                "write_device_slot_offset_table_rebuild",
+                offsets_started_ns,
+            )
+
+            valid_started_ns = self._host_profiler.start()
+            valid_flags = pool.all_block_valid_flags(min_entries=min_entries)
+            valid_table = torch.tensor(
+                valid_flags,
+                dtype=torch.uint8,
+                device=device,
+            )
+            self._host_profiler.stop(
+                "write_device_slot_valid_table_rebuild",
+                valid_started_ns,
+            )
+            if pool.block_state_epoch() == epoch:
+                break
+        else:
+            raise KcmmError(
+                "KCMM block-state epoch changed while building device-slot tables"
+            )
+
+        self._last_device_slot_offsets = offsets_f16
+        self._last_device_slot_offset_table = offset_table
+        self._last_device_slot_valid_flags = valid_flags
+        self._last_device_slot_valid_table = valid_table
+        self._last_device_slot_table_epoch = epoch
+        self._recent_device_slot_tables.append(offset_table)
+        self._recent_device_slot_tables.append(valid_table)
+        self._recent_device_slot_tables = self._recent_device_slot_tables[-16:]
+        self._device_slot_offset_table_cache_rebuilds += 1
+        self._device_slot_valid_table_cache_rebuilds += 1
+
+        if int(offset_table.numel()) != int(valid_table.numel()):
+            raise KcmmError(
+                "KCMM device-slot write table length mismatch: "
+                f"offsets={int(offset_table.numel())} "
+                f"valid={int(valid_table.numel())}"
+            )
+        return offset_table, valid_table
+
+    def _collect_pending_device_slot_statuses(self) -> None:
+        if not self._pending_device_slot_statuses:
+            return
+        statuses = self._pending_device_slot_statuses
+        self._pending_device_slot_statuses = []
+        for status in statuses:
+            value = int(status.detach().cpu().item())
+            self._device_slot_status_checks += 1
+            self._last_device_slot_status = value
+            self._device_slot_status_codes[value] = (
+                self._device_slot_status_codes.get(value, 0) + 1
+            )
+            if value != 0:
+                self._device_slot_status_error_count += 1
+                self._error_count += 1
+                self._last_error = (
+                    "KCMM device-slot write reported invalid slot status "
+                    f"{value}"
+                )
+
+    @staticmethod
     def _validate_dtype(key: Any, value: Any) -> None:
         if str(getattr(key, "dtype", "")) != "torch.float16":
             raise KcmmError(f"KCMM KV write mirror requires FP16 key, got {key.dtype}")
@@ -430,10 +566,18 @@ class KcmmKvWriteMirrorTracker:
                 validate_started_ns = self._host_profiler.start()
                 self._validate_dtype(key, value)
                 self._host_profiler.stop("write_validate_dtype", validate_started_ns)
-                slot_started_ns = self._host_profiler.start()
-                slots = self._slot_mapping_to_list(slot_mapping)
-                self._host_profiler.stop("write_slot_mapping_to_host", slot_started_ns)
-                batch = len(slots)
+                use_device_slot_write = self._should_use_device_slot_write()
+                slots: list[int] | None = None
+                if use_device_slot_write:
+                    batch = self._slot_mapping_numel(slot_mapping)
+                else:
+                    slot_started_ns = self._host_profiler.start()
+                    slots = self._slot_mapping_to_list(slot_mapping)
+                    self._host_profiler.stop(
+                        "write_slot_mapping_to_host",
+                        slot_started_ns,
+                    )
+                    batch = len(slots)
                 self._max_batch_seen = max(self._max_batch_seen, batch)
                 if batch == 0:
                     self._skipped_empty_batches += 1
@@ -461,37 +605,115 @@ class KcmmKvWriteMirrorTracker:
                 if _device_index(v_rows, "value") != device_index:
                     raise KcmmError("key and value are on different CUDA devices")
 
-                self._ensure_slot_blocks(pool, slots, block_size=block_size)
+                if use_device_slot_write:
+                    if not bool(getattr(slot_mapping, "is_cuda", False)):
+                        raise KcmmError(
+                            "KCMM device-slot write requires CUDA slot_mapping"
+                        )
+                    slot_device_index = _device_index(slot_mapping, "slot_mapping")
+                    if slot_device_index != device_index:
+                        raise KcmmError(
+                            "slot_mapping and key/value are on different CUDA devices"
+                        )
+                    import torch
+
+                    slot_prepare_started_ns = self._host_profiler.start()
+                    slot_tensor = slot_mapping.detach().reshape(-1)
+                    if str(getattr(slot_tensor, "dtype", "")) != "torch.int64":
+                        slot_tensor = slot_tensor.to(dtype=torch.int64)
+                    if not bool(slot_tensor.is_contiguous()):
+                        slot_tensor = slot_tensor.contiguous()
+                    self._host_profiler.stop(
+                        "write_device_slot_prepare_tensor",
+                        slot_prepare_started_ns,
+                    )
+                    table_started_ns = self._host_profiler.start()
+                    min_entries = max(pool.total_blocks(), 1)
+                    offset_table, valid_table = self._device_slot_tables_for_device(
+                        pool=pool,
+                        device=slot_tensor.device,
+                        min_entries=min_entries,
+                    )
+                    self._host_profiler.stop(
+                        "write_device_slot_table_lookup",
+                        table_started_ns,
+                    )
+                    status_tensor = torch.zeros(
+                        1,
+                        dtype=torch.int32,
+                        device=slot_tensor.device,
+                    )
+                else:
+                    if slots is None:
+                        raise KcmmError("host slot list was not materialized")
+                    self._ensure_slot_blocks(pool, slots, block_size=block_size)
 
                 stream_started_ns = self._host_profiler.start()
                 stream_selection = self._stream_provider.select(device_index)
                 self._host_profiler.stop("write_select_stream", stream_started_ns)
                 record_started_ns = self._host_profiler.start()
-                self._stream_provider.record_tensors(
-                    stream_selection,
-                    k_rows,
-                    v_rows,
-                )
+                if use_device_slot_write:
+                    self._stream_provider.record_tensors(
+                        stream_selection,
+                        k_rows,
+                        v_rows,
+                        slot_tensor,
+                        offset_table,
+                        valid_table,
+                        status_tensor,
+                    )
+                else:
+                    self._stream_provider.record_tensors(
+                        stream_selection,
+                        k_rows,
+                        v_rows,
+                    )
                 self._host_profiler.stop("write_record_tensors", record_started_ns)
                 ptr_started_ns = self._host_profiler.start()
                 k_src_ptr = int(k_rows.data_ptr())
                 v_src_ptr = int(v_rows.data_ptr())
                 self._host_profiler.stop("write_data_ptrs", ptr_started_ns)
                 launch_started_ns = self._host_profiler.start()
-                pool.append_kv_slots(
-                    layer_idx=layer_idx,
-                    slot_mapping=slots,
-                    k_src_ptr=k_src_ptr,
-                    v_src_ptr=v_src_ptr,
-                    stream_ptr=stream_selection.stream_ptr,
-                )
+                if use_device_slot_write:
+                    pool.append_kv_device_slots_on_stream(
+                        layer_idx=layer_idx,
+                        slot_mapping_ptr=int(slot_tensor.data_ptr()),
+                        block_offsets_f16_ptr=int(offset_table.data_ptr()),
+                        valid_blocks_ptr=int(valid_table.data_ptr()),
+                        block_offsets_f16_len=int(offset_table.numel()),
+                        batch=batch,
+                        k_src_ptr=k_src_ptr,
+                        v_src_ptr=v_src_ptr,
+                        status_ptr=int(status_tensor.data_ptr()),
+                        stream_ptr=stream_selection.stream_ptr,
+                    )
+                else:
+                    if slots is None:
+                        raise KcmmError("host slot list was not materialized")
+                    pool.append_kv_slots(
+                        layer_idx=layer_idx,
+                        slot_mapping=slots,
+                        k_src_ptr=k_src_ptr,
+                        v_src_ptr=v_src_ptr,
+                        stream_ptr=stream_selection.stream_ptr,
+                    )
                 self._host_profiler.stop("write_ctypes_launch", launch_started_ns)
                 complete_started_ns = self._host_profiler.start()
                 self._stream_provider.complete(stream_selection)
                 self._host_profiler.stop("write_complete_stream", complete_started_ns)
 
-                padding_slots = sum(1 for slot in slots if slot < 0)
-                mirrored_rows = batch - padding_slots
+                if use_device_slot_write:
+                    padding_slots = 0
+                    mirrored_rows = batch
+                    self._device_slot_padding_slots_unknown_calls += 1
+                    self._device_slot_write_calls += 1
+                    self._pending_device_slot_statuses.append(status_tensor)
+                else:
+                    if slots is None:
+                        raise KcmmError("host slot list was not materialized")
+                    padding_slots = sum(1 for slot in slots if slot < 0)
+                    mirrored_rows = batch - padding_slots
+                    self._host_slot_write_calls += 1
                 self._stream_aware_write_calls += 1
                 if stream_selection.forced_non_default:
                     self._forced_non_default_stream_calls += 1
@@ -508,7 +730,7 @@ class KcmmKvWriteMirrorTracker:
                 verified_rows, verified_bytes = self._verify_rows(
                     pool=pool,
                     layer_idx=layer_idx,
-                    slots=slots,
+                    slots=slots or [],
                     k_rows=k_rows,
                     v_rows=v_rows,
                     block_size=block_size,
@@ -528,7 +750,13 @@ class KcmmKvWriteMirrorTracker:
                         "native_written": native_written,
                         "mirrored_rows": mirrored_rows,
                         "padding_slots": padding_slots,
+                        "padding_slots_known": not use_device_slot_write,
                         "verified_rows": verified_rows,
+                        "write_path": (
+                            "kcmm_append_kv_device_slots_on_stream"
+                            if use_device_slot_write
+                            else "kcmm_append_kv_slots_on_stream"
+                        ),
                         "stream_aware_write": True,
                         "stream_ptr": stream_selection.stream_ptr,
                         "original_stream_ptr": (
@@ -539,7 +767,8 @@ class KcmmKvWriteMirrorTracker:
                             stream_selection.forced_non_default
                         ),
                         "verification_synchronized": verification_synchronized,
-                        "slot_sample": slots[:16],
+                        "slot_sample": [] if slots is None else slots[:16],
+                        "slot_sample_available": slots is not None,
                         "key_shape": _shape(key),
                         "value_shape": _shape(value),
                     }
@@ -553,6 +782,7 @@ class KcmmKvWriteMirrorTracker:
 
     def report(self) -> dict[str, Any]:
         with self._lock:
+            self._collect_pending_device_slot_statuses()
             pool_stats: dict[str, int | float] | None = None
             if self._pool is not None:
                 try:
@@ -574,6 +804,11 @@ class KcmmKvWriteMirrorTracker:
                 ),
                 "write_path": "kcmm_append_kv_slots",
                 "stream_aware_write_path": "kcmm_append_kv_slots_on_stream",
+                "device_slot_write_enabled": self._use_device_slot_write,
+                "device_slot_write_active": self._should_use_device_slot_write(),
+                "device_slot_write_path": (
+                    "kcmm_append_kv_device_slots_on_stream"
+                ),
                 "force_non_default_stream": (
                     self._stream_provider.force_non_default
                 ),
@@ -608,6 +843,35 @@ class KcmmKvWriteMirrorTracker:
                 "external_blocks_allocated": self._external_blocks_allocated,
                 "verified_rows": self._verified_rows,
                 "verification_bytes": self._verification_bytes,
+                "host_slot_write_calls": self._host_slot_write_calls,
+                "device_slot_write_calls": self._device_slot_write_calls,
+                "device_slot_status_checks": self._device_slot_status_checks,
+                "device_slot_status_error_count": (
+                    self._device_slot_status_error_count
+                ),
+                "device_slot_status_codes": {
+                    str(key): value
+                    for key, value in sorted(
+                        self._device_slot_status_codes.items()
+                    )
+                },
+                "last_device_slot_status": self._last_device_slot_status,
+                "device_slot_table_epoch": self._last_device_slot_table_epoch,
+                "device_slot_offset_table_cache_hits": (
+                    self._device_slot_offset_table_cache_hits
+                ),
+                "device_slot_offset_table_cache_rebuilds": (
+                    self._device_slot_offset_table_cache_rebuilds
+                ),
+                "device_slot_valid_table_cache_hits": (
+                    self._device_slot_valid_table_cache_hits
+                ),
+                "device_slot_valid_table_cache_rebuilds": (
+                    self._device_slot_valid_table_cache_rebuilds
+                ),
+                "device_slot_padding_slots_unknown_calls": (
+                    self._device_slot_padding_slots_unknown_calls
+                ),
                 "stream_aware_write_calls": self._stream_aware_write_calls,
                 "forced_non_default_stream_calls": (
                     self._forced_non_default_stream_calls

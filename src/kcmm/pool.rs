@@ -12,7 +12,7 @@ use cudarc::driver::sys::{self, CUdeviceptr};
 use cudarc::driver::{CudaSlice, DevicePtr};
 use half::f16;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -161,6 +161,8 @@ pub struct KcmmPool {
     pub(crate) free_block_indices: Mutex<Vec<u32>>,
     /// Per-sequence metadata.
     pub(crate) sequences: Mutex<Vec<SequenceState>>,
+    /// Monotonic version for block table/device-slot cache invalidation.
+    block_state_epoch: AtomicU64,
 
     /// Optional tiering engine for GPU↔CPU↔NVMe migration.
     /// `None` when tiering is disabled in config.
@@ -263,6 +265,7 @@ impl KcmmPool {
             block_info: Mutex::new(Vec::new()),
             free_block_indices: Mutex::new(Vec::new()),
             sequences: Mutex::new(Vec::new()),
+            block_state_epoch: AtomicU64::new(0),
             tiering,
             sharing: None,
             streams,
@@ -445,6 +448,7 @@ impl KcmmPool {
             tiering.eviction_policy.lock().on_allocate(block_handle);
         }
 
+        self.bump_block_state_epoch();
         idx
     }
 
@@ -535,7 +539,10 @@ impl KcmmPool {
             }
         }
 
-        self.free_block_indices.lock().extend(recycled);
+        if !recycled.is_empty() {
+            self.bump_block_state_epoch();
+            self.free_block_indices.lock().extend(recycled);
+        }
     }
 
     // --- Sequence tracking ---
@@ -727,6 +734,18 @@ impl KcmmPool {
             .collect()
     }
 
+    /// Get validity flags for all allocated block indices.
+    ///
+    /// Returns a flat Vec where index = block_idx and value = 1 when that
+    /// block is currently in use, otherwise 0. This is paired with
+    /// `get_all_block_offsets_f16` for device-side slot validation.
+    pub fn get_all_block_valid_flags(&self) -> Vec<u8> {
+        let info = self.block_info.lock();
+        info.iter()
+            .map(|bi| if bi.in_use { 1u8 } else { 0u8 })
+            .collect()
+    }
+
     /// Get the block location for a block index.
     pub fn get_block_location(&self, block_idx: u32) -> Option<BlockLocation> {
         let info = self.block_info.lock();
@@ -770,6 +789,7 @@ impl KcmmPool {
             return Err(anyhow!("block_idx {} is not in use", block_idx));
         }
         bi.location = location;
+        self.bump_block_state_epoch();
         Ok(())
     }
 
@@ -797,6 +817,7 @@ impl KcmmPool {
         bi.va_offset = va_offset;
         bi.superblock_idx = sb_idx;
         bi.block_index_in_sb = blk_in_sb;
+        self.bump_block_state_epoch();
         Ok(())
     }
 
@@ -1083,6 +1104,15 @@ impl KcmmPool {
     /// Total number of block indices.
     pub fn total_blocks(&self) -> usize {
         self.block_info.lock().len()
+    }
+
+    /// Monotonic version for block in-use state and physical VA mapping changes.
+    pub fn block_state_epoch(&self) -> u64 {
+        self.block_state_epoch.load(Ordering::Acquire)
+    }
+
+    fn bump_block_state_epoch(&self) {
+        self.block_state_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Total blocks allocated across all per-layer pools.

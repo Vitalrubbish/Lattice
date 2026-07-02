@@ -879,6 +879,39 @@ pub unsafe extern "C" fn kcmm_get_all_block_offsets_f16(
     0
 }
 
+/// Get in-use flags for all block indices.
+///
+/// Writes up to `max_blocks` entries into `out_valid`. Each byte is 1 when the
+/// corresponding block index is currently in use, otherwise 0. The actual count
+/// of flags is written to `out_count`.
+///
+/// # Safety
+/// `pool` must be a valid handle. `out_valid` must point to a buffer of at
+/// least `max_blocks * sizeof(u8)` bytes. `out_count` must be non-null.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_get_all_block_valid(
+    pool: *mut kcmm_pool_t,
+    out_valid: *mut u8,
+    max_blocks: u32,
+    out_count: *mut u32,
+) -> i32 {
+    if pool.is_null() || out_valid.is_null() || out_count.is_null() {
+        if !pool.is_null() {
+            pool_from_ptr(pool)
+                .set_error("kcmm_get_all_block_valid: null arguments".to_string());
+        }
+        return -1;
+    }
+
+    let handle = pool_from_ptr(pool);
+    let flags = handle.pool.get_all_block_valid_flags();
+    let n = flags.len().min(max_blocks as usize);
+    let dst = std::slice::from_raw_parts_mut(out_valid, n);
+    dst.copy_from_slice(&flags[..n]);
+    *out_count = n as u32;
+    0
+}
+
 /// Get the location of a block.
 ///
 /// Writes the block location into `out_location`.
@@ -1316,11 +1349,14 @@ unsafe fn kcmm_append_kv_slots_impl(
 /// `slot_mapping_ptr` points to CUDA memory containing `batch` int64 slot ids.
 /// `block_offsets_f16_ptr` points to a CUDA int64/u64 table where
 /// `block_offsets_f16[block_id]` is the KCMM block VA offset in f16 elements.
+/// `valid_blocks_ptr` may be 0; otherwise it points to a CUDA u8 table where
+/// `valid_blocks[block_id] != 0` means the block is currently in use.
 /// Non-negative slots are interpreted as
 /// `slot = block_idx * block_size + offset_in_block`; negative slots are
 /// padding and skipped. `status_ptr` may be 0; when non-zero it must point to a
 /// CUDA int32 status word initialized to 0. The kernel atomically sets it to 1
-/// if it observes a slot whose block id is outside `block_offsets_f16_len`.
+/// if a slot's block id is outside `block_offsets_f16_len`, or 2 if the block
+/// id is in range but the valid-block table marks it inactive.
 ///
 /// This function enqueues a CUDA kernel on `stream_ptr` and returns without
 /// synchronizing. The caller owns stream ordering, tensor lifetimes, and status
@@ -1337,6 +1373,7 @@ pub unsafe extern "C" fn kcmm_append_kv_device_slots_on_stream(
     layer_idx: u32,
     slot_mapping_ptr: u64,
     block_offsets_f16_ptr: u64,
+    valid_blocks_ptr: u64,
     block_offsets_f16_len: u32,
     batch: u32,
     k_src_ptr: u64,
@@ -1445,6 +1482,7 @@ pub unsafe extern "C" fn kcmm_append_kv_device_slots_on_stream(
     let mut va_v_arg = va_v;
     let mut slot_mapping_ptr_arg = slot_mapping_ptr;
     let mut block_offsets_f16_ptr_arg = block_offsets_f16_ptr;
+    let mut valid_blocks_ptr_arg = valid_blocks_ptr;
     let mut k_src_ptr_arg = k_src_ptr;
     let mut v_src_ptr_arg = v_src_ptr;
     let mut status_ptr_arg = status_ptr;
@@ -1457,6 +1495,7 @@ pub unsafe extern "C" fn kcmm_append_kv_device_slots_on_stream(
         &mut va_v_arg as *mut u64 as *mut c_void,
         &mut slot_mapping_ptr_arg as *mut u64 as *mut c_void,
         &mut block_offsets_f16_ptr_arg as *mut u64 as *mut c_void,
+        &mut valid_blocks_ptr_arg as *mut u64 as *mut c_void,
         &mut k_src_ptr_arg as *mut u64 as *mut c_void,
         &mut v_src_ptr_arg as *mut u64 as *mut c_void,
         &mut status_ptr_arg as *mut u64 as *mut c_void,
@@ -2063,6 +2102,21 @@ pub unsafe extern "C" fn kcmm_total_blocks(pool: *mut kcmm_pool_t) -> u32 {
         return 0;
     }
     pool_from_ptr(pool).pool.total_blocks() as u32
+}
+
+/// Get the current block-state epoch for cache invalidation.
+///
+/// The epoch increments when logical block in-use state or physical VA mapping
+/// changes. It is intended for host-side caches of device lookup tables.
+///
+/// # Safety
+/// `pool` must be a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_block_state_epoch(pool: *mut kcmm_pool_t) -> u64 {
+    if pool.is_null() {
+        return 0;
+    }
+    pool_from_ptr(pool).pool.block_state_epoch()
 }
 
 /// Get the number of free physical blocks.

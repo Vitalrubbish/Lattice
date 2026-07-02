@@ -69,6 +69,7 @@ class SmokeConfig:
     kv_write_mirror: bool
     kv_write_replace_candidate: bool
     kv_write_verify: bool
+    kv_write_device_slots: bool
     kv_force_non_default_stream: bool
     runtime_derived_pool: bool
     shadow_allocations: bool
@@ -278,6 +279,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--kv-write-device-slots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the device-resident vLLM slot_mapping tensor for KCMM KV "
+            "writes. Requires --no-kv-write-verify."
+        ),
+    )
+    parser.add_argument(
         "--kv-force-non-default-stream",
         action="store_true",
         help=(
@@ -436,6 +446,7 @@ def parse_config(argv: list[str] | None = None) -> SmokeConfig:
         kv_write_mirror=args.kv_write_mirror,
         kv_write_replace_candidate=args.kv_write_replace_candidate,
         kv_write_verify=args.kv_write_verify,
+        kv_write_device_slots=args.kv_write_device_slots,
         kv_force_non_default_stream=args.kv_force_non_default_stream,
         runtime_derived_pool=(
             args.runtime_derived_pool
@@ -722,6 +733,8 @@ def vllm_command(config: SmokeConfig) -> list[str]:
             )
             if not config.kv_write_verify:
                 command.append("--no-kcmm-kv-write-verify")
+            if config.kv_write_device_slots:
+                command.append("--kcmm-kv-write-device-slots")
         if config.kv_force_non_default_stream:
             command.append("--kcmm-kv-force-non-default-stream")
         if (
@@ -990,6 +1003,7 @@ def read_kv_write_mirror_report(
     path: Path,
     *,
     expect_verification: bool = True,
+    expect_device_slots: bool = False,
 ) -> dict[str, Any]:
     if not path.exists():
         raise SmokeFailure(f"KCMM KV write mirror report was not written: {path}")
@@ -1020,6 +1034,28 @@ def read_kv_write_mirror_report(
             "KCMM KV write report used no stream-aware writes: "
             + json.dumps(report, sort_keys=True)
         )
+    if report.get("device_slot_status_error_count", 0) != 0:
+        raise SmokeFailure(
+            "KCMM KV write device-slot report recorded status errors: "
+            + json.dumps(report, sort_keys=True)
+        )
+    if expect_device_slots:
+        if report.get("device_slot_write_enabled") is not True:
+            raise SmokeFailure(
+                "KCMM KV write report did not enable device-slot writes: "
+                + json.dumps(report, sort_keys=True)
+            )
+        if report.get("device_slot_write_calls", 0) <= 0:
+            raise SmokeFailure(
+                "KCMM KV write report used no device-slot writes: "
+                + json.dumps(report, sort_keys=True)
+            )
+        if report.get("host_slot_write_calls", 0) != 0:
+            raise SmokeFailure(
+                "KCMM KV write report used host-slot writes despite "
+                "device-slot mode: "
+                + json.dumps(report, sort_keys=True)
+            )
     verification_enabled = bool(report.get("write_verification_enabled", True))
     if expect_verification and not verification_enabled:
         raise SmokeFailure(
@@ -1458,6 +1494,17 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         )
     if config.kv_write_replace_candidate and not config.backed_allocations:
         raise SmokeFailure("--kv-write-replace-candidate requires --backed-allocations")
+    if config.kv_write_device_slots and not (
+        config.kv_write_mirror or config.kv_write_replace_candidate
+    ):
+        raise SmokeFailure(
+            "--kv-write-device-slots requires --kv-write-mirror or "
+            "--kv-write-replace-candidate"
+        )
+    if config.kv_write_device_slots and config.kv_write_verify:
+        raise SmokeFailure(
+            "--kv-write-device-slots requires --no-kv-write-verify"
+        )
     if config.kv_read_offset_table and not config.backed_allocations:
         raise SmokeFailure("--kv-read-offset-table requires --backed-allocations")
     if config.kv_read_replace_candidate and config.kv_read_offset_table:
@@ -1558,6 +1605,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
             "kv_write_mirror": config.kv_write_mirror,
             "kv_write_replace_candidate": config.kv_write_replace_candidate,
             "kv_write_verify": config.kv_write_verify,
+            "kv_write_device_slots": config.kv_write_device_slots,
             "kv_force_non_default_stream": config.kv_force_non_default_stream,
             "shadow_allocations": config.shadow_allocations,
             "backed_allocations": config.backed_allocations,
@@ -1585,6 +1633,7 @@ def run_smoke(config: SmokeConfig) -> dict[str, Any]:
         report = read_kv_write_mirror_report(
             config.kv_write_mirror_report_path,
             expect_verification=config.kv_write_verify,
+            expect_device_slots=config.kv_write_device_slots,
         )
         if config.kv_force_non_default_stream:
             require_non_default_stream_report(report, name="KCMM KV write")

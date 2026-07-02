@@ -67,6 +67,7 @@ class GateConfig:
     kv_read_precompile_gpu_kernel: bool
     instrument_kv_reads: bool
     kv_write_verify: bool
+    kv_write_device_slots: bool
     tracker_report_on_update: bool
     tracker_host_profile: bool
     build_kcmm: bool
@@ -137,6 +138,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Enable bounded D2H verification of KCMM KV writes in the KCMM "
             "mode. Disable for performance-clean gates."
+        ),
+    )
+    parser.add_argument(
+        "--kv-write-device-slots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use device-resident vLLM slot_mapping tensors for KCMM KV writes "
+            "in the KCMM mode. Requires --no-kv-write-verify."
         ),
     )
     parser.add_argument(
@@ -337,6 +347,7 @@ def parse_config(argv: list[str] | None = None) -> GateConfig:
         kv_read_precompile_gpu_kernel=args.kv_read_precompile_gpu_kernel,
         instrument_kv_reads=args.instrument_kv_reads,
         kv_write_verify=args.kv_write_verify,
+        kv_write_device_slots=args.kv_write_device_slots,
         tracker_report_on_update=args.tracker_report_on_update,
         tracker_host_profile=args.tracker_host_profile,
         build_kcmm=args.build_kcmm,
@@ -404,6 +415,7 @@ def smoke_config_for_mode(
         kv_write_mirror=False,
         kv_write_replace_candidate=is_gpu_read,
         kv_write_verify=config.kv_write_verify,
+        kv_write_device_slots=(is_gpu_read and config.kv_write_device_slots),
         kv_force_non_default_stream=(
             is_gpu_read and config.kv_force_non_default_stream
         ),
@@ -574,6 +586,31 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "write_report_write_count": write_report.get("report_write_count"),
         "write_host_profile": write_report.get("host_profile"),
         "kcmm_write_verified_rows": write_report.get("verified_rows"),
+        "write_device_slot_enabled": write_report.get("device_slot_write_enabled"),
+        "write_device_slot_active": write_report.get("device_slot_write_active"),
+        "write_device_slot_calls": write_report.get("device_slot_write_calls"),
+        "write_host_slot_calls": write_report.get("host_slot_write_calls"),
+        "write_device_slot_status_checks": write_report.get(
+            "device_slot_status_checks"
+        ),
+        "write_device_slot_status_error_count": write_report.get(
+            "device_slot_status_error_count"
+        ),
+        "write_device_slot_status_codes": write_report.get(
+            "device_slot_status_codes"
+        ),
+        "write_device_slot_offset_table_cache_hits": write_report.get(
+            "device_slot_offset_table_cache_hits"
+        ),
+        "write_device_slot_offset_table_cache_rebuilds": write_report.get(
+            "device_slot_offset_table_cache_rebuilds"
+        ),
+        "write_device_slot_valid_table_cache_hits": write_report.get(
+            "device_slot_valid_table_cache_hits"
+        ),
+        "write_device_slot_valid_table_cache_rebuilds": write_report.get(
+            "device_slot_valid_table_cache_rebuilds"
+        ),
         "stream_aware_write_calls": write_report.get("stream_aware_write_calls"),
         "write_pool_shape_cached": write_report.get("pool_shape_cached"),
         "write_pool_shape_refreshes": write_report.get("pool_shape_refreshes"),
@@ -629,6 +666,7 @@ def summarize_success(mode_name: str, result: dict[str, Any]) -> dict[str, Any]:
         "generated_model": result.get("generated_model"),
         "instrument_kv_reads": result.get("instrument_kv_reads"),
         "kv_write_verify": result.get("kv_write_verify"),
+        "kv_write_device_slots": result.get("kv_write_device_slots"),
         "kv_read_fast_current_context_launch": result.get(
             "kv_read_fast_current_context_launch"
         ),
@@ -989,6 +1027,7 @@ def run_gate(config: GateConfig) -> dict[str, Any]:
         "kv_read_validate_block_tables": config.kv_read_validate_block_tables,
         "instrument_kv_reads": config.instrument_kv_reads,
         "kv_write_verify": config.kv_write_verify,
+        "kv_write_device_slots": config.kv_write_device_slots,
         "kv_read_fast_current_context_launch": (
             config.kv_read_fast_current_context_launch
         ),

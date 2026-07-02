@@ -10,6 +10,7 @@ extern "C" __global__ void kcmm_vllm_kv_write_slots_f16(
     unsigned long long va_v_ptr,
     unsigned long long slot_mapping_ptr,
     unsigned long long block_offsets_f16_ptr,
+    unsigned long long valid_blocks_ptr,
     unsigned long long k_src_ptr,
     unsigned long long v_src_ptr,
     unsigned long long status_ptr,
@@ -25,6 +26,8 @@ extern "C" __global__ void kcmm_vllm_kv_write_slots_f16(
         reinterpret_cast<const long long *>(slot_mapping_ptr);
     const unsigned long long *block_offsets_f16 =
         reinterpret_cast<const unsigned long long *>(block_offsets_f16_ptr);
+    const unsigned char *valid_blocks =
+        reinterpret_cast<const unsigned char *>(valid_blocks_ptr);
     const __half *k_src = reinterpret_cast<const __half *>(k_src_ptr);
     const __half *v_src = reinterpret_cast<const __half *>(v_src_ptr);
     __half *va_k = reinterpret_cast<__half *>(va_k_ptr);
@@ -40,6 +43,12 @@ extern "C" __global__ void kcmm_vllm_kv_write_slots_f16(
     if (block_id < 0 || block_id >= block_offsets_f16_len) {
         if (status != 0) {
             atomicCAS(status, 0, 1);
+        }
+        return;
+    }
+    if (valid_blocks != 0 && valid_blocks[block_id] == 0) {
+        if (status != 0) {
+            atomicCAS(status, 0, 2);
         }
         return;
     }
