@@ -365,15 +365,17 @@ block IDs after first successful `block_location` validation or lazy worker-loca
 allocation, avoiding repeated block-location checks for the same physical
 blocks. When host-side block-table validation is disabled, the read planner uses
 the lightweight `kcmm_total_blocks()` ABI to size the offset table instead of
-building a full pool stats snapshot on every read seam. The gate also enables
-device-slot KV writes so vLLM's CUDA `slot_mapping` tensor stays on device; it
-requires device write calls, zero host-slot write calls, status checks, and zero
-device status errors. The gate still requires token-exact stock-vs-KCMM output,
-GPU read-kernel calls, zero CPU-staged reference read bytes, successful
-read-kernel precompile, successful device-slot write-kernel precompile, and zero
-write verification rows/synchronizations. It is cleaner than the correctness
-gates, but it still includes vLLM server, Python monkey-patch, and scheduling
-overhead.
+building a full pool stats snapshot on every read seam. In the same
+performance-clean mode, the planner uses compact read-plan metadata so it does
+not collect stride/contiguity/sample diagnostics on every request-time read
+seam. The gate also enables device-slot KV writes so vLLM's CUDA `slot_mapping`
+tensor stays on device; it requires device write calls, zero host-slot write
+calls, status checks, and zero device status errors. The gate still requires
+token-exact stock-vs-KCMM output, GPU read-kernel calls, zero CPU-staged
+reference read bytes, successful read-kernel precompile, successful device-slot
+write-kernel precompile, compact read-plan metadata, and zero write verification
+rows/synchronizations. It is cleaner than the correctness gates, but it still
+includes vLLM server, Python monkey-patch, and scheduling overhead.
 
 `python -m scripts.kcmm.vllm_gpu_read_host_profile_gate` wraps that
 performance-clean gate with section-level host wall-clock timing enabled in the

@@ -110,6 +110,13 @@ def _shape(value: Any) -> list[int] | None:
         return None
 
 
+def _first_dim(value: Any) -> int | None:
+    try:
+        return int(value.shape[0])
+    except Exception:
+        return None
+
+
 def _stride(value: Any) -> list[int] | None:
     method = getattr(value, "stride", None)
     if not callable(method):
@@ -210,6 +217,9 @@ class KcmmKvReadOffsetTableTracker:
         self._gpu_kernel_precompile_calls = 0
         self._gpu_kernel_precompile_succeeded = False
         self._gpu_kernel_precompile_elapsed_ms: float | None = None
+        self._compact_plan_metadata = self._should_use_compact_plan_metadata()
+        self._compact_plan_metadata_calls = 0
+        self._detailed_plan_metadata_calls = 0
 
     @property
     def replace_native(self) -> bool:
@@ -261,6 +271,15 @@ class KcmmKvReadOffsetTableTracker:
         self._error_count += 1
         self._last_error = f"{type(exc).__name__}: {exc}"
         self.write_report()
+
+    def _should_use_compact_plan_metadata(self) -> bool:
+        return (
+            self._replace_native
+            and self._replacement_backend == "gpu_kernel"
+            and not self._validate_block_tables
+            and not self._report_on_update
+            and not self._profile_gpu_kernel
+        )
 
     def _write_report_on_update(self) -> None:
         if self._report_on_update:
@@ -349,14 +368,22 @@ class KcmmKvReadOffsetTableTracker:
         layer_started_ns = self._host_profiler.start()
         layer_idx = self._layer_for_cache(key_cache, value_cache)
         self._host_profiler.stop("read_layer_for_cache", layer_started_ns)
-        shape_started_ns = self._host_profiler.start()
-        query_shape = _shape(query)
-        out_shape = _shape(out)
-        block_tables_shape = _shape(block_tables)
-        seq_lens_shape = _shape(seq_lens)
-        batch = query_shape[0] if query_shape else None
+        compact_metadata = self._compact_plan_metadata
+        if compact_metadata:
+            query_shape = None
+            out_shape = None
+            block_tables_shape = None
+            seq_lens_shape = None
+            batch = _first_dim(query)
+        else:
+            shape_started_ns = self._host_profiler.start()
+            query_shape = _shape(query)
+            out_shape = _shape(out)
+            block_tables_shape = _shape(block_tables)
+            seq_lens_shape = _shape(seq_lens)
+            batch = query_shape[0] if query_shape else None
+            self._host_profiler.stop("read_tensor_shape_capture", shape_started_ns)
         device = getattr(block_tables, "device", "cpu")
-        self._host_profiler.stop("read_tensor_shape_capture", shape_started_ns)
         if self._validate_block_tables:
             block_ids_started_ns = self._host_profiler.start()
             block_ids = _tensor_block_ids(block_tables)
@@ -407,22 +434,50 @@ class KcmmKvReadOffsetTableTracker:
             )
 
         sample_ids = unique_ids[:16]
+        if compact_metadata:
+            query_stride = None
+            out_stride = None
+            block_tables_stride = None
+            seq_lens_stride = None
+            query_is_contiguous = None
+            out_is_contiguous = None
+            block_tables_is_contiguous = None
+            seq_lens_is_contiguous = None
+            block_locations_sample = {}
+            offset_f16_sample = {}
+            self._compact_plan_metadata_calls += 1
+        else:
+            query_stride = _stride(query)
+            out_stride = _stride(out)
+            block_tables_stride = _stride(block_tables)
+            seq_lens_stride = _stride(seq_lens)
+            query_is_contiguous = _is_contiguous(query)
+            out_is_contiguous = _is_contiguous(out)
+            block_tables_is_contiguous = _is_contiguous(block_tables)
+            seq_lens_is_contiguous = _is_contiguous(seq_lens)
+            block_locations_sample = {
+                str(block_id): locations[block_id] for block_id in sample_ids
+            }
+            offset_f16_sample = {
+                str(block_id): int(offsets_f16[block_id]) for block_id in sample_ids
+            }
+            self._detailed_plan_metadata_calls += 1
         call = ReadPlanCall(
             function=function_name,
             layer_idx=layer_idx,
             batch=batch,
             query_shape=query_shape,
-            query_stride=_stride(query),
-            query_is_contiguous=_is_contiguous(query),
+            query_stride=query_stride,
+            query_is_contiguous=query_is_contiguous,
             out_shape=out_shape,
-            out_stride=_stride(out),
-            out_is_contiguous=_is_contiguous(out),
+            out_stride=out_stride,
+            out_is_contiguous=out_is_contiguous,
             block_tables_shape=block_tables_shape,
-            block_tables_stride=_stride(block_tables),
-            block_tables_is_contiguous=_is_contiguous(block_tables),
+            block_tables_stride=block_tables_stride,
+            block_tables_is_contiguous=block_tables_is_contiguous,
             seq_lens_shape=seq_lens_shape,
-            seq_lens_stride=_stride(seq_lens),
-            seq_lens_is_contiguous=_is_contiguous(seq_lens),
+            seq_lens_stride=seq_lens_stride,
+            seq_lens_is_contiguous=seq_lens_is_contiguous,
             block_table_entries=len(block_ids),
             block_ids_sample=sample_ids,
             unique_block_ids=len(unique_ids),
@@ -432,12 +487,8 @@ class KcmmKvReadOffsetTableTracker:
             offset_table_device=str(offset_table.device),
             offset_table_data_ptr=int(offset_table.data_ptr()),
             missing_block_ids=[],
-            block_locations_sample={
-                str(block_id): locations[block_id] for block_id in sample_ids
-            },
-            offset_f16_sample={
-                str(block_id): int(offsets_f16[block_id]) for block_id in sample_ids
-            },
+            block_locations_sample=block_locations_sample,
+            offset_f16_sample=offset_f16_sample,
             block_table_validation_enabled=self._validate_block_tables,
             offset_table_reused=offset_table_reused,
             native_replaced=self._replace_native,
@@ -913,6 +964,9 @@ class KcmmKvReadOffsetTableTracker:
                 "report_on_update": self._report_on_update,
                 "report_write_count": self._report_write_count,
                 "block_table_validation_enabled": self._validate_block_tables,
+                "compact_plan_metadata": self._compact_plan_metadata,
+                "compact_plan_metadata_calls": self._compact_plan_metadata_calls,
+                "detailed_plan_metadata_calls": self._detailed_plan_metadata_calls,
                 "fast_current_context_launch": self._fast_current_context_launch,
                 "gpu_kernel_precompile_requested": (
                     self._gpu_kernel_precompile_requested

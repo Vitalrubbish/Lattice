@@ -559,6 +559,13 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "read_block_table_validation_enabled": read_report.get(
             "block_table_validation_enabled"
         ),
+        "read_compact_plan_metadata": read_report.get("compact_plan_metadata"),
+        "read_compact_plan_metadata_calls": read_report.get(
+            "compact_plan_metadata_calls"
+        ),
+        "read_detailed_plan_metadata_calls": read_report.get(
+            "detailed_plan_metadata_calls"
+        ),
         "read_fast_current_context_launch": read_report.get(
             "fast_current_context_launch"
         ),

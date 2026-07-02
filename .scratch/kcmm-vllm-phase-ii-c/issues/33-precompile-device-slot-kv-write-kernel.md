@@ -98,8 +98,8 @@ make the write kernel follow the read kernel's attach-time precompile model.
 
 ## Follow-up
 
-With read and write kernel compile/load moved to attach time, the remaining
-request-path host sections are much smaller. The next useful target is reducing
-steady-state Python/ctypes and tracker bookkeeping: read plan construction
-around `14ms` total, write device-slot table lookup around `5ms`, stream
-selection around `4ms`, and write launch around `4ms`.
+Completed by Issue 34: the performance-clean read planner now uses compact
+metadata, reducing `read_replace_build_plan` from `14.894ms` total to
+`11.654ms` total in the local host-profile gate. Remaining follow-up should
+focus on read GPU-kernel launch/stream selection and write device-slot table
+lookup, stream selection, and ctypes launch.

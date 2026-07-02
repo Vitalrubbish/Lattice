@@ -294,6 +294,13 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         "read_block_table_validation_enabled": contract.get(
             "read_block_table_validation_enabled"
         ),
+        "read_compact_plan_metadata": contract.get("read_compact_plan_metadata"),
+        "read_compact_plan_metadata_calls": contract.get(
+            "read_compact_plan_metadata_calls"
+        ),
+        "read_detailed_plan_metadata_calls": contract.get(
+            "read_detailed_plan_metadata_calls"
+        ),
         "offset_table_builds": contract.get("offset_table_builds"),
         "offset_table_cache_hits": contract.get("offset_table_cache_hits"),
         "offset_table_cache_rebuilds": contract.get(
@@ -307,6 +314,7 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         "write_stream_synchronize_for_verification_calls": contract.get(
             "write_stream_synchronize_for_verification_calls"
         ),
+        "replacement_calls": contract.get("replacement_calls"),
         "gpu_kernel_calls": contract.get("gpu_kernel_calls"),
         "stream_aware_kernel_calls": contract.get("stream_aware_kernel_calls"),
         "reference_read_bytes": contract.get("reference_read_bytes"),
@@ -457,6 +465,43 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "mode": "kcmm_gpu_read",
                 "reason": "read_block_table_validation_not_disabled",
                 "value": contract.get("read_block_table_validation_enabled"),
+            }
+        )
+    if contract.get("read_compact_plan_metadata") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_compact_plan_metadata_not_enabled",
+                "value": contract.get("read_compact_plan_metadata"),
+            }
+        )
+    compact_plan_calls = contract.get("read_compact_plan_metadata_calls")
+    replacement_calls = contract.get("replacement_calls")
+    if not isinstance(compact_plan_calls, int) or compact_plan_calls <= 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_compact_plan_metadata_calls_missing",
+                "value": compact_plan_calls,
+            }
+        )
+    elif isinstance(replacement_calls, int) and compact_plan_calls != replacement_calls:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_compact_plan_metadata_call_count_mismatch",
+                "value": compact_plan_calls,
+                "expected": replacement_calls,
+            }
+        )
+    detailed_plan_calls = contract.get("read_detailed_plan_metadata_calls")
+    if detailed_plan_calls != 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "read_detailed_plan_metadata_used_in_perf_clean",
+                "value": detailed_plan_calls,
+                "expected": 0,
             }
         )
     if not isinstance(contract.get("offset_table_cache_hits"), int):
