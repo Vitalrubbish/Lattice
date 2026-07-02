@@ -644,6 +644,18 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "write_device_slot_valid_table_cache_rebuilds": write_report.get(
             "device_slot_valid_table_cache_rebuilds"
         ),
+        "write_device_slot_prepare_direct_calls": write_report.get(
+            "device_slot_prepare_direct_calls"
+        ),
+        "write_device_slot_prepare_reshape_calls": write_report.get(
+            "device_slot_prepare_reshape_calls"
+        ),
+        "write_device_slot_prepare_dtype_conversions": write_report.get(
+            "device_slot_prepare_dtype_conversions"
+        ),
+        "write_device_slot_prepare_contiguous_copies": write_report.get(
+            "device_slot_prepare_contiguous_copies"
+        ),
         "stream_aware_write_calls": write_report.get("stream_aware_write_calls"),
         "write_pool_shape_cached": write_report.get("pool_shape_cached"),
         "write_pool_shape_refreshes": write_report.get("pool_shape_refreshes"),

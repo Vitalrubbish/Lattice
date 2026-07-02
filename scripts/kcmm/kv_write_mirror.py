@@ -165,6 +165,10 @@ class KcmmKvWriteMirrorTracker:
         self._device_slot_valid_table_cache_hits = 0
         self._device_slot_valid_table_cache_rebuilds = 0
         self._device_slot_padding_slots_unknown_calls = 0
+        self._device_slot_prepare_direct_calls = 0
+        self._device_slot_prepare_reshape_calls = 0
+        self._device_slot_prepare_dtype_conversions = 0
+        self._device_slot_prepare_contiguous_copies = 0
         self._device_slot_kernel_precompile_requested = self._should_use_device_slot_write()
         self._device_slot_kernel_precompile_calls = 0
         self._device_slot_kernel_precompile_succeeded = False
@@ -367,6 +371,40 @@ class KcmmKvWriteMirrorTracker:
 
     def _should_use_device_slot_write(self) -> bool:
         return self._use_device_slot_write and self._verify_rows_per_call == 0
+
+    def _prepare_device_slot_tensor(self, slot_mapping: Any) -> Any:
+        import torch
+
+        dtype = getattr(slot_mapping, "dtype", None)
+        dim_method = getattr(slot_mapping, "dim", None)
+        if callable(dim_method):
+            ndim = int(dim_method())
+        else:
+            shape = _shape(slot_mapping)
+            ndim = len(shape) if shape is not None else None
+        contiguous_method = getattr(slot_mapping, "is_contiguous", None)
+        is_contiguous = (
+            bool(contiguous_method()) if callable(contiguous_method) else False
+        )
+        if (
+            bool(getattr(slot_mapping, "is_cuda", False))
+            and dtype == torch.int64
+            and ndim == 1
+            and is_contiguous
+        ):
+            self._device_slot_prepare_direct_calls += 1
+            return slot_mapping
+
+        self._device_slot_prepare_reshape_calls += 1
+        slot_tensor = slot_mapping.detach().reshape(-1)
+        if getattr(slot_tensor, "dtype", None) != torch.int64:
+            slot_tensor = slot_tensor.to(dtype=torch.int64)
+            self._device_slot_prepare_dtype_conversions += 1
+        contiguous_method = getattr(slot_tensor, "is_contiguous", None)
+        if callable(contiguous_method) and not bool(contiguous_method()):
+            slot_tensor = slot_tensor.contiguous()
+            self._device_slot_prepare_contiguous_copies += 1
+        return slot_tensor
 
     def _device_slot_block_state_epoch(self, pool: KcmmPool) -> int:
         self._device_slot_block_state_epoch_queries += 1
@@ -655,11 +693,7 @@ class KcmmKvWriteMirrorTracker:
                     import torch
 
                     slot_prepare_started_ns = self._host_profiler.start()
-                    slot_tensor = slot_mapping.detach().reshape(-1)
-                    if str(getattr(slot_tensor, "dtype", "")) != "torch.int64":
-                        slot_tensor = slot_tensor.to(dtype=torch.int64)
-                    if not bool(slot_tensor.is_contiguous()):
-                        slot_tensor = slot_tensor.contiguous()
+                    slot_tensor = self._prepare_device_slot_tensor(slot_mapping)
                     self._host_profiler.stop(
                         "write_device_slot_prepare_tensor",
                         slot_prepare_started_ns,
@@ -930,6 +964,18 @@ class KcmmKvWriteMirrorTracker:
                 ),
                 "device_slot_padding_slots_unknown_calls": (
                     self._device_slot_padding_slots_unknown_calls
+                ),
+                "device_slot_prepare_direct_calls": (
+                    self._device_slot_prepare_direct_calls
+                ),
+                "device_slot_prepare_reshape_calls": (
+                    self._device_slot_prepare_reshape_calls
+                ),
+                "device_slot_prepare_dtype_conversions": (
+                    self._device_slot_prepare_dtype_conversions
+                ),
+                "device_slot_prepare_contiguous_copies": (
+                    self._device_slot_prepare_contiguous_copies
                 ),
                 "stream_aware_write_calls": self._stream_aware_write_calls,
                 "forced_non_default_stream_calls": (

@@ -288,6 +288,18 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         "write_device_slot_valid_table_cache_rebuilds": contract.get(
             "write_device_slot_valid_table_cache_rebuilds"
         ),
+        "write_device_slot_prepare_direct_calls": contract.get(
+            "write_device_slot_prepare_direct_calls"
+        ),
+        "write_device_slot_prepare_reshape_calls": contract.get(
+            "write_device_slot_prepare_reshape_calls"
+        ),
+        "write_device_slot_prepare_dtype_conversions": contract.get(
+            "write_device_slot_prepare_dtype_conversions"
+        ),
+        "write_device_slot_prepare_contiguous_copies": contract.get(
+            "write_device_slot_prepare_contiguous_copies"
+        ),
         "read_fast_current_context_launch": contract.get(
             "read_fast_current_context_launch"
         ),
@@ -773,6 +785,48 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "value": table_device_index,
             }
         )
+    if isinstance(device_calls, int) and device_calls > 0:
+        direct_calls = contract.get("write_device_slot_prepare_direct_calls")
+        reshape_calls = contract.get("write_device_slot_prepare_reshape_calls")
+        dtype_conversions = contract.get(
+            "write_device_slot_prepare_dtype_conversions"
+        )
+        contiguous_copies = contract.get(
+            "write_device_slot_prepare_contiguous_copies"
+        )
+        if direct_calls != device_calls:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_device_slot_prepare_direct_fast_path_incomplete",
+                    "value": direct_calls,
+                    "device_slot_write_calls": device_calls,
+                }
+            )
+        if reshape_calls != 0:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_device_slot_prepare_reshape_used",
+                    "value": reshape_calls,
+                }
+            )
+        if dtype_conversions != 0:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_device_slot_prepare_dtype_conversion_used",
+                    "value": dtype_conversions,
+                }
+            )
+        if contiguous_copies != 0:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_device_slot_prepare_contiguous_copy_used",
+                    "value": contiguous_copies,
+                }
+            )
     status_checks = contract.get("write_device_slot_status_checks")
     if not isinstance(status_checks, int) or status_checks <= 0:
         failures.append(

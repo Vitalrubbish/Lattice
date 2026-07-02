@@ -374,19 +374,23 @@ calls, status checks, and zero device status errors. Device-slot table sizing
 uses `kcmm_total_blocks()` only when the cached offset/valid tables are rebuilt;
 cache hits rely on one `kcmm_block_state_epoch()` query for invalidation. The
 device-slot table cache records the already validated CUDA device index, so
-cache-hit checks do not convert cached tensor devices to strings. The stream
-provider still queries PyTorch's current CUDA stream on every read/write seam,
-but caches each device's default stream pointer after the first lookup. The gate
-requires read/write stream selection counts to match the corresponding KCMM
-launches, current-stream query counts to match stream selections, and default
-stream pointer cache reuse. The gate still requires token-exact stock-vs-KCMM
-output, GPU read-kernel calls, zero CPU-staged reference read bytes, successful
-read-kernel precompile, successful device-slot write-kernel precompile, compact
-read-plan metadata, non-per-write device-slot table sizing refreshes,
-device-slot table device-index reporting, default stream pointer cache reuse,
-and zero write verification rows/synchronizations. It is cleaner than the
-correctness gates, but it still includes vLLM server, Python monkey-patch, and
-scheduling overhead.
+cache-hit checks do not convert cached tensor devices to strings. The write
+tracker also directly reuses canonical vLLM `slot_mapping` tensors when they are
+CUDA, 1-D, contiguous, and `torch.int64`, while preserving reshape/conversion
+fallbacks for non-canonical inputs. The stream provider still queries PyTorch's
+current CUDA stream on every read/write seam, but caches each device's default
+stream pointer after the first lookup. The gate requires read/write stream
+selection counts to match the corresponding KCMM launches, current-stream query
+counts to match stream selections, and default stream pointer cache reuse. The
+gate still requires token-exact stock-vs-KCMM output, GPU read-kernel calls,
+zero CPU-staged reference read bytes, successful read-kernel precompile,
+successful device-slot write-kernel precompile, compact read-plan metadata,
+non-per-write device-slot table sizing refreshes, device-slot table
+device-index reporting, direct canonical `slot_mapping` prepare fast-path
+coverage with zero reshape/conversion/copy fallbacks, default stream pointer
+cache reuse, and zero write verification rows/synchronizations. It is cleaner
+than the correctness gates, but it still includes vLLM server, Python
+monkey-patch, and scheduling overhead.
 
 `python -m scripts.kcmm.vllm_gpu_read_host_profile_gate` wraps that
 performance-clean gate with section-level host wall-clock timing enabled in the
