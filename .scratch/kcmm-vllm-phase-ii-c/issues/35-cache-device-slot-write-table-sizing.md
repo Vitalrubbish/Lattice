@@ -76,7 +76,7 @@ needed when the tables are rebuilt.
 
 ## Follow-up
 
-The remaining write-side steady-state host sections are stream selection around
-`4.7ms` total and ctypes launch around `4.0ms` total. The next useful issue
-should look for a safe way to reduce `KcmmStreamProvider.select(...)` overhead or
-to batch/fuse more launch-side work.
+Issue 36 reduced stream-selection overhead by caching the per-device default
+stream pointer while still querying the current stream on every seam. Remaining
+write-side steady-state host sections are ctypes launch and broader launch-side
+batching/fusion opportunities.

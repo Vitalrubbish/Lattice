@@ -319,6 +319,26 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         "read_report_write_count": contract.get("read_report_write_count"),
         "write_report_on_update": contract.get("write_report_on_update"),
         "write_report_write_count": contract.get("write_report_write_count"),
+        "read_stream_select_calls": contract.get("read_stream_select_calls"),
+        "read_stream_current_stream_queries": contract.get(
+            "read_stream_current_stream_queries"
+        ),
+        "read_stream_default_ptr_cache_hits": contract.get(
+            "read_stream_default_ptr_cache_hits"
+        ),
+        "read_stream_default_ptr_cache_misses": contract.get(
+            "read_stream_default_ptr_cache_misses"
+        ),
+        "write_stream_select_calls": contract.get("write_stream_select_calls"),
+        "write_stream_current_stream_queries": contract.get(
+            "write_stream_current_stream_queries"
+        ),
+        "write_stream_default_ptr_cache_hits": contract.get(
+            "write_stream_default_ptr_cache_hits"
+        ),
+        "write_stream_default_ptr_cache_misses": contract.get(
+            "write_stream_default_ptr_cache_misses"
+        ),
         "kcmm_write_verified_rows": contract.get("kcmm_write_verified_rows"),
         "write_stream_synchronize_for_verification_calls": contract.get(
             "write_stream_synchronize_for_verification_calls"
@@ -602,6 +622,61 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "value": device_calls,
             }
         )
+    for prefix, expected_calls in (
+        ("read", contract.get("gpu_kernel_calls")),
+        ("write", device_calls),
+    ):
+        select_calls = contract.get(f"{prefix}_stream_select_calls")
+        current_queries = contract.get(
+            f"{prefix}_stream_current_stream_queries"
+        )
+        cache_hits = contract.get(f"{prefix}_stream_default_ptr_cache_hits")
+        cache_misses = contract.get(f"{prefix}_stream_default_ptr_cache_misses")
+        if not isinstance(select_calls, int) or select_calls <= 0:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": f"{prefix}_stream_select_calls_missing",
+                    "value": select_calls,
+                }
+            )
+            continue
+        if current_queries != select_calls:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": f"{prefix}_stream_current_query_count_mismatch",
+                    "value": current_queries,
+                    "expected": select_calls,
+                }
+            )
+        if isinstance(expected_calls, int) and expected_calls > 0:
+            if select_calls != expected_calls:
+                failures.append(
+                    {
+                        "mode": "kcmm_gpu_read",
+                        "reason": f"{prefix}_stream_select_call_count_mismatch",
+                        "value": select_calls,
+                        "expected": expected_calls,
+                    }
+                )
+        if not isinstance(cache_hits, int) or cache_hits <= 0:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": f"{prefix}_stream_default_ptr_cache_unused",
+                    "value": cache_hits,
+                }
+            )
+        if not isinstance(cache_misses, int) or cache_misses >= select_calls:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": f"{prefix}_stream_default_ptr_cache_misses_too_high",
+                    "value": cache_misses,
+                    "select_calls": select_calls,
+                }
+            )
     if contract.get("write_host_slot_calls") != 0:
         failures.append(
             {

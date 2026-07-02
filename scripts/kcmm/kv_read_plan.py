@@ -961,6 +961,7 @@ class KcmmKvReadOffsetTableTracker:
                 "force_non_default_stream": (
                     self._stream_provider.force_non_default
                 ),
+                "stream_provider": self._stream_provider.report(),
                 "report_on_update": self._report_on_update,
                 "report_write_count": self._report_write_count,
                 "block_table_validation_enabled": self._validate_block_tables,

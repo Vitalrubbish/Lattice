@@ -539,6 +539,8 @@ def token_throughput(result: dict[str, Any]) -> float | None:
 def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
     read_report = result.get("kv_read_offset_table_report") or {}
     write_report = result.get("kv_write_replace_candidate_report") or {}
+    read_stream_report = read_report.get("stream_provider") or {}
+    write_stream_report = write_report.get("stream_provider") or {}
     backed_report = result.get("backed_allocator") or {}
     backed_pool_stats = backed_report.get("pool_stats") or {}
     return {
@@ -660,6 +662,16 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "read_last_stream_ptr": read_report.get("last_stream_ptr"),
         "read_last_original_stream_ptr": read_report.get("last_original_stream_ptr"),
         "read_last_default_stream_ptr": read_report.get("last_default_stream_ptr"),
+        "read_stream_select_calls": read_stream_report.get("select_calls"),
+        "read_stream_current_stream_queries": read_stream_report.get(
+            "current_stream_queries"
+        ),
+        "read_stream_default_ptr_cache_hits": read_stream_report.get(
+            "default_stream_ptr_cache_hits"
+        ),
+        "read_stream_default_ptr_cache_misses": read_stream_report.get(
+            "default_stream_ptr_cache_misses"
+        ),
         "gpu_kernel_profile": read_report.get("gpu_kernel_profile"),
         "write_forced_non_default_stream_calls": write_report.get(
             "forced_non_default_stream_calls"
@@ -667,6 +679,16 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "write_last_stream_ptr": write_report.get("last_stream_ptr"),
         "write_last_original_stream_ptr": write_report.get("last_original_stream_ptr"),
         "write_last_default_stream_ptr": write_report.get("last_default_stream_ptr"),
+        "write_stream_select_calls": write_stream_report.get("select_calls"),
+        "write_stream_current_stream_queries": write_stream_report.get(
+            "current_stream_queries"
+        ),
+        "write_stream_default_ptr_cache_hits": write_stream_report.get(
+            "default_stream_ptr_cache_hits"
+        ),
+        "write_stream_default_ptr_cache_misses": write_stream_report.get(
+            "default_stream_ptr_cache_misses"
+        ),
         "max_read_batch_seen": read_report.get("max_batch_seen"),
         "max_write_batch_seen": write_report.get("max_batch_seen"),
         "write_stream_synchronize_for_verification_calls": write_report.get(
