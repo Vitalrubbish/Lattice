@@ -81,6 +81,8 @@ Python time without contributing to the gate contract.
 
 ## Follow-up
 
-The remaining request-path host hotspots are now mostly outside read metadata:
-read GPU-kernel host launch/stream selection and write device-slot table lookup,
-stream selection, and ctypes launch.
+Completed in part by Issue 35: device-slot write table sizing no longer
+refreshes total blocks on cache hits, reducing `write_device_slot_table_lookup`
+from `5.424ms` total to `4.561ms` total in the local host-profile gate.
+Remaining request-path host hotspots are read GPU-kernel host launch/stream
+selection and write stream selection/ctypes launch.

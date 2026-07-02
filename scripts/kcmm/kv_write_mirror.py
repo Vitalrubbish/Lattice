@@ -135,6 +135,9 @@ class KcmmKvWriteMirrorTracker:
         self._last_device_slot_valid_flags: list[int] = []
         self._last_device_slot_valid_table: Any | None = None
         self._last_device_slot_table_epoch: int | None = None
+        self._device_slot_total_blocks: int | None = None
+        self._device_slot_total_blocks_refreshes = 0
+        self._device_slot_block_state_epoch_queries = 0
         self._recent_device_slot_tables: list[Any] = []
         self._pending_device_slot_statuses: list[Any] = []
         self._driver: _CudaDriver | None = None
@@ -364,17 +367,26 @@ class KcmmKvWriteMirrorTracker:
     def _should_use_device_slot_write(self) -> bool:
         return self._use_device_slot_write and self._verify_rows_per_call == 0
 
+    def _device_slot_block_state_epoch(self, pool: KcmmPool) -> int:
+        self._device_slot_block_state_epoch_queries += 1
+        return pool.block_state_epoch()
+
+    def _refresh_device_slot_total_blocks(self, pool: KcmmPool) -> int:
+        total_blocks = max(int(pool.total_blocks()), 1)
+        self._device_slot_total_blocks = total_blocks
+        self._device_slot_total_blocks_refreshes += 1
+        return total_blocks
+
     def _device_slot_tables_for_device(
         self,
         *,
         pool: KcmmPool,
         device: Any,
-        min_entries: int,
     ) -> tuple[Any, Any]:
         import torch
 
         table_device = str(device)
-        epoch = pool.block_state_epoch()
+        epoch = self._device_slot_block_state_epoch(pool)
         cached_offsets = self._last_device_slot_offset_table
         cached_valid = self._last_device_slot_valid_table
         if (
@@ -382,19 +394,18 @@ class KcmmKvWriteMirrorTracker:
             and cached_valid is not None
             and self._last_device_slot_offsets
             and self._last_device_slot_valid_flags
-            and len(self._last_device_slot_offsets) >= min_entries
-            and len(self._last_device_slot_valid_flags) >= min_entries
             and str(getattr(cached_offsets, "device", None)) == table_device
             and str(getattr(cached_valid, "device", None)) == table_device
             and self._last_device_slot_table_epoch == epoch
-            and pool.block_state_epoch() == epoch
         ):
             self._device_slot_offset_table_cache_hits += 1
             self._device_slot_valid_table_cache_hits += 1
             return cached_offsets, cached_valid
 
-        for _attempt in range(3):
-            epoch = pool.block_state_epoch()
+        for attempt in range(3):
+            if attempt:
+                epoch = self._device_slot_block_state_epoch(pool)
+            min_entries = self._refresh_device_slot_total_blocks(pool)
             offsets_started_ns = self._host_profiler.start()
             offsets_f16 = pool.all_block_offsets_f16(min_entries=min_entries)
             offset_table = torch.tensor(
@@ -418,7 +429,7 @@ class KcmmKvWriteMirrorTracker:
                 "write_device_slot_valid_table_rebuild",
                 valid_started_ns,
             )
-            if pool.block_state_epoch() == epoch:
+            if self._device_slot_block_state_epoch(pool) == epoch:
                 break
         else:
             raise KcmmError(
@@ -653,11 +664,9 @@ class KcmmKvWriteMirrorTracker:
                         slot_prepare_started_ns,
                     )
                     table_started_ns = self._host_profiler.start()
-                    min_entries = max(pool.total_blocks(), 1)
                     offset_table, valid_table = self._device_slot_tables_for_device(
                         pool=pool,
                         device=slot_tensor.device,
-                        min_entries=min_entries,
                     )
                     self._host_profiler.stop(
                         "write_device_slot_table_lookup",
@@ -894,6 +903,13 @@ class KcmmKvWriteMirrorTracker:
                     self._device_slot_kernel_precompile_elapsed_ms
                 ),
                 "device_slot_table_epoch": self._last_device_slot_table_epoch,
+                "device_slot_total_blocks": self._device_slot_total_blocks,
+                "device_slot_total_blocks_refreshes": (
+                    self._device_slot_total_blocks_refreshes
+                ),
+                "device_slot_block_state_epoch_queries": (
+                    self._device_slot_block_state_epoch_queries
+                ),
                 "device_slot_offset_table_cache_hits": (
                     self._device_slot_offset_table_cache_hits
                 ),

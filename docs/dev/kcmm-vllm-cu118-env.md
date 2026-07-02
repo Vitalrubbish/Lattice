@@ -771,19 +771,21 @@ cache the KCMM write offset/valid-block tables by `kcmm_block_state_epoch()`.
 The device-slot write kernel is also precompiled at pool attach so first-call
 NVRTC/module-load cost is not charged to the first request. The read planner
 uses compact plan metadata in performance-clean mode so it does not collect
-stride/contiguity/sample diagnostics on every request-time read seam.
+stride/contiguity/sample diagnostics on every request-time read seam. Device-slot
+write table sizing refreshes `kcmm_total_blocks()` only on table rebuilds; cache
+hits use a single block-state epoch query for invalidation.
 Correctness gates keep per-update reports, block-table validation, row
 verification, and the host-slot writer enabled by default for better failure
 diagnostics.
 
-Latest local performance-clean result on 2026-07-02 after enabling compact read
-plan metadata:
+Latest local performance-clean result on 2026-07-02 after caching device-slot
+write table sizing:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-compact-plan-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-write-table-sizing-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-compact-plan-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-write-table-sizing-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Model: `facebook/opt-125m`
@@ -798,7 +800,7 @@ plan metadata:
 - Read detailed plan metadata calls: `0`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `93.363ms`
+- Read GPU kernel precompile elapsed: `95.078ms`
 - Lightweight read total-block calls: `372`
 - Write pool shape cached/refreshes: `true/1`
 - Cached write pool shape: `block_size=16`, `block_bytes=24576`,
@@ -806,7 +808,9 @@ plan metadata:
 - Device-slot write enabled/active: `true/true`
 - Device-slot write calls: `384`
 - Device-slot write-kernel precompile requested/succeeded/calls: `true/true/1`
-- Device-slot write-kernel precompile elapsed: `77.829ms`
+- Device-slot write-kernel precompile elapsed: `77.687ms`
+- Device-slot total-block refreshes: `3`
+- Device-slot block-state epoch queries: `387`
 - Host-slot write calls: `0`
 - Device-slot status checks/errors: `384/0`
 - Device-slot status codes: `{"0": 384}`
@@ -817,12 +821,12 @@ plan metadata:
 - Write tracker report writes: `1`
 - Stream-level write verification synchronizations: `0`
 - KCMM write verification enabled: `false`
-- Request latency seconds: stock `1.826`, KCMM `1.813`, ratio `0.993`
-- Tokens per second: stock `17.525`, KCMM `17.650`, ratio `1.007`
+- Request latency seconds: stock `1.837`, KCMM `1.840`, ratio `1.002`
+- Tokens per second: stock `17.420`, KCMM `17.391`, ratio `0.998`
 - Peak GPU memory delta MiB: stock `5441`, KCMM `5591`, ratio `1.028`
-- Compared with the previous write-precompile run, compact read-plan metadata
-  keeps the same clean contract while removing per-call diagnostic field
-  collection from the read planner.
+- Compared with the previous compact-plan run, the gate now verifies that
+  device-slot table sizing does not refresh total blocks per write and does not
+  use the old two-epoch-query cache-hit pattern.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 For concurrent real-model performance-clean coverage, use the stress wrapper:
@@ -845,16 +849,16 @@ device-slot KV write requirement from the performance-clean gate.
 Latest local performance-clean stress result on 2026-07-02:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_stress_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-compact-plan-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_stress_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-write-table-sizing-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-compact-plan-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-write-table-sizing-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Coverage cases: `stress_history`, `stress_memory`
 - Completion concurrency: `2`
 - Observed max read batch: `2`
-- Observed max write batch: `17`
+- Observed max write batch: `9`
 - GPU read kernel calls: `276`
 - Stream-aware read kernel calls: `276`
 - Reference KCMM read bytes: `0`
@@ -862,21 +866,23 @@ Latest local performance-clean stress result on 2026-07-02:
 - Read detailed plan metadata calls: `0`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `94.898ms`
+- Read GPU kernel precompile elapsed: `93.382ms`
 - Offset table cache hits/rebuilds: `273/3`
 - Device-slot write enabled/active: `true/true`
-- Device-slot write calls: `288`
+- Device-slot write calls: `300`
 - Device-slot write-kernel precompile requested/succeeded/calls: `true/true/1`
-- Device-slot write-kernel precompile elapsed: `76.366ms`
+- Device-slot write-kernel precompile elapsed: `76.756ms`
+- Device-slot total-block refreshes: `4`
+- Device-slot block-state epoch queries: `304`
 - Host-slot write calls: `0`
-- Device-slot status checks/errors: `288/0`
-- Device-slot status codes: `{"0": 288}`
-- Device-slot offset table cache hits/rebuilds: `285/3`
-- Device-slot valid table cache hits/rebuilds: `285/3`
+- Device-slot status checks/errors: `300/0`
+- Device-slot status codes: `{"0": 300}`
+- Device-slot offset table cache hits/rebuilds: `296/4`
+- Device-slot valid table cache hits/rebuilds: `296/4`
 - Write verification enabled: `false`
 - KCMM write verified rows: `0`
-- Request latency seconds: stock `1.818`, KCMM `1.791`, ratio `0.985`
-- Tokens per second: stock `26.403`, KCMM `26.801`, ratio `1.015`
+- Request latency seconds: stock `1.828`, KCMM `1.791`, ratio `0.980`
+- Tokens per second: stock `26.258`, KCMM `26.801`, ratio `1.021`
 - Peak GPU memory delta MiB: stock `5443`, KCMM `5593`, ratio `1.028`
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
@@ -897,14 +903,14 @@ tracker final reports without enabling CUDA event profiling or per-update report
 writes. The timings are nested diagnostic sections; do not sum them as
 independent request-level costs.
 
-Latest local host-profile result on 2026-07-02 after enabling compact read plan
-metadata:
+Latest local host-profile result on 2026-07-02 after caching device-slot write
+table sizing:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_host_profile_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-compact-plan-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_host_profile_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-write-table-sizing-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-compact-plan-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-write-table-sizing-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - GPU read kernel calls: `372`
@@ -912,7 +918,7 @@ metadata:
 - Reference KCMM read bytes: `0`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `94.536ms`
+- Read GPU kernel precompile elapsed: `90.494ms`
 - Read compact plan metadata enabled/calls: `true/372`
 - Read detailed plan metadata calls: `0`
 - Lightweight read total-block calls: `372`
@@ -920,25 +926,29 @@ metadata:
 - Cached write pool shape: `block_size=16`, `block_bytes=24576`,
   `step_elements=768`, `num_layers=12`
 - Device-slot write-kernel precompile requested/succeeded/calls: `true/true/1`
-- Device-slot write-kernel precompile elapsed: `78.703ms`
+- Device-slot write-kernel precompile elapsed: `73.471ms`
 - Device-slot write calls: `384`
+- Device-slot total-block refreshes: `3`
+- Device-slot block-state epoch queries: `387`
 - Host-slot write calls: `0`
 - Offset table cache hits/rebuilds: `369/3`
-- Request latency seconds: stock `1.814`, KCMM `1.823`, ratio `1.005`
-- Tokens per second: stock `17.641`, KCMM `17.553`, ratio `0.995`
-- Top read host sections: `read_gpu_kernel_precompile=94.542ms`,
-  `read_replace_call_total=33.429ms`,
-  `read_replace_gpu_kernel_host=18.687ms`,
-  `read_replace_build_plan=11.654ms`,
-  `read_build_plan_total=10.695ms`,
-  `read_gpu_kernel_ctypes_launch=6.001ms`.
-- Top write host sections: `write_device_slot_kernel_precompile=78.715ms`,
-  `write_mirror_call_total=41.051ms`,
-  `write_device_slot_table_lookup=5.424ms`,
-  `write_select_stream=4.655ms`, `write_ctypes_launch=3.844ms`.
-- Compared with the host-profile run immediately before Issue 34,
-  `read_replace_build_plan` dropped from `14.894ms` total to `11.654ms`, and
-  `read_build_plan_total` dropped from `13.931ms` total to `10.695ms`.
+- Request latency seconds: stock `1.839`, KCMM `1.844`, ratio `1.003`
+- Tokens per second: stock `17.401`, KCMM `17.354`, ratio `0.997`
+- Top read host sections: `read_gpu_kernel_precompile=90.502ms`,
+  `read_replace_call_total=34.297ms`,
+  `read_replace_gpu_kernel_host=19.121ms`,
+  `read_replace_build_plan=12.000ms`,
+  `read_build_plan_total=11.021ms`,
+  `read_gpu_kernel_ctypes_launch=6.177ms`.
+- Top write host sections: `write_device_slot_kernel_precompile=73.481ms`,
+  `write_mirror_call_total=40.444ms`,
+  `write_select_stream=4.667ms`,
+  `write_device_slot_table_lookup=4.561ms`,
+  `write_ctypes_launch=3.953ms`.
+- Compared with the host-profile run immediately before Issue 35,
+  `write_device_slot_table_lookup` dropped from `5.424ms` total to `4.561ms`;
+  total-block refreshes dropped from per-write behavior to `3` refreshes across
+  `384` device-slot writes, and epoch queries dropped to `387`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 Latest local performance characterization on 2026-06-20:

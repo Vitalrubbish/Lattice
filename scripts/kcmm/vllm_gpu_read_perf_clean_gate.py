@@ -264,6 +264,15 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         "write_device_slot_kernel_precompile_elapsed_ms": contract.get(
             "write_device_slot_kernel_precompile_elapsed_ms"
         ),
+        "write_device_slot_total_blocks": contract.get(
+            "write_device_slot_total_blocks"
+        ),
+        "write_device_slot_total_blocks_refreshes": contract.get(
+            "write_device_slot_total_blocks_refreshes"
+        ),
+        "write_device_slot_block_state_epoch_queries": contract.get(
+            "write_device_slot_block_state_epoch_queries"
+        ),
         "write_device_slot_offset_table_cache_hits": contract.get(
             "write_device_slot_offset_table_cache_hits"
         ),
@@ -638,6 +647,45 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "expected": 1,
             }
         )
+    total_block_refreshes = contract.get("write_device_slot_total_blocks_refreshes")
+    if not isinstance(total_block_refreshes, int) or total_block_refreshes <= 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_device_slot_total_blocks_refreshes_missing",
+                "value": total_block_refreshes,
+            }
+        )
+    elif isinstance(device_calls, int) and device_calls > 0:
+        if total_block_refreshes >= device_calls:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_device_slot_total_blocks_refreshed_per_write",
+                    "value": total_block_refreshes,
+                    "device_slot_write_calls": device_calls,
+                }
+            )
+    epoch_queries = contract.get("write_device_slot_block_state_epoch_queries")
+    if not isinstance(epoch_queries, int) or epoch_queries <= 0:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_device_slot_epoch_queries_missing",
+                "value": epoch_queries,
+            }
+        )
+    elif isinstance(device_calls, int) and device_calls > 0:
+        max_expected_epoch_queries = device_calls * 2
+        if epoch_queries >= max_expected_epoch_queries:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_device_slot_epoch_queries_too_high",
+                    "value": epoch_queries,
+                    "threshold_exclusive": max_expected_epoch_queries,
+                }
+            )
     status_checks = contract.get("write_device_slot_status_checks")
     if not isinstance(status_checks, int) or status_checks <= 0:
         failures.append(
