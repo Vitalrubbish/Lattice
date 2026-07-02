@@ -252,6 +252,18 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         "write_device_slot_status_error_count": contract.get(
             "write_device_slot_status_error_count"
         ),
+        "write_device_slot_kernel_precompile_requested": contract.get(
+            "write_device_slot_kernel_precompile_requested"
+        ),
+        "write_device_slot_kernel_precompile_succeeded": contract.get(
+            "write_device_slot_kernel_precompile_succeeded"
+        ),
+        "write_device_slot_kernel_precompile_calls": contract.get(
+            "write_device_slot_kernel_precompile_calls"
+        ),
+        "write_device_slot_kernel_precompile_elapsed_ms": contract.get(
+            "write_device_slot_kernel_precompile_elapsed_ms"
+        ),
         "write_device_slot_offset_table_cache_hits": contract.get(
             "write_device_slot_offset_table_cache_hits"
         ),
@@ -550,6 +562,35 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "mode": "kcmm_gpu_read",
                 "reason": "device_slot_status_errors_seen",
                 "value": contract.get("write_device_slot_status_error_count"),
+            }
+        )
+    if contract.get("write_device_slot_kernel_precompile_requested") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_kernel_precompile_not_requested_in_report",
+                "value": contract.get(
+                    "write_device_slot_kernel_precompile_requested"
+                ),
+            }
+        )
+    if contract.get("write_device_slot_kernel_precompile_succeeded") is not True:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_kernel_precompile_not_succeeded",
+                "value": contract.get(
+                    "write_device_slot_kernel_precompile_succeeded"
+                ),
+            }
+        )
+    if contract.get("write_device_slot_kernel_precompile_calls") != 1:
+        failures.append(
+            {
+                "mode": "kcmm_gpu_read",
+                "reason": "write_kernel_precompile_call_count_unexpected",
+                "value": contract.get("write_device_slot_kernel_precompile_calls"),
+                "expected": 1,
             }
         )
     status_checks = contract.get("write_device_slot_status_checks")

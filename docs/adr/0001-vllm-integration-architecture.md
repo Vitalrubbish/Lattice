@@ -211,7 +211,9 @@ performance-clean write tracker can use this ABI behind
 `--kcmm-kv-write-device-slots` when row verification is disabled; correctness
 paths still default to the host-slot writer because D2H row verification needs a
 host slot list. The tracker caches device offset/valid tables by KCMM
-block-state epoch so block reuse or VA remapping invalidates stale tables.
+block-state epoch so block reuse or VA remapping invalidates stale tables. The
+device-slot write kernel is precompiled when the runtime pool attaches, moving
+NVRTC/module-load cost out of the first request.
 
 ### Why A1 is not valid at the vLLM Python custom-op seam (intercept 3)
 
@@ -368,9 +370,10 @@ device-slot KV writes so vLLM's CUDA `slot_mapping` tensor stays on device; it
 requires device write calls, zero host-slot write calls, status checks, and zero
 device status errors. The gate still requires token-exact stock-vs-KCMM output,
 GPU read-kernel calls, zero CPU-staged reference read bytes, successful
-read-kernel precompile, and zero write verification rows/synchronizations. It is
-cleaner than the correctness gates, but it still includes vLLM server, Python
-monkey-patch, and scheduling overhead.
+read-kernel precompile, successful device-slot write-kernel precompile, and zero
+write verification rows/synchronizations. It is cleaner than the correctness
+gates, but it still includes vLLM server, Python monkey-patch, and scheduling
+overhead.
 
 `python -m scripts.kcmm.vllm_gpu_read_host_profile_gate` wraps that
 performance-clean gate with section-level host wall-clock timing enabled in the
@@ -378,8 +381,9 @@ KCMM read/write trackers. This is diagnostic-only and remains off by default.
 The first local run showed the dominant measured request-time section nested
 under Python/ctypes kernel launch because the first FFI call compiled/loaded
 the CUDA kernel. After precompile, that cost is visible as a one-time
-`read_gpu_kernel_precompile` attach-time section and
-`read_gpu_kernel_ctypes_launch` is no longer the dominant request-time cost.
+`read_gpu_kernel_precompile` or `write_device_slot_kernel_precompile`
+attach-time section, and per-call ctypes launch sections are no longer dominated
+by NVRTC/module load.
 
 `python -m scripts.kcmm.vllm_gpu_read_tensor_parallel_gate` now covers the
 local tensor-parallel case with `tensor_parallel_size=2` on the dual RTX 3080

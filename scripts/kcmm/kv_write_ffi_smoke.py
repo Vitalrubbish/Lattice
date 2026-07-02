@@ -374,6 +374,9 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
             dtype=torch.uint8,
             device=device,
         )
+        precompile_started = time.monotonic()
+        pool.precompile_vllm_kv_write_f16()
+        precompile_elapsed_seconds = round(time.monotonic() - precompile_started, 6)
         device_slot_status = torch.zeros(1, dtype=torch.int32, device=device)
         pool.append_kv_device_slots_on_stream(
             layer_idx=0,
@@ -550,6 +553,8 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
                 ),
                 "valid_blocks_device_ptr": int(block_valid_tensor.data_ptr()),
                 "valid_blocks": block_valid_flags,
+                "kernel_precompiled": True,
+                "kernel_precompile_elapsed_seconds": precompile_elapsed_seconds,
                 "status_device_ptr": int(device_slot_status.data_ptr()),
                 "inactive_slot": inactive_slot,
                 "inactive_slot_status": inactive_device_status_value,

@@ -198,6 +198,34 @@ pub unsafe extern "C" fn kcmm_precompile_paged_attn_decode_f16(
     }
 }
 
+/// Precompile and load KCMM's vLLM-facing KV write kernel.
+///
+/// This shifts NVRTC/module-load cost out of the first device-slot write. The
+/// function is idempotent for a pool and returns immediately after the first
+/// successful compile.
+///
+/// # Safety
+/// `pool` must be a valid KCMM pool handle.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_precompile_vllm_kv_write_f16(
+    pool: *mut kcmm_pool_t,
+) -> i32 {
+    if pool.is_null() {
+        return -1;
+    }
+    let handle = pool_from_ptr(pool);
+    match compile_vllm_kv_write_kernel(handle) {
+        Ok(_) => 0,
+        Err(e) => {
+            handle.set_error(format!(
+                "kcmm_precompile_vllm_kv_write_f16: compile/load kernel failed: {:#}",
+                e
+            ));
+            -1
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // C-compatible configuration struct
 // ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import json
 import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -160,6 +161,10 @@ class KcmmKvWriteMirrorTracker:
         self._device_slot_valid_table_cache_hits = 0
         self._device_slot_valid_table_cache_rebuilds = 0
         self._device_slot_padding_slots_unknown_calls = 0
+        self._device_slot_kernel_precompile_requested = self._should_use_device_slot_write()
+        self._device_slot_kernel_precompile_calls = 0
+        self._device_slot_kernel_precompile_succeeded = False
+        self._device_slot_kernel_precompile_elapsed_ms: float | None = None
         self._stream_aware_write_calls = 0
         self._forced_non_default_stream_calls = 0
         self._stream_synchronize_for_verification_calls = 0
@@ -187,6 +192,26 @@ class KcmmKvWriteMirrorTracker:
         with self._lock:
             self._pool = pool
             self._refresh_pool_shape(pool)
+            if self._should_use_device_slot_write():
+                started_ns = self._host_profiler.start()
+                precompile_started_ns = time.perf_counter_ns()
+                self._device_slot_kernel_precompile_calls += 1
+                try:
+                    pool.precompile_vllm_kv_write_f16()
+                except BaseException as exc:
+                    self._record_error(exc)
+                    raise
+                finally:
+                    elapsed_ns = time.perf_counter_ns() - precompile_started_ns
+                    self._device_slot_kernel_precompile_elapsed_ms = round(
+                        elapsed_ns / 1_000_000,
+                        6,
+                    )
+                    self._host_profiler.stop(
+                        "write_device_slot_kernel_precompile",
+                        started_ns,
+                    )
+                self._device_slot_kernel_precompile_succeeded = True
             self._write_report_on_update()
 
     def _require_pool(self) -> KcmmPool:
@@ -856,6 +881,18 @@ class KcmmKvWriteMirrorTracker:
                     )
                 },
                 "last_device_slot_status": self._last_device_slot_status,
+                "device_slot_kernel_precompile_requested": (
+                    self._device_slot_kernel_precompile_requested
+                ),
+                "device_slot_kernel_precompile_calls": (
+                    self._device_slot_kernel_precompile_calls
+                ),
+                "device_slot_kernel_precompile_succeeded": (
+                    self._device_slot_kernel_precompile_succeeded
+                ),
+                "device_slot_kernel_precompile_elapsed_ms": (
+                    self._device_slot_kernel_precompile_elapsed_ms
+                ),
                 "device_slot_table_epoch": self._last_device_slot_table_epoch,
                 "device_slot_offset_table_cache_hits": (
                     self._device_slot_offset_table_cache_hits

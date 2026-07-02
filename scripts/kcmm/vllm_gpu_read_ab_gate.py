@@ -599,6 +599,18 @@ def summarize_gpu_read_contract(result: dict[str, Any]) -> dict[str, Any]:
         "write_device_slot_status_codes": write_report.get(
             "device_slot_status_codes"
         ),
+        "write_device_slot_kernel_precompile_requested": write_report.get(
+            "device_slot_kernel_precompile_requested"
+        ),
+        "write_device_slot_kernel_precompile_succeeded": write_report.get(
+            "device_slot_kernel_precompile_succeeded"
+        ),
+        "write_device_slot_kernel_precompile_calls": write_report.get(
+            "device_slot_kernel_precompile_calls"
+        ),
+        "write_device_slot_kernel_precompile_elapsed_ms": write_report.get(
+            "device_slot_kernel_precompile_elapsed_ms"
+        ),
         "write_device_slot_offset_table_cache_hits": write_report.get(
             "device_slot_offset_table_cache_hits"
         ),

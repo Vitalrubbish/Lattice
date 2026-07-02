@@ -183,6 +183,7 @@ class KcmmLibrary:
         self.lib = ctypes.CDLL(str(self.path))
         self.has_current_context_read_launch = False
         self.has_paged_attn_precompile = False
+        self.has_kv_write_precompile = False
         self.has_device_slot_write = False
         self.has_all_block_valid = False
         self.has_block_state_epoch = False
@@ -395,6 +396,14 @@ class KcmmLibrary:
             precompile_paged_attn.argtypes = [pool]
             precompile_paged_attn.restype = ctypes.c_int
             self.has_paged_attn_precompile = True
+        try:
+            precompile_kv_write = lib.kcmm_precompile_vllm_kv_write_f16
+        except AttributeError:
+            precompile_kv_write = None
+        if precompile_kv_write is not None:
+            precompile_kv_write.argtypes = [pool]
+            precompile_kv_write.restype = ctypes.c_int
+            self.has_kv_write_precompile = True
         lib.kcmm_get_block_location.argtypes = [
             pool,
             ctypes.c_uint32,
@@ -444,6 +453,11 @@ class KcmmPool:
         self._precompile_paged_attn_decode_f16 = (
             library.lib.kcmm_precompile_paged_attn_decode_f16
             if library.has_paged_attn_precompile
+            else None
+        )
+        self._precompile_vllm_kv_write_f16 = (
+            library.lib.kcmm_precompile_vllm_kv_write_f16
+            if library.has_kv_write_precompile
             else None
         )
         self._append_kv_device_slots_on_stream = (
@@ -712,6 +726,16 @@ class KcmmPool:
             int(stream_ptr),
         )
         self._check(rc, "kcmm_append_kv_device_slots_on_stream")
+
+    def precompile_vllm_kv_write_f16(self) -> None:
+        function = self._precompile_vllm_kv_write_f16
+        if function is None:
+            raise KcmmError(
+                "KCMM library does not export kcmm_precompile_vllm_kv_write_f16; "
+                "rebuild libbaseline_llm_os.so"
+            )
+        rc = function(self.handle)
+        self._check(rc, "kcmm_precompile_vllm_kv_write_f16")
 
     def paged_attn_decode_f16(
         self,

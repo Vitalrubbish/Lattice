@@ -101,7 +101,7 @@ kernel compile overhead had already been removed.
 
 ## Follow-up
 
-The next useful issue should investigate the remaining KCMM-vs-stock request
-latency gap with device-slot writes active. Likely targets are write-stream
-completion behavior, per-call ctypes overhead, and read/write tracker host
-bookkeeping that still remains in the replacement path.
+Completed by Issue 33: host-profile showed the main device-slot write overhead
+was first-call kernel compile/load under `write_ctypes_launch`, so the write
+kernel now precompiles at pool attach. Remaining follow-up should focus on
+steady-state Python/ctypes and tracker bookkeeping rather than compile latency.
