@@ -314,6 +314,96 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
                 }
             )
 
+        device_slot_batch = 3
+        device_slot_k_src = (
+            torch.arange(device_slot_batch * step, dtype=torch.float16, device=device)
+            + 4000
+        ).reshape(
+            device_slot_batch,
+            step,
+        )
+        device_slot_v_src = (
+            torch.arange(device_slot_batch * step, dtype=torch.float16, device=device)
+            + 5000
+        ).reshape(
+            device_slot_batch,
+            step,
+        )
+        device_slots = [
+            blocks[0] * config.block_size + 1,
+            blocks[1] * config.block_size + 0,
+            -1,
+        ]
+        block_offsets_f16 = pool.all_block_offsets_f16()
+        if len(block_offsets_f16) <= max(blocks):
+            raise KvWriteSmokeFailure(
+                "block offset table shorter than allocated blocks: "
+                f"entries={len(block_offsets_f16)} blocks={blocks}"
+            )
+        device_slot_tensor = torch.tensor(
+            device_slots,
+            dtype=torch.int64,
+            device=device,
+        )
+        block_offsets_f16_tensor = torch.tensor(
+            block_offsets_f16,
+            dtype=torch.int64,
+            device=device,
+        )
+        device_slot_status = torch.zeros(1, dtype=torch.int32, device=device)
+        pool.append_kv_device_slots_on_stream(
+            layer_idx=0,
+            slot_mapping_ptr=int(device_slot_tensor.data_ptr()),
+            block_offsets_f16_ptr=int(block_offsets_f16_tensor.data_ptr()),
+            block_offsets_f16_len=len(block_offsets_f16),
+            batch=device_slot_batch,
+            k_src_ptr=int(device_slot_k_src.data_ptr()),
+            v_src_ptr=int(device_slot_v_src.data_ptr()),
+            status_ptr=int(device_slot_status.data_ptr()),
+            stream_ptr=slot_stream_ptr,
+        )
+        slot_stream.synchronize()
+        if int(device_slot_status.cpu().item()) != 0:
+            raise KvWriteSmokeFailure(
+                "device-slot write unexpectedly reported an invalid slot"
+            )
+
+        for row, slot in enumerate(device_slots):
+            if slot < 0:
+                comparisons.append(
+                    {
+                        "mode": "device_physical_slot_padding",
+                        "row": row,
+                        "slot": slot,
+                        "skipped": True,
+                    }
+                )
+                continue
+            block = slot // config.block_size
+            offset_in_block = slot % config.block_size
+            block_offset = pool.block_va_offset(block)
+            token_offset_bytes = offset_in_block * step * 2
+            k_addr = va_k + block_offset + token_offset_bytes
+            v_addr = va_v + block_offset + token_offset_bytes
+            expected_k = tensor_bytes(device_slot_k_src[row])
+            expected_v = tensor_bytes(device_slot_v_src[row])
+            actual_k = driver.memcpy_dtoh(k_addr, byte_count)
+            actual_v = driver.memcpy_dtoh(v_addr, byte_count)
+            assert_bytes_equal(f"k[device_slot_row={row}]", actual_k, expected_k)
+            assert_bytes_equal(f"v[device_slot_row={row}]", actual_v, expected_v)
+            comparisons.append(
+                {
+                    "mode": "device_physical_slot",
+                    "row": row,
+                    "slot": slot,
+                    "block": block,
+                    "offset_in_block": offset_in_block,
+                    "byte_count": byte_count,
+                    "k_addr": k_addr,
+                    "v_addr": v_addr,
+                }
+            )
+
         invalid_slot = config.max_blocks * config.block_size
         invalid_error = None
         try:
@@ -329,6 +419,31 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
         if invalid_error is None:
             raise KvWriteSmokeFailure(
                 f"direct-slot write unexpectedly accepted invalid slot {invalid_slot}"
+            )
+
+        invalid_device_slots = torch.tensor(
+            [invalid_slot],
+            dtype=torch.int64,
+            device=device,
+        )
+        invalid_device_status = torch.zeros(1, dtype=torch.int32, device=device)
+        pool.append_kv_device_slots_on_stream(
+            layer_idx=0,
+            slot_mapping_ptr=int(invalid_device_slots.data_ptr()),
+            block_offsets_f16_ptr=int(block_offsets_f16_tensor.data_ptr()),
+            block_offsets_f16_len=len(block_offsets_f16),
+            batch=1,
+            k_src_ptr=int(device_slot_k_src[:1].data_ptr()),
+            v_src_ptr=int(device_slot_v_src[:1].data_ptr()),
+            status_ptr=int(invalid_device_status.data_ptr()),
+            stream_ptr=slot_stream_ptr,
+        )
+        slot_stream.synchronize()
+        invalid_device_status_value = int(invalid_device_status.cpu().item())
+        if invalid_device_status_value == 0:
+            raise KvWriteSmokeFailure(
+                "device-slot write did not report invalid slot "
+                f"{invalid_slot} through status tensor"
             )
 
         pool.unregister_sequence(seq_idx)
@@ -367,6 +482,20 @@ def run_smoke(config: KvWriteSmokeConfig) -> dict[str, Any]:
                 "stream_ptr": slot_stream_ptr,
                 "invalid_slot": invalid_slot,
                 "invalid_slot_error": invalid_error,
+            },
+            "device_slot_writes": {
+                "slot_formula": "slot = block_id * block_size + offset_in_block",
+                "slots": device_slots,
+                "stream_aware": True,
+                "stream_ptr": slot_stream_ptr,
+                "slot_mapping_device_ptr": int(device_slot_tensor.data_ptr()),
+                "block_offsets_f16_entries": len(block_offsets_f16),
+                "block_offsets_f16_device_ptr": int(
+                    block_offsets_f16_tensor.data_ptr()
+                ),
+                "status_device_ptr": int(device_slot_status.data_ptr()),
+                "invalid_slot": invalid_slot,
+                "invalid_slot_status": invalid_device_status_value,
             },
             "stats_after_unregister": stats_after_unregister,
             "elapsed_seconds": round(time.monotonic() - started_at, 3),

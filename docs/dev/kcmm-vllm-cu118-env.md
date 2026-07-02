@@ -196,13 +196,21 @@ python -m scripts.kcmm.kv_write_ffi_smoke
 The gate creates a tiny KCMM pool, registers a sequence backed by two KCMM
 blocks, writes known FP16 K/V rows through `kcmm_append_kv_step`, then verifies
 the vLLM-style physical-slot writer `kcmm_append_kv_slots_on_stream` with
-`slot = block_id * block_size + offset_in_block`. It reads the destination KCMM
-VA bytes back to host and compares them with the source CUDA tensors. This
-verifies the C ABI, VA accessors, D2D write paths, direct-slot decoding, caller
-stream enqueue, padding skip behavior, unallocated-slot failure, and D2H
-byte-level comparison without downloading a model or starting vLLM.
+`slot = block_id * block_size + offset_in_block`. It also verifies the
+device-slot writer `kcmm_append_kv_device_slots_on_stream`, which consumes a
+CUDA int64 `slot_mapping` tensor pointer plus a CUDA int64 f16-offset table
+indexed by block id. It reads the destination KCMM VA bytes back to host and
+compares them with the source CUDA tensors. This verifies the C ABI, VA
+accessors, D2D write paths, host-slot and device-slot decoding, caller stream
+enqueue, padding skip behavior, invalid-slot handling, and D2H byte-level
+comparison without downloading a model or starting vLLM.
 
-Latest local Phase II.B preflight result on 2026-06-20:
+The device-slot writer is a low-level ABI only at this point. The vLLM write
+tracker still uses the stable host-slot path until the replacement-mode safety
+contract can avoid `_slot_mapping_to_list()` without losing in-use block
+validation.
+
+Latest local Phase II.B preflight result on 2026-07-02:
 
 - Command: `python -m scripts.kcmm.kv_write_ffi_smoke --no-build-kcmm`
 - Result: `passed=true`
@@ -214,6 +222,11 @@ Latest local Phase II.B preflight result on 2026-06-20:
 - Direct-slot stream pointer: `0`
 - Direct-slot padding slot `-1` was skipped.
 - Invalid direct slot `16` failed with `block_idx 4 from slot 16 not in use`.
+- Device direct-slot writes passed for slots `1` and `4` using the same slot
+  formula.
+- Device direct-slot padding slot `-1` was skipped.
+- Device direct-slot invalid slot `16` set the device status tensor to `1`.
+- Device direct-slot offset table entries: `2`.
 - Final KCMM stats recorded `blocks_in_use=0`.
 
 ## Phase II.B vLLM write contract trace

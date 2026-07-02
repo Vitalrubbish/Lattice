@@ -47,6 +47,7 @@ struct KcmmPoolHandle {
     pool: Arc<KcmmPool>,
     last_error: parking_lot::Mutex<String>,
     paged_attn_kernel: parking_lot::Mutex<Option<KcmmPagedAttnKernel>>,
+    kv_write_kernel: parking_lot::Mutex<Option<KcmmKvWriteKernel>>,
 }
 
 #[derive(Clone, Copy)]
@@ -58,12 +59,22 @@ struct KcmmPagedAttnKernel {
 unsafe impl Send for KcmmPagedAttnKernel {}
 unsafe impl Sync for KcmmPagedAttnKernel {}
 
+#[derive(Clone, Copy)]
+struct KcmmKvWriteKernel {
+    module: sys::CUmodule,
+    function: sys::CUfunction,
+}
+
+unsafe impl Send for KcmmKvWriteKernel {}
+unsafe impl Sync for KcmmKvWriteKernel {}
+
 impl KcmmPoolHandle {
     fn new(pool: KcmmPool) -> Self {
         Self {
             pool: Arc::new(pool),
             last_error: parking_lot::Mutex::new(String::new()),
             paged_attn_kernel: parking_lot::Mutex::new(None),
+            kv_write_kernel: parking_lot::Mutex::new(None),
         }
     }
 
@@ -75,6 +86,12 @@ impl KcmmPoolHandle {
 impl Drop for KcmmPoolHandle {
     fn drop(&mut self) {
         if let Some(kernel) = self.paged_attn_kernel.lock().take() {
+            let _ = self.pool.ctx.device.bind_to_thread();
+            unsafe {
+                let _ = result::module::unload(kernel.module);
+            }
+        }
+        if let Some(kernel) = self.kv_write_kernel.lock().take() {
             let _ = self.pool.ctx.device.bind_to_thread();
             unsafe {
                 let _ = result::module::unload(kernel.module);
@@ -115,6 +132,41 @@ fn compile_vllm_paged_attn_kernel(handle: &KcmmPoolHandle) -> anyhow::Result<Kcm
     }?;
     let kernel = KcmmPagedAttnKernel { module, function };
     *handle.paged_attn_kernel.lock() = Some(kernel.clone());
+    Ok(kernel)
+}
+
+fn compile_vllm_kv_write_kernel(handle: &KcmmPoolHandle) -> anyhow::Result<KcmmKvWriteKernel> {
+    if let Some(kernel) = handle.kv_write_kernel.lock().as_ref().cloned() {
+        return Ok(kernel);
+    }
+
+    let mut include_paths = vec!["/usr/include".to_string()];
+    let cuda_home = std::env::var("CUDA_HOME")
+        .or_else(|_| std::env::var("CUDA_PATH"))
+        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    include_paths.push(format!("{cuda_home}/include"));
+    let opts = cudarc::nvrtc::CompileOptions {
+        ftz: Some(true),
+        use_fast_math: Some(true),
+        include_paths,
+        ..Default::default()
+    };
+    let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(
+        include_str!("../cuda/kernels/kcmm_vllm_kv_write.cu"),
+        opts,
+    )?;
+    handle.pool.ctx.device.bind_to_thread()?;
+    let ptx_src = ptx.to_src();
+    let ptx_image = CString::new(ptx_src)?;
+    let module = unsafe { result::module::load_data(ptx_image.as_ptr() as *const c_void) }?;
+    let function = unsafe {
+        result::module::get_function(
+            module,
+            CString::new("kcmm_vllm_kv_write_slots_f16")?,
+        )
+    }?;
+    let kernel = KcmmKvWriteKernel { module, function };
+    *handle.kv_write_kernel.lock() = Some(kernel.clone());
     Ok(kernel)
 }
 
@@ -1256,6 +1308,181 @@ unsafe fn kcmm_append_kv_slots_impl(
         }
     }
 
+    0
+}
+
+/// Write one step of KV data using a device-resident vLLM slot_mapping tensor.
+///
+/// `slot_mapping_ptr` points to CUDA memory containing `batch` int64 slot ids.
+/// `block_offsets_f16_ptr` points to a CUDA int64/u64 table where
+/// `block_offsets_f16[block_id]` is the KCMM block VA offset in f16 elements.
+/// Non-negative slots are interpreted as
+/// `slot = block_idx * block_size + offset_in_block`; negative slots are
+/// padding and skipped. `status_ptr` may be 0; when non-zero it must point to a
+/// CUDA int32 status word initialized to 0. The kernel atomically sets it to 1
+/// if it observes a slot whose block id is outside `block_offsets_f16_len`.
+///
+/// This function enqueues a CUDA kernel on `stream_ptr` and returns without
+/// synchronizing. The caller owns stream ordering, tensor lifetimes, and status
+/// read-back if `status_ptr` is used.
+///
+/// # Safety
+/// `pool` must be a valid handle. All non-zero pointer arguments must refer to
+/// live CUDA device memory for the duration of the queued work. `stream_ptr`
+/// must be valid for the active CUDA context, or 0 for the legacy default
+/// stream.
+#[no_mangle]
+pub unsafe extern "C" fn kcmm_append_kv_device_slots_on_stream(
+    pool: *mut kcmm_pool_t,
+    layer_idx: u32,
+    slot_mapping_ptr: u64,
+    block_offsets_f16_ptr: u64,
+    block_offsets_f16_len: u32,
+    batch: u32,
+    k_src_ptr: u64,
+    v_src_ptr: u64,
+    status_ptr: u64,
+    stream_ptr: u64,
+) -> i32 {
+    if pool.is_null()
+        || slot_mapping_ptr == 0
+        || block_offsets_f16_ptr == 0
+        || k_src_ptr == 0
+        || v_src_ptr == 0
+    {
+        if !pool.is_null() {
+            pool_from_ptr(pool).set_error(
+                "kcmm_append_kv_device_slots_on_stream: null pointer argument".to_string(),
+            );
+        }
+        return -1;
+    }
+    if batch == 0 || block_offsets_f16_len == 0 {
+        pool_from_ptr(pool).set_error(
+            "kcmm_append_kv_device_slots_on_stream: batch and offset table length must be positive"
+                .to_string(),
+        );
+        return -1;
+    }
+
+    let handle = pool_from_ptr(pool);
+    let pool_ref = &handle.pool;
+    let va_k = match pool_ref.va_k.get(layer_idx as usize) {
+        Some(&value) => value,
+        None => {
+            handle.set_error(format!(
+                "kcmm_append_kv_device_slots_on_stream: layer_idx {} out of bounds",
+                layer_idx
+            ));
+            return -1;
+        }
+    };
+    let va_v = match pool_ref.va_v.get(layer_idx as usize) {
+        Some(&value) => value,
+        None => {
+            handle.set_error(format!(
+                "kcmm_append_kv_device_slots_on_stream: layer_idx {} out of bounds",
+                layer_idx
+            ));
+            return -1;
+        }
+    };
+
+    let step_elements = match u32::try_from(pool_ref.elem_per_block / pool_ref.block_size) {
+        Ok(value) if value > 0 => value,
+        _ => {
+            handle.set_error(
+                "kcmm_append_kv_device_slots_on_stream: invalid step_elements".to_string(),
+            );
+            return -1;
+        }
+    };
+    let block_size = match u32::try_from(pool_ref.block_size) {
+        Ok(value) if value > 0 => value,
+        _ => {
+            handle.set_error(
+                "kcmm_append_kv_device_slots_on_stream: invalid block_size".to_string(),
+            );
+            return -1;
+        }
+    };
+    let total_elements = match batch.checked_mul(step_elements) {
+        Some(value) => value,
+        None => {
+            handle.set_error(
+                "kcmm_append_kv_device_slots_on_stream: total_elements overflow".to_string(),
+            );
+            return -1;
+        }
+    };
+
+    let kernel = match compile_vllm_kv_write_kernel(handle) {
+        Ok(value) => value,
+        Err(e) => {
+            handle.set_error(format!(
+                "kcmm_append_kv_device_slots_on_stream: compile/load kernel failed: {:#}",
+                e
+            ));
+            return -1;
+        }
+    };
+    if let Err(e) = pool_ref.ctx.device.bind_to_thread() {
+        handle.set_error(format!(
+            "kcmm_append_kv_device_slots_on_stream: bind context failed: {:#}",
+            e
+        ));
+        return -1;
+    }
+
+    let block_dim = 256u32;
+    let grid_dim = ((total_elements + block_dim - 1) / block_dim, 1, 1);
+    let cfg = LaunchConfig {
+        grid_dim,
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut va_k_arg = va_k;
+    let mut va_v_arg = va_v;
+    let mut slot_mapping_ptr_arg = slot_mapping_ptr;
+    let mut block_offsets_f16_ptr_arg = block_offsets_f16_ptr;
+    let mut k_src_ptr_arg = k_src_ptr;
+    let mut v_src_ptr_arg = v_src_ptr;
+    let mut status_ptr_arg = status_ptr;
+    let mut total_elements_arg = total_elements as i32;
+    let mut step_elements_arg = step_elements as i32;
+    let mut block_size_arg = block_size as i32;
+    let mut block_offsets_f16_len_arg = block_offsets_f16_len as i32;
+    let mut params = [
+        &mut va_k_arg as *mut u64 as *mut c_void,
+        &mut va_v_arg as *mut u64 as *mut c_void,
+        &mut slot_mapping_ptr_arg as *mut u64 as *mut c_void,
+        &mut block_offsets_f16_ptr_arg as *mut u64 as *mut c_void,
+        &mut k_src_ptr_arg as *mut u64 as *mut c_void,
+        &mut v_src_ptr_arg as *mut u64 as *mut c_void,
+        &mut status_ptr_arg as *mut u64 as *mut c_void,
+        &mut total_elements_arg as *mut i32 as *mut c_void,
+        &mut step_elements_arg as *mut i32 as *mut c_void,
+        &mut block_size_arg as *mut i32 as *mut c_void,
+        &mut block_offsets_f16_len_arg as *mut i32 as *mut c_void,
+    ];
+    let stream = stream_ptr as sys::CUstream;
+    let launch_result = unsafe {
+        result::launch_kernel(
+            kernel.function,
+            cfg.grid_dim,
+            cfg.block_dim,
+            cfg.shared_mem_bytes,
+            stream,
+            &mut params,
+        )
+    };
+    if let Err(e) = launch_result {
+        handle.set_error(format!(
+            "kcmm_append_kv_device_slots_on_stream: launch failed: {:#}",
+            e
+        ));
+        return -1;
+    }
     0
 }
 

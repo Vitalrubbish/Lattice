@@ -202,6 +202,14 @@ current PyTorch CUDA stream and returns without full-device synchronization.
 D2H verification in smoke tests still synchronizes that stream before reading
 KCMM bytes back to host.
 
+A later Phase II.C cleanup added a low-level device-slot write ABI,
+`kcmm_append_kv_device_slots_on_stream`, that consumes vLLM's CUDA
+`slot_mapping` tensor plus a CUDA f16-offset table directly. This ABI is
+validated by `kv_write_ffi_smoke`, but it is not yet the default vLLM tracker
+path because replacement-mode safety still needs a device-side valid-block
+contract before `_slot_mapping_to_list()` can be removed from the integrated
+write tracker.
+
 ### Why A1 is not valid at the vLLM Python custom-op seam (intercept 3)
 
 A1: replace `block_tables` values with f16-unit VA offsets, set kernel `kv_cache_base=0`.

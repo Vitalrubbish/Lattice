@@ -183,6 +183,7 @@ class KcmmLibrary:
         self.lib = ctypes.CDLL(str(self.path))
         self.has_current_context_read_launch = False
         self.has_paged_attn_precompile = False
+        self.has_device_slot_write = False
         self._bind_functions()
 
     def _bind_functions(self) -> None:
@@ -290,6 +291,25 @@ class KcmmLibrary:
             ctypes.c_uint64,
         ]
         lib.kcmm_append_kv_slots_on_stream.restype = ctypes.c_int
+        try:
+            append_device_slots = lib.kcmm_append_kv_device_slots_on_stream
+        except AttributeError:
+            append_device_slots = None
+        if append_device_slots is not None:
+            append_device_slots.argtypes = [
+                pool,
+                ctypes.c_uint32,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+            ]
+            append_device_slots.restype = ctypes.c_int
+            self.has_device_slot_write = True
         lib.kcmm_paged_attn_decode_f16.argtypes = [
             pool,
             ctypes.c_uint32,
@@ -400,6 +420,11 @@ class KcmmPool:
         self._precompile_paged_attn_decode_f16 = (
             library.lib.kcmm_precompile_paged_attn_decode_f16
             if library.has_paged_attn_precompile
+            else None
+        )
+        self._append_kv_device_slots_on_stream = (
+            library.lib.kcmm_append_kv_device_slots_on_stream
+            if library.has_device_slot_write
             else None
         )
         self._destroyed = False
@@ -591,6 +616,44 @@ class KcmmPool:
                 int(stream_ptr),
             )
             self._check(rc, "kcmm_append_kv_slots_on_stream")
+
+    def append_kv_device_slots_on_stream(
+        self,
+        *,
+        layer_idx: int,
+        slot_mapping_ptr: int,
+        block_offsets_f16_ptr: int,
+        block_offsets_f16_len: int,
+        batch: int,
+        k_src_ptr: int,
+        v_src_ptr: int,
+        status_ptr: int = 0,
+        stream_ptr: int = 0,
+    ) -> None:
+        function = self._append_kv_device_slots_on_stream
+        if function is None:
+            raise KcmmError(
+                "KCMM library does not export "
+                "kcmm_append_kv_device_slots_on_stream; rebuild "
+                "libbaseline_llm_os.so"
+            )
+        if batch <= 0:
+            raise ValueError("batch must be positive")
+        if block_offsets_f16_len <= 0:
+            raise ValueError("block_offsets_f16_len must be positive")
+        rc = function(
+            self.handle,
+            layer_idx,
+            int(slot_mapping_ptr),
+            int(block_offsets_f16_ptr),
+            int(block_offsets_f16_len),
+            int(batch),
+            int(k_src_ptr),
+            int(v_src_ptr),
+            int(status_ptr),
+            int(stream_ptr),
+        )
+        self._check(rc, "kcmm_append_kv_device_slots_on_stream")
 
     def paged_attn_decode_f16(
         self,
