@@ -7,15 +7,63 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::cache::fragmentation_tracker::RuntimeFragmentationTracker;
-use crate::cache::paged_kv::{PagedKvCache, BLOCK_SIZE};
-use crate::cache::{EvictedSeqData, SwapManager, advance_epoch, current_epoch};
+use crate::cache::paged_kv::BLOCK_SIZE;
+use crate::cache::{EvictedSeqData, KvCacheBackend, PagedKvCache, SwapManager, advance_epoch, current_epoch};
 use crate::config::ModelConfig;
 use crate::cuda::CudaContext;
 use crate::decoder::greedy_sample;
+#[cfg(feature = "kcmm")]
+use crate::kcmm::KcmmPool;
 use crate::model::Transformer;
 
 use super::static_batch::{InferenceQueue, InferenceRequest, InferenceResponse};
 use super::stats::StatsHandle;
+
+// --- Cache backend enum ---
+
+/// Owned handle that unifies the two cache backends.
+pub enum CacheBackend {
+    Baseline(Arc<PagedKvCache>),
+    #[cfg(feature = "kcmm")]
+    Kcmm(Arc<KcmmPool>),
+}
+
+impl CacheBackend {
+    pub(crate) fn as_trait(&self) -> &dyn KvCacheBackend {
+        match self {
+            CacheBackend::Baseline(c) => c.as_ref(),
+            #[cfg(feature = "kcmm")]
+            CacheBackend::Kcmm(c) => c.as_ref(),
+        }
+    }
+
+    pub(crate) fn is_kcmm(&self) -> bool {
+        #[cfg(feature = "kcmm")]
+        {
+            matches!(self, CacheBackend::Kcmm(_))
+        }
+        #[cfg(not(feature = "kcmm"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "kcmm")]
+    pub(crate) fn kcmm_pool(&self) -> Option<&KcmmPool> {
+        match self {
+            CacheBackend::Kcmm(p) => Some(p),
+            CacheBackend::Baseline(_) => None,
+        }
+    }
+
+    pub(crate) fn paged_kv(&self) -> Option<&PagedKvCache> {
+        match self {
+            CacheBackend::Baseline(c) => Some(c),
+            #[cfg(feature = "kcmm")]
+            CacheBackend::Kcmm(_) => None,
+        }
+    }
+}
 
 /// Maximum number of sequences allowed in the swapped queue.
 const MAX_SWAPPED_SEQS: usize = 256;
@@ -51,18 +99,26 @@ struct SwappedRequest {
     position: usize,
     num_blocks: usize,
     kv_data: EvictedSeqData,
+    /// Pool sequence index (only used in KCMM mode, set to 0 for baseline).
+    seq_idx: usize,
 }
 
 pub struct ContinuousScheduler {
     pub cfg: ModelConfig,
     pub ctx: Arc<CudaContext>,
     pub model: Arc<dyn Transformer>,
-    pub cache: Arc<PagedKvCache>,
     pub max_batch: usize,
     pub max_seq_len: usize,
     pub max_prefill_tokens: usize,
     queue: Arc<InferenceQueue>,
-    swap_manager: SwapManager,
+    /// Unified cache backend enum (avoids downcasting).
+    backend: CacheBackend,
+    /// Swap-manager — only used in Baseline mode when swap is enabled.
+    swap_manager: Option<SwapManager>,
+    /// When true, Baseline mode will NOT use SwapManager — OOM simply
+    /// skips the request.  This is the correct baseline for KCMM comparisons
+    /// (the baseline should represent "no OS-level tiering support").
+    disable_swap: bool,
     /// Swapped-out sequences waiting for GPU memory to become available.
     swapped: Vec<SwappedRequest>,
     /// Per-sequence last-access epoch for LRU victim selection.
@@ -78,26 +134,34 @@ impl ContinuousScheduler {
         cfg: ModelConfig,
         ctx: Arc<CudaContext>,
         model: Arc<dyn Transformer>,
-        cache: PagedKvCache,
         max_batch: usize,
         max_seq_len: usize,
         queue: Arc<InferenceQueue>,
         stats_handle: StatsHandle,
+        backend: CacheBackend,
+        disable_swap: bool,
     ) -> Self {
         // bytes_per_token_elem = kv_heads × head_dim × 2 (one layer of K, f16)
         let bytes_per_token_elem = cfg.kv_heads() * cfg.head_dim() * 2;
         let tracker = RuntimeFragmentationTracker::new(bytes_per_token_elem);
 
+        let swap_manager = if backend.is_kcmm() || disable_swap {
+            None
+        } else {
+            Some(SwapManager::new())
+        };
+
         Self {
             cfg,
             ctx: ctx.clone(),
             model,
-            cache: Arc::new(cache),
             max_batch,
             max_seq_len,
             max_prefill_tokens: 512,
             queue,
-            swap_manager: SwapManager::new(),
+            backend,
+            swap_manager,
+            disable_swap,
             swapped: Vec::new(),
             seq_last_epoch: HashMap::new(),
             tracker,
@@ -186,9 +250,9 @@ impl ContinuousScheduler {
             let prompt_len = waiting[i].0.prompt_tokens.len();
             let blocks_needed = (prompt_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-            match self.cache.alloc_sequence(blocks_needed) {
+            match self.backend.as_trait().alloc_sequence(blocks_needed) {
                 Ok(block_table) => {
-                    let seq_idx = self.cache.register_sequence(block_table);
+                    let seq_idx = self.backend.as_trait().register_sequence(block_table);
                     self.seq_last_epoch
                         .insert(seq_idx, current_epoch());
                     tracing::debug!(
@@ -210,7 +274,7 @@ impl ContinuousScheduler {
                     // No increment of i since we removed element at index i
                 }
                 Err(_e) => {
-                    if free_blocks_available(self.cache.as_ref()) {
+                    if free_blocks_available(self.backend.as_trait()) {
                         // Free blocks exist but alloc_sequence failed —
                         // likely a different error (not OOM). Skip this request.
                         tracing::warn!(
@@ -222,6 +286,133 @@ impl ContinuousScheduler {
                     }
 
                     // VRAM exhausted — try to evict a running sequence
+
+                    // KCMM path: use tiering engine instead of SwapManager
+                    #[cfg(feature = "kcmm")]
+                    if self.backend.is_kcmm() {
+                        // Calculate how many blocks we need to free.
+                        let free_blocks = self
+                            .backend
+                            .kcmm_pool()
+                            .map(|p| p.free_physical_blocks())
+                            .unwrap_or(0);
+                        let needed_blocks =
+                            blocks_needed.saturating_sub(free_blocks);
+
+                        if needed_blocks == 0 {
+                            // Shouldn't happen (alloc_sequence failed but free
+                            // blocks exist), but handle gracefully.
+                            i += 1;
+                            continue;
+                        }
+
+                        // Collect block-granularity victims across potentially
+                        // multiple sequences, respecting priority order.
+                        let mut evicted_total = 0usize;
+                        let mut victims_seen: usize = 0;
+                        let max_victims = running.len().min(4); // at most 4 victims per attempt
+
+                        while evicted_total < needed_blocks && victims_seen < max_victims {
+                            let victim_idx = self.select_victim(running);
+                            let idx = match victim_idx {
+                                Some(i) => i,
+                                None => break,
+                            };
+                            victims_seen += 1;
+
+                            let victim = &running[idx];
+                            let victim_seq_idx = victim.seq_idx;
+
+                            // Collect GPU-resident block handles for this sequence
+                            let candidates: Vec<_> = if let Some(pool) = self.backend.kcmm_pool() {
+                                pool.sequence_gpu_handles(victim_seq_idx)
+                                    .into_iter()
+                                    .map(|(_, h)| h)
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                            if candidates.is_empty() {
+                                // No GPU blocks to evict — skip this victim
+                                continue;
+                            }
+
+                            let to_evict = (needed_blocks - evicted_total).min(candidates.len());
+
+                            if let Some(pool) = self.backend.kcmm_pool() {
+                                if let Some(ref tiering) = pool.tiering {
+                                    match tiering.evict_blocks(
+                                        pool,
+                                        &candidates,
+                                        to_evict,
+                                    ) {
+                                        Ok(evicted) => {
+                                            evicted_total += evicted.len();
+                                            tracing::debug!(
+                                                req_id = victim.req.id,
+                                                seq_idx = victim_seq_idx,
+                                                evicted = evicted.len(),
+                                                total_evicted = evicted_total,
+                                                needed = needed_blocks,
+                                                "KCMM: block-granularity eviction via tiering"
+                                            );
+
+                                            if evicted.len() >= candidates.len() {
+                                                // Fully evicted: move to swapped
+                                                let v = running.remove(idx);
+                                                self.seq_last_epoch.remove(&v.seq_idx);
+                                                let seq_idx = v.seq_idx;
+                                                self.swapped.push(SwappedRequest {
+                                                    request: v.req,
+                                                    tx: v.tx,
+                                                    generated: v.generated,
+                                                    state: v.state,
+                                                    position: v.position,
+                                                    num_blocks: v.num_blocks,
+                                                    kv_data: EvictedSeqData::dummy(),
+                                                    seq_idx,
+                                                });
+                                            }
+                                            // If partially evicted: sequence
+                                            // stays in running with remaining
+                                            // GPU-resident blocks.
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                req_id = victim.req.id,
+                                                "KCMM eviction failed: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if evicted_total >= needed_blocks {
+                            // Freed enough — retry admission
+                            continue;
+                        }
+
+                        // Not enough blocks freed — skip this request
+                        i += 1;
+                        continue;
+                    }
+
+                    // Baseline path with SwapManager disabled:
+                    // KCMM-comparison baseline — no eviction, OOM = skip request.
+                    if self.disable_swap {
+                        tracing::debug!(
+                            req_id = waiting[i].0.id,
+                            blocks_needed,
+                            running = running.len(),
+                            "baseline OOM (swap disabled): deferring request"
+                        );
+                        i += 1;
+                        continue;
+                    }
+
+                    // Baseline path with SwapManager enabled (standalone server mode).
                     if let Some(victim_idx) = self.select_victim(running) {
                         let victim = &running[victim_idx];
                         tracing::info!(
@@ -231,14 +422,14 @@ impl ContinuousScheduler {
                             "preempting sequence to free VRAM"
                         );
 
-                        match self.swap_manager.evict_sequence(
-                            self.cache.as_ref(),
+                        match self.swap_manager.as_ref().unwrap().evict_sequence(
+                            self.backend.as_trait(),
                             victim.seq_idx,
                         ) {
                             Ok(kv_data) => {
                                 let v = running.remove(victim_idx);
                                 self.seq_last_epoch.remove(&v.seq_idx);
-                                self.cache.unregister_sequence(v.seq_idx);
+                                self.backend.as_trait().unregister_sequence(v.seq_idx);
                                 tracing::debug!(
                                     req_id = v.req.id,
                                     "sequence evicted to host, will resume later"
@@ -251,6 +442,7 @@ impl ContinuousScheduler {
                                     position: v.position,
                                     num_blocks: v.num_blocks,
                                     kv_data,
+                                    seq_idx: 0, // baseline: unused
                                 });
                                 // Now retry alloc_sequence for the waiting request
                                 continue; // retry same i
@@ -302,16 +494,67 @@ impl ContinuousScheduler {
             }
 
             let sw = &self.swapped[i];
+
+            // KCMM path: use tiering engine to restore blocks in-place
+            #[cfg(feature = "kcmm")]
+            if self.backend.is_kcmm() {
+                if let Some(pool) = self.backend.kcmm_pool() {
+                    // Get the block table from the pool (sequence is still registered)
+                    let block_table = pool.get_block_table(sw.seq_idx)
+                        .unwrap_or_default();
+                    if !block_table.is_empty() {
+                        match pool.restore_evicted_blocks(&block_table) {
+                            Ok(()) => {
+                                // Mark as active again
+                                pool.touch(sw.seq_idx);
+                                self.seq_last_epoch
+                                    .insert(sw.seq_idx, current_epoch());
+                                tracing::debug!(
+                                    req_id = sw.request.id,
+                                    seq_idx = sw.seq_idx,
+                                    position = sw.position,
+                                    "KCMM: restored evicted sequence"
+                                );
+
+                                running.push(RunningRequest {
+                                    req: sw.request.clone(),
+                                    tx: sw.tx.clone(),
+                                    state: sw.state,
+                                    position: sw.position,
+                                    seq_idx: sw.seq_idx,
+                                    num_blocks: sw.num_blocks,
+                                    generated: sw.generated.clone(),
+                                });
+                                restored.push(i);
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    req_id = sw.request.id,
+                                    seq_idx = sw.seq_idx,
+                                    "KCMM: restore failed: {e}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+
+            // Baseline path: SwapManager
             match self
                 .swap_manager
-                .restore_sequence(self.cache.as_ref(), &sw.kv_data)
+                .as_ref()
+                .unwrap()
+                .restore_sequence(self.backend.as_trait(), &sw.kv_data)
             {
                 Ok(new_block_table) => {
                     // Drop host-side buffers
-                    self.swap_manager.drop_swapped(&sw.kv_data);
+                    self.swap_manager.as_ref().unwrap().drop_swapped(&sw.kv_data);
 
-                    let seq_idx = self.cache.register_sequence(new_block_table);
-                    self.cache.update_seq_len(seq_idx, sw.position);
+                    let seq_idx = self.backend.as_trait().register_sequence(new_block_table);
+                    self.backend.as_trait().update_seq_len(seq_idx, sw.position);
                     self.seq_last_epoch
                         .insert(seq_idx, current_epoch());
                     tracing::debug!(
@@ -365,7 +608,12 @@ impl ContinuousScheduler {
                 let r = running.remove(i);
                 freed_blocks += r.num_blocks;
                 self.seq_last_epoch.remove(&r.seq_idx);
-                self.cache.unregister_sequence(r.seq_idx);
+                // KCMM: cool the sequence so its blocks become preferred eviction targets.
+                #[cfg(feature = "kcmm")]
+                if let Some(pool) = self.backend.kcmm_pool() {
+                    pool.cool(r.seq_idx);
+                }
+                self.backend.as_trait().unregister_sequence(r.seq_idx);
                 let _ = r.tx.send(InferenceResponse {
                     id: r.req.id,
                     generated_tokens: r.generated,
@@ -403,7 +651,23 @@ impl ContinuousScheduler {
 
         for i in done.into_iter().rev() {
             let sw = self.swapped.remove(i);
-            self.swap_manager.drop_swapped(&sw.kv_data);
+
+            // KCMM: unregister the sequence from the pool (frees all blocks,
+            // including CpuResident ones managed by the tiering engine).
+            #[cfg(feature = "kcmm")]
+            if self.backend.is_kcmm() {
+                if let Some(pool) = self.backend.kcmm_pool() {
+                    pool.unregister_sequence(sw.seq_idx);
+                }
+            }
+
+            // Baseline: free host-side swap buffers.
+            if !self.backend.is_kcmm() {
+                if let Some(ref sm) = self.swap_manager {
+                    sm.drop_swapped(&sw.kv_data);
+                }
+            }
+
             let _ = sw.tx.send(InferenceResponse {
                 id: sw.request.id,
                 generated_tokens: sw.generated,
@@ -429,9 +693,9 @@ impl ContinuousScheduler {
         for r in running.iter_mut() {
             let blocks_needed = (r.position / BLOCK_SIZE) + 1;
             while blocks_needed > r.num_blocks {
-                match self.cache.alloc_block() {
+                match self.backend.as_trait().alloc_block() {
                     Ok(block_idx) => {
-                        self.cache
+                        self.backend.as_trait()
                             .append_block_to_sequence(r.seq_idx, block_idx);
                         r.num_blocks += 1;
                     }
@@ -452,6 +716,11 @@ impl ContinuousScheduler {
         let epoch = current_epoch();
         for r in running.iter() {
             self.seq_last_epoch.insert(r.seq_idx, epoch);
+            // KCMM: mark sequence as recently accessed for eviction policy
+            #[cfg(feature = "kcmm")]
+            if let Some(pool) = self.backend.kcmm_pool() {
+                pool.touch(r.seq_idx);
+            }
         }
 
         // Run the transformer forward step (per-layer GEMM + KV cache write)
@@ -463,7 +732,7 @@ impl ContinuousScheduler {
         }).collect();
         let logits = self.model.forward_step_paged(
             &mut hidden,
-            &self.cache,
+            self.backend.as_trait(),
             &seq_indices,
             &token_ids,
             &positions,
@@ -481,7 +750,7 @@ impl ContinuousScheduler {
                     // Blocks are pre-allocated for the full prompt length;
                     // report seq_len = full prompt_len for fragmentation
                     // tracking so IFR is not inflated during prefill ramp.
-                    self.cache
+                    self.backend.as_trait()
                         .update_seq_len(r.seq_idx, r.req.prompt_tokens.len());
                     if new_pos >= r.req.prompt_tokens.len() {
                         r.state = RequestState::Decode;
@@ -500,7 +769,7 @@ impl ContinuousScheduler {
                 RequestState::Decode => {
                     r.generated.push(next[b]);
                     r.position += 1;
-                    self.cache.update_seq_len(r.seq_idx, r.position);
+                    self.backend.as_trait().update_seq_len(r.seq_idx, r.position);
                 }
             }
         }
@@ -511,7 +780,11 @@ impl ContinuousScheduler {
     /// Record a unified fragmentation snapshot from the current cache state
     /// and publish it to the shared stats handle for the server to query.
     fn record_fragmentation_snapshot(&mut self) {
-        self.tracker.record_unified(&self.cache);
+        // Baseline mode: use the fragmentation tracker with the concrete PagedKvCache.
+        // KCMM mode: KcmmPool tracks its own fragmentation internally.
+        if let Some(paged) = self.backend.paged_kv() {
+            self.tracker.record_unified(paged);
+        }
 
         let snapshot = self.tracker.unified_summary();
         let latest_unified = self
@@ -532,16 +805,27 @@ impl ContinuousScheduler {
     /// Select a victim sequence from the running set for eviction.
     /// Returns the index in the running Vec, or None if no sequence can be evicted.
     ///
-    /// Policy: LRU — the sequence with the smallest (oldest) epoch.
-    /// Among sequences with the same epoch, prefer those with more blocks
-    /// (fewer evictions needed to free a given amount of memory).
+    /// Priority-aware LRU:
+    ///   1. EVICTABLE sequences first (can be discarded without restore)
+    ///   2. LOW priority sequences
+    ///   3. NORMAL priority sequences
+    ///   4. HIGH priority sequences (last resort)
+    ///
+    /// Within each priority tier, uses epoch-based LRU with block-count
+    /// tiebreaker (prefer more blocks → fewer evictions to free memory).
     fn select_victim(&self, running: &[RunningRequest]) -> Option<usize> {
         if running.is_empty() {
             return None;
         }
 
-        // Don't preempt sequences still in Prefill.
-        let mut best: Option<(usize, u64, isize)> = None; // (idx, epoch, -blocks)
+        // Try each priority tier in order.
+        // We fold into a single pass by scoring candidates.
+        // Scoring: (priority_tier, epoch, -blocks) — lower = evict first.
+
+        #[cfg(feature = "kcmm")]
+        let pool = self.backend.kcmm_pool();
+
+        let mut best: Option<(usize, u32, u64, isize)> = None; // (idx, prio_tier, epoch, -blocks)
 
         for (i, r) in running.iter().enumerate() {
             if matches!(r.state, RequestState::Prefill { .. }) {
@@ -551,15 +835,33 @@ impl ContinuousScheduler {
             let epoch = self.seq_last_epoch.get(&r.seq_idx).copied().unwrap_or(0);
             let blocks = -(r.num_blocks as isize);
 
+            // Determine priority tier (0 = evictable, 1 = low, 2 = normal, 3 = high)
+            #[cfg(feature = "kcmm")]
+            let prio_tier: u32 = {
+                if let Some(ref p) = pool {
+                    match p.sequence_priority(r.seq_idx) {
+                        crate::kcmm::pool::SequencePriority::Evictable => 0,
+                        crate::kcmm::pool::SequencePriority::Low => 1,
+                        crate::kcmm::pool::SequencePriority::Normal => 2,
+                        crate::kcmm::pool::SequencePriority::High => 3,
+                    }
+                } else {
+                    2 // default normal
+                }
+            };
+            #[cfg(not(feature = "kcmm"))]
+            let prio_tier: u32 = 2; // normal
+
             match best {
                 None => {
-                    best = Some((i, epoch, blocks));
+                    best = Some((i, prio_tier, epoch, blocks));
                 }
-                Some((_, best_epoch, best_blocks)) => {
-                    if epoch < best_epoch
-                        || (epoch == best_epoch && blocks < best_blocks)
+                Some((_, best_tier, best_epoch, best_blocks)) => {
+                    if prio_tier < best_tier
+                        || (prio_tier == best_tier && epoch < best_epoch)
+                        || (prio_tier == best_tier && epoch == best_epoch && blocks < best_blocks)
                     {
-                        best = Some((i, epoch, blocks));
+                        best = Some((i, prio_tier, epoch, blocks));
                     }
                 }
             }
@@ -570,27 +872,44 @@ impl ContinuousScheduler {
             for (i, r) in running.iter().enumerate() {
                 let epoch = self.seq_last_epoch.get(&r.seq_idx).copied().unwrap_or(0);
                 let blocks = -(r.num_blocks as isize);
+                #[cfg(feature = "kcmm")]
+                let prio_tier: u32 = {
+                    if let Some(ref p) = pool {
+                        match p.sequence_priority(r.seq_idx) {
+                            crate::kcmm::pool::SequencePriority::Evictable => 0,
+                            crate::kcmm::pool::SequencePriority::Low => 1,
+                            crate::kcmm::pool::SequencePriority::Normal => 2,
+                            crate::kcmm::pool::SequencePriority::High => 3,
+                        }
+                    } else {
+                        2
+                    }
+                };
+                #[cfg(not(feature = "kcmm"))]
+                let prio_tier: u32 = 2;
+
                 match best {
                     None => {
-                        best = Some((i, epoch, blocks));
+                        best = Some((i, prio_tier, epoch, blocks));
                     }
-                    Some((_, best_epoch, best_blocks)) => {
-                        if epoch < best_epoch
-                            || (epoch == best_epoch && blocks < best_blocks)
+                    Some((_, best_tier, best_epoch, best_blocks)) => {
+                        if prio_tier < best_tier
+                            || (prio_tier == best_tier && epoch < best_epoch)
+                            || (prio_tier == best_tier && epoch == best_epoch && blocks < best_blocks)
                         {
-                            best = Some((i, epoch, blocks));
+                            best = Some((i, prio_tier, epoch, blocks));
                         }
                     }
                 }
             }
         }
 
-        best.map(|(i, _, _)| i)
+        best.map(|(i, _, _, _)| i)
     }
 }
 
 /// Check if there are free blocks available in the allocator pool.
-fn free_blocks_available(cache: &PagedKvCache) -> bool {
+fn free_blocks_available(cache: &dyn KvCacheBackend) -> bool {
     cache.has_free_blocks()
 }
 
@@ -646,11 +965,12 @@ mod integration_tests {
             cfg.clone(),
             ctx.clone(),
             model,
-            cache,
             max_batch,
             max_seq_len,
             queue.clone(),
             stats,
+            CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
         );
         let _h = sched.spawn();
 
@@ -708,11 +1028,12 @@ mod integration_tests {
             cfg.clone(),
             ctx.clone(),
             model,
-            cache,
             max_batch,
             max_seq_len,
             queue.clone(),
             stats,
+            CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
         );
         let _h = sched.spawn();
 
@@ -732,5 +1053,213 @@ mod integration_tests {
             "should stop at EOS token 0"
         );
         assert_eq!(resp.generated_tokens[0], 0);
+    }
+
+    /// Test that the scheduler handles multiple requests correctly by
+    /// submitting several requests and verifying all complete.
+    #[test]
+    fn e2e_multiple_requests() {
+        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+        let cfg = small_config();
+        let max_batch = 4;
+        let max_seq_len = 64;
+        let block_size = 16;
+
+        let weights = ModelWeights::empty(&cfg);
+        let model = Arc::new(
+            NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights).expect("model"),
+        );
+
+        let cache = PagedKvCache::new(
+            ctx.clone(),
+            cfg.clone(),
+            max_batch,
+            max_seq_len,
+            block_size,
+        )
+        .expect("PagedKvCache");
+
+        let queue = Arc::new(InferenceQueue::new());
+
+        let stats = StatsHandle::new();
+        let sched = ContinuousScheduler::new(
+            cfg.clone(),
+            ctx.clone(),
+            model,
+            max_batch,
+            max_seq_len,
+            queue.clone(),
+            stats,
+            CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
+        );
+        let _h = sched.spawn();
+
+        // Submit 4 requests concurrently
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let q = queue.clone();
+            handles.push(std::thread::spawn(move || {
+                let req = InferenceRequest {
+                    id: 300 + i,
+                    prompt_tokens: vec![1, 2, 3],
+                    max_new_tokens: 3,
+                    eos_token_id: 2,
+                };
+                q.submit_blocking(req).expect("response")
+            }));
+        }
+
+        for h in handles {
+            let resp = h.join().unwrap();
+            assert_eq!(resp.generated_tokens.len(), 3);
+            assert!(resp.generated_tokens.iter().all(|&t| t == 0));
+        }
+    }
+
+    /// Test the LRU victim selection logic in isolation.
+    #[test]
+    #[allow(unused_mut)]
+    fn test_select_victim_logic() {
+        // We can test select_victim by creating a scheduler with no cache needed
+        // and directly calling select_victim on manually crafted RunningRequests.
+        // Since select_victim only looks at seq_last_epoch and num_blocks,
+        // we can test it without a real cache.
+        let cfg = small_config();
+        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+        let weights = ModelWeights::empty(&cfg);
+        let model = Arc::new(
+            NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights).expect("model"),
+        );
+        let cache = PagedKvCache::new(ctx.clone(), cfg.clone(), 4, 64, 16)
+            .expect("PagedKvCache");
+        let queue = Arc::new(InferenceQueue::new());
+        let stats = StatsHandle::new();
+
+        let mut sched = ContinuousScheduler::new(
+            cfg, ctx, model, 4, 64, queue, stats, CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
+        );
+
+        // Create mock running requests
+        let req_base = InferenceRequest {
+            id: 0,
+            prompt_tokens: vec![1],
+            max_new_tokens: 10,
+            eos_token_id: 2,
+        };
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+
+        let running = vec![
+            RunningRequest {
+                req: InferenceRequest { id: 10, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Decode,
+                position: 0,
+                seq_idx: 100,
+                num_blocks: 3,
+                generated: vec![],
+            },
+            RunningRequest {
+                req: InferenceRequest { id: 20, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Decode,
+                position: 0,
+                seq_idx: 200,
+                num_blocks: 5,
+                generated: vec![],
+            },
+            RunningRequest {
+                req: InferenceRequest { id: 30, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Prefill { prompt_pos: 0 },
+                position: 0,
+                seq_idx: 300,
+                num_blocks: 2,
+                generated: vec![],
+            },
+        ];
+
+        // All have epoch 0 (not in seq_last_epoch → default 0)
+        // seq 100: 3 blocks, seq 200: 5 blocks
+        // Both decode-stage, same epoch → larger block count (200) preferred
+        let victim = sched.select_victim(&running);
+        assert!(victim.is_some());
+        let idx = victim.unwrap();
+        assert_eq!(idx, 1, "should pick seq 200 (more blocks, same epoch)");
+
+        // Give seq 100 a newer epoch → seq 200 (epoch 0) is now older
+        sched.seq_last_epoch.insert(100, 10);
+        let victim2 = sched.select_victim(&running);
+        assert_eq!(victim2, Some(1), "should pick seq 200 (older epoch 0)");
+
+        // Both decode sequences with newer epoch, victim should be seq 200 (epoch 0)
+        sched.seq_last_epoch.insert(200, 5);
+        let victim3 = sched.select_victim(&running);
+        assert_eq!(victim3, Some(1), "should pick seq 200 (epoch 5 < epoch 10)");
+
+        // No decode-stage → falls back to any sequence.
+        // Reconstruct a prefill-only running list using index lookup.
+        let victim4 = sched.select_victim(&running[2..3]);
+        assert_eq!(victim4, Some(0), "should fall back to prefill-only sequence");
+
+        // Empty running → None
+        let victim5 = sched.select_victim(&[]);
+        assert!(victim5.is_none());
+    }
+
+    /// Test that prefill-stage sequences are skipped during victim selection
+    /// when decode-stage sequences exist.
+    #[test]
+    #[allow(unused_mut)]
+    fn test_select_victim_skips_prefill() {
+        let cfg = small_config();
+        let ctx = Arc::new(CudaContext::new(0).expect("cuda device 0"));
+        let weights = ModelWeights::empty(&cfg);
+        let model = Arc::new(
+            NaiveTransformer::new(ctx.clone(), cfg.clone(), &weights).expect("model"),
+        );
+        let cache = PagedKvCache::new(ctx.clone(), cfg.clone(), 4, 64, 16)
+            .expect("PagedKvCache");
+        let queue = Arc::new(InferenceQueue::new());
+        let stats = StatsHandle::new();
+
+        let mut sched = ContinuousScheduler::new(
+            cfg, ctx, model, 4, 64, queue, stats, CacheBackend::Baseline(Arc::new(cache)),
+            true, // disable_swap: baseline for KCMM comparison
+        );
+
+        let req_base = InferenceRequest {
+            id: 0,
+            prompt_tokens: vec![1],
+            max_new_tokens: 10,
+            eos_token_id: 2,
+        };
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+
+        let running = vec![
+            RunningRequest {
+                req: InferenceRequest { id: 50, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Prefill { prompt_pos: 0 },
+                position: 0,
+                seq_idx: 50,
+                num_blocks: 10, // many blocks, but in prefill → should be skipped
+                generated: vec![],
+            },
+            RunningRequest {
+                req: InferenceRequest { id: 60, ..req_base.clone() },
+                tx: tx.clone(),
+                state: RequestState::Decode,
+                position: 0,
+                seq_idx: 60,
+                num_blocks: 1, // few blocks, but in decode → should be selected
+                generated: vec![],
+            },
+        ];
+
+        // seq 60 has epoch 0 (default), seq 50 has epoch 0 but is prefill
+        let victim = sched.select_victim(&running);
+        assert_eq!(victim, Some(1), "should pick decode-stage seq 60, not prefill seq 50");
     }
 }

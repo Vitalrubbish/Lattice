@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::KvCache;
-use crate::cache::paged_kv::PagedKvCache;
+use crate::cache::KvCacheBackend;
 use crate::config::ModelConfig;
 use crate::cuda::{runtime::Blas, CudaContext};
 
@@ -41,7 +41,7 @@ pub trait Transformer: Send + Sync {
     fn forward_step_paged(
         &self,
         hidden: &mut CudaSlice<f16>,
-        cache: &PagedKvCache,
+        cache: &dyn KvCacheBackend,
         seq_indices: &[usize],
         token_ids: &[u32],
         positions: &[usize],
@@ -50,7 +50,7 @@ pub trait Transformer: Send + Sync {
     fn prefill_paged(
         &self,
         hidden: &mut CudaSlice<f16>,
-        cache: &PagedKvCache,
+        cache: &dyn KvCacheBackend,
         seq_indices: &[usize],
         token_ids: &[u32],
         seq_len: usize,
@@ -130,11 +130,11 @@ impl NaiveTransformer {
     }
 
     /// Paged KV cache variant: one forward step for all layers.
-    /// `seq_indices` are indices into PagedKvCache.seq_metadata.
+    /// `seq_indices` are indices into the cache backend's sequence table.
     pub fn forward_step_paged(
         &self,
         hidden: &mut CudaSlice<f16>,
-        cache: &PagedKvCache,
+        cache: &dyn KvCacheBackend,
         seq_indices: &[usize],
         positions: &[usize],
     ) -> Result<Vec<f32>> {
@@ -146,7 +146,7 @@ impl NaiveTransformer {
         for (i, w) in self.layers.iter().enumerate() {
             self.blas.hgemm(hidden, w, &mut tmp, batch as i32, h as i32, h as i32)?;
             std::mem::swap(hidden, &mut tmp);
-            cache.append_step(i, seq_indices, positions, hidden)?;
+            cache.append_kv_step(i, seq_indices, positions, hidden, hidden)?;
         }
 
         let mut logits = self.ctx.device.alloc_zeros::<f16>(batch * self.cfg.vocab_size)?;
@@ -164,7 +164,7 @@ impl NaiveTransformer {
     pub fn prefill_paged(
         &self,
         hidden: &mut CudaSlice<f16>,
-        cache: &PagedKvCache,
+        cache: &dyn KvCacheBackend,
         seq_indices: &[usize],
         seq_len: usize,
     ) -> Result<Duration> {
@@ -204,7 +204,7 @@ impl Transformer for NaiveTransformer {
     fn forward_step_paged(
         &self,
         hidden: &mut CudaSlice<f16>,
-        cache: &PagedKvCache,
+        cache: &dyn KvCacheBackend,
         seq_indices: &[usize],
         _token_ids: &[u32],
         positions: &[usize],
@@ -215,7 +215,7 @@ impl Transformer for NaiveTransformer {
     fn prefill_paged(
         &self,
         hidden: &mut CudaSlice<f16>,
-        cache: &PagedKvCache,
+        cache: &dyn KvCacheBackend,
         seq_indices: &[usize],
         _token_ids: &[u32],
         seq_len: usize,

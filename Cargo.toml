@@ -21,8 +21,15 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 gds = []
+kcmm = []
 
 [[bin]]
 name = "baseline-server"

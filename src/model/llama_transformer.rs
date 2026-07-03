@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::KvCache;
-use crate::cache::paged_kv::PagedKvCache;
+use crate::cache::KvCacheBackend;
 use crate::config::ModelConfig;
 use crate::cuda::kernels::{
     GpuKernels, launch_add, launch_contig_attn_decode, launch_paged_attn_decode, launch_rms_norm,
@@ -259,7 +259,7 @@ impl Transformer for LlamaTransformer {
         Ok(t.elapsed())
     }
 
-    fn forward_step_paged(&self, hidden: &mut CudaSlice<f16>, cache: &PagedKvCache, seq_indices: &[usize], token_ids: &[u32], positions: &[usize]) -> Result<Vec<f32>> {
+    fn forward_step_paged(&self, hidden: &mut CudaSlice<f16>, cache: &dyn KvCacheBackend, seq_indices: &[usize], token_ids: &[u32], positions: &[usize]) -> Result<Vec<f32>> {
         // Embed tokens
         let h = self.h();
         let embed_ptr = self._weights.try_get("model.embed_tokens.weight").map(|t| t.device_ptr()).unwrap_or(0);
@@ -283,8 +283,24 @@ impl Transformer for LlamaTransformer {
         let nheads = self.num_heads;
         let kvh = self.kv_heads;
         let kvd = self.kv_head_dim;
-        let block_size = cache.block_size;
-        let max_bps = cache.max_blocks_per_seq;
+        let block_size = cache.block_size();
+        let max_bps = cache.max_blocks_per_seq();
+
+        // Cache block tables and sequence lengths before the per-layer loop.
+        // These are invariant during a forward step and were previously
+        // rebuilt per layer (including a Vec<u32> clone per sequence).
+        let mut block_tables: Vec<i32> = vec![0i32; batch * max_bps];
+        let mut seq_lens: Vec<i32> = vec![0i32; batch];
+        for b in 0..batch {
+            let seq_idx = seq_indices[b];
+            seq_lens[b] = cache.get_seq_len(seq_idx) as i32;
+            let bt_start = b * max_bps;
+            if let Some(bt) = cache.get_block_table(seq_idx) {
+                for (j, &blk) in bt.iter().enumerate() {
+                    if j < max_bps { block_tables[bt_start + j] = blk as i32; }
+                }
+            }
+        }
 
         for li in 0..self.cfg.num_hidden_layers {
             let lw = &self.layers[li];
@@ -319,22 +335,8 @@ impl Transformer for LlamaTransformer {
             // Paged attention
             let mut attn = self.ctx.device.alloc_zeros::<f16>(batch * h)?;
             {
-                // Build per-sequence block tables and seq_lens on GPU
-                let meta = cache.seq_metadata.lock();
-                let mut block_tables: Vec<i32> = vec![0i32; batch * max_bps];
-                let mut seq_lens: Vec<i32> = vec![0i32; batch];
-                for b in 0..batch {
-                    let seq_idx = seq_indices[b];
-                    let seq = &meta[seq_idx];
-                    seq_lens[b] = seq.seq_len as i32;
-                    let bt_start = b * max_bps;
-                    for (j, &blk) in seq.block_table.iter().enumerate() {
-                        if j < max_bps { block_tables[bt_start + j] = blk as i32; }
-                    }
-                }
-                drop(meta);
-                let bt_dev = self.ctx.device.htod_copy(block_tables)?;
-                let sl_dev = self.ctx.device.htod_copy(seq_lens)?;
+                let bt_dev = self.ctx.device.htod_copy(block_tables.clone())?;
+                let sl_dev = self.ctx.device.htod_copy(seq_lens.clone())?;
 
                 // Create temp slices for VA bases
                 let va_k_base: u64 = cache.va_k(li);
@@ -388,7 +390,7 @@ impl Transformer for LlamaTransformer {
         Ok(out.iter().map(|x| x.to_f32()).collect())
     }
 
-    fn prefill_paged(&self, hidden: &mut CudaSlice<f16>, cache: &PagedKvCache, seq_indices: &[usize], token_ids: &[u32], seq_len: usize) -> Result<Duration> {
+    fn prefill_paged(&self, hidden: &mut CudaSlice<f16>, cache: &dyn KvCacheBackend, seq_indices: &[usize], token_ids: &[u32], seq_len: usize) -> Result<Duration> {
         let t = std::time::Instant::now();
         let batch = seq_indices.len();
         for pos in 0..seq_len {

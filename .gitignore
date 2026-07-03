@@ -5,7 +5,6 @@
 *.profraw
 perf.data*
 flamegraph.svg
-AGENTS.md
 CLAUDE.md
 results
 .claude
@@ -13,3 +12,6 @@ results
 __pycache__/
 cufile.log
 scripts/load_trace_qwen.sh
+docs/task/kcmm-kernel-modifications.md
+.local/
+.scratch/kcmm-vllm/
