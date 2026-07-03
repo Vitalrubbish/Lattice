@@ -779,21 +779,24 @@ cache-hit checks avoid converting cached tensor devices to strings. Device-slot
 writes also use the original vLLM `slot_mapping` tensor directly when it is
 already CUDA, 1-D, contiguous, and `torch.int64`; fallback reshape, dtype
 conversion, and contiguous-copy counts are reported and must stay at zero in
-performance-clean runs for the current vLLM 0.6.1 eager seam. The stream
-provider still queries PyTorch's current CUDA stream on every read/write seam,
-but caches each device's default stream pointer after the first lookup.
+performance-clean runs for the current vLLM 0.6.1 eager seam. Canonical
+contiguous key/value write tensors use a direct `view(batch, -1)` row fast path;
+non-contiguous batched tensors keep the compact-copy fallback because the
+current write ABI assumes compact source rows. The stream provider still queries
+PyTorch's current CUDA stream on every read/write seam, but caches each device's
+default stream pointer after the first lookup.
 Correctness gates keep per-update reports, block-table validation, row
 verification, and the host-slot writer enabled by default for better failure
 diagnostics.
 
-Latest local performance-clean result on 2026-07-02 after fast-pathing canonical
-device-slot mappings:
+Latest local performance-clean result on 2026-07-03 after fast-pathing canonical
+KV write rows:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-slot-fastpath-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-row-fastpath-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-slot-fastpath-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-row-fastpath-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Model: `facebook/opt-125m`
@@ -808,7 +811,7 @@ device-slot mappings:
 - Read detailed plan metadata calls: `0`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `94.095ms`
+- Read GPU kernel precompile elapsed: `95.495ms`
 - Read stream select/current/cache hits/cache misses: `372/372/371/1`
 - Lightweight read total-block calls: `372`
 - Write pool shape cached/refreshes: `true/1`
@@ -817,8 +820,9 @@ device-slot mappings:
 - Device-slot write enabled/active: `true/true`
 - Device-slot write calls: `384`
 - Device-slot write-kernel precompile requested/succeeded/calls: `true/true/1`
-- Device-slot write-kernel precompile elapsed: `78.389ms`
+- Device-slot write-kernel precompile elapsed: `79.432ms`
 - Device-slot prepare direct/reshape/dtype/copy calls: `384/0/0/0`
+- Row prepare direct/fallback/contiguous-copy calls: `372/12/24`
 - Device-slot total-block refreshes: `3`
 - Device-slot block-state epoch queries: `387`
 - Device-slot table device index: `0`
@@ -833,12 +837,13 @@ device-slot mappings:
 - Write tracker report writes: `1`
 - Stream-level write verification synchronizations: `0`
 - KCMM write verification enabled: `false`
-- Request latency seconds: stock `1.814`, KCMM `1.811`, ratio `0.998`
-- Tokens per second: stock `17.641`, KCMM `17.670`, ratio `1.002`
+- Request latency seconds: stock `1.785`, KCMM `1.803`, ratio `1.010`
+- Tokens per second: stock `17.927`, KCMM `17.748`, ratio `0.990`
 - Peak GPU memory delta MiB: stock `5441`, KCMM `5591`, ratio `1.028`
-- Compared with the previous device-key run, the gate now verifies that every
-  device-slot write uses the direct `slot_mapping` prepare fast path and that no
-  reshape, dtype conversion, or contiguous copy fallback was needed.
+- Compared with the previous slot-mapping fast-path run, the single-request
+  gate now verifies that canonical contiguous K/V rows take the direct row-view
+  path. The remaining `12` row fallback calls correspond to non-contiguous
+  prefill tensors and require compact copies under the current ABI.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 For concurrent real-model performance-clean coverage, use the stress wrapper:
@@ -858,19 +863,19 @@ report does not observe a decode batch of at least `2`, so it validates that the
 fast path is exercised under concurrent vLLM scheduling. It also inherits the
 device-slot KV write requirement from the performance-clean gate.
 
-Latest local performance-clean stress result on 2026-07-02:
+Latest local performance-clean stress result on 2026-07-03:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_stress_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-slot-fastpath-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_perf_clean_stress_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-row-fastpath-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-slot-fastpath-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-perf-clean-stress-row-fastpath-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - Coverage cases: `stress_history`, `stress_memory`
 - Completion concurrency: `2`
 - Observed max read batch: `2`
-- Observed max write batch: `9`
+- Observed max write batch: `17`
 - GPU read kernel calls: `276`
 - Stream-aware read kernel calls: `276`
 - Reference KCMM read bytes: `0`
@@ -878,27 +883,28 @@ Latest local performance-clean stress result on 2026-07-02:
 - Read detailed plan metadata calls: `0`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `92.155ms`
+- Read GPU kernel precompile elapsed: `94.866ms`
 - Read stream select/current/cache hits/cache misses: `276/276/275/1`
 - Offset table cache hits/rebuilds: `273/3`
 - Device-slot write enabled/active: `true/true`
-- Device-slot write calls: `300`
+- Device-slot write calls: `288`
 - Device-slot write-kernel precompile requested/succeeded/calls: `true/true/1`
-- Device-slot write-kernel precompile elapsed: `76.645ms`
-- Device-slot prepare direct/reshape/dtype/copy calls: `300/0/0/0`
-- Device-slot total-block refreshes: `4`
-- Device-slot block-state epoch queries: `304`
+- Device-slot write-kernel precompile elapsed: `77.084ms`
+- Device-slot prepare direct/reshape/dtype/copy calls: `288/0/0/0`
+- Row prepare direct/fallback/contiguous-copy calls: `0/288/576`
+- Device-slot total-block refreshes: `3`
+- Device-slot block-state epoch queries: `291`
 - Device-slot table device index: `0`
 - Host-slot write calls: `0`
-- Device-slot status checks/errors: `300/0`
-- Device-slot status codes: `{"0": 300}`
-- Device-slot offset table cache hits/rebuilds: `296/4`
-- Device-slot valid table cache hits/rebuilds: `296/4`
-- Write stream select/current/cache hits/cache misses: `300/300/299/1`
+- Device-slot status checks/errors: `288/0`
+- Device-slot status codes: `{"0": 288}`
+- Device-slot offset table cache hits/rebuilds: `285/3`
+- Device-slot valid table cache hits/rebuilds: `285/3`
+- Write stream select/current/cache hits/cache misses: `288/288/287/1`
 - Write verification enabled: `false`
 - KCMM write verified rows: `0`
-- Request latency seconds: stock `1.796`, KCMM `1.776`, ratio `0.989`
-- Tokens per second: stock `26.726`, KCMM `27.027`, ratio `1.011`
+- Request latency seconds: stock `1.787`, KCMM `1.776`, ratio `0.994`
+- Tokens per second: stock `26.861`, KCMM `27.027`, ratio `1.006`
 - Peak GPU memory delta MiB: stock `5443`, KCMM `5593`, ratio `1.028`
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
@@ -919,14 +925,14 @@ tracker final reports without enabling CUDA event profiling or per-update report
 writes. The timings are nested diagnostic sections; do not sum them as
 independent request-level costs.
 
-Latest local host-profile result on 2026-07-02 after fast-pathing canonical
-device-slot mappings:
+Latest local host-profile result on 2026-07-03 after fast-pathing canonical KV
+write rows:
 
 - Command:
-  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_host_profile_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-slot-fastpath-latest.json`
+  `/home/zhuoxiang/miniconda3/envs/vllm-cu118/bin/python -m scripts.kcmm.vllm_gpu_read_host_profile_gate --no-build-kcmm --no-print-seams --timeout-seconds 420 --shutdown-timeout-seconds 60 --output /tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-row-fastpath-latest.json`
 - Result: `passed=true`
 - Report:
-  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-slot-fastpath-latest.json`
+  `/tmp/kcmm-vllm-phase-ii-c-gpu-read-host-profile-row-fastpath-latest.json`
 - Correctness failures: `[]`
 - Performance warnings: `[]`
 - GPU read kernel calls: `372`
@@ -934,7 +940,7 @@ device-slot mappings:
 - Reference KCMM read bytes: `0`
 - Read fast current-context launch: `true`
 - Read GPU kernel precompile requested/succeeded/calls: `true/true/1`
-- Read GPU kernel precompile elapsed: `94.698ms`
+- Read GPU kernel precompile elapsed: `94.251ms`
 - Read compact plan metadata enabled/calls: `true/372`
 - Read detailed plan metadata calls: `0`
 - Read stream select/current/cache hits/cache misses: `372/372/371/1`
@@ -943,38 +949,37 @@ device-slot mappings:
 - Cached write pool shape: `block_size=16`, `block_bytes=24576`,
   `step_elements=768`, `num_layers=12`
 - Device-slot write-kernel precompile requested/succeeded/calls: `true/true/1`
-- Device-slot write-kernel precompile elapsed: `78.704ms`
+- Device-slot write-kernel precompile elapsed: `76.770ms`
 - Device-slot write calls: `384`
 - Device-slot prepare direct/reshape/dtype/copy calls: `384/0/0/0`
+- Row prepare direct/fallback/contiguous-copy calls: `372/12/24`
 - Device-slot total-block refreshes: `3`
 - Device-slot block-state epoch queries: `387`
 - Device-slot table device index: `0`
 - Host-slot write calls: `0`
 - Offset table cache hits/rebuilds: `369/3`
 - Write stream select/current/cache hits/cache misses: `384/384/383/1`
-- Request latency seconds: stock `1.835`, KCMM `1.820`, ratio `0.992`
-- Tokens per second: stock `17.439`, KCMM `17.582`, ratio `1.008`
-- Top read host sections: `read_gpu_kernel_precompile=94.706ms`,
-  `read_replace_call_total=33.276ms`,
-  `read_replace_gpu_kernel_host=18.260ms`,
-  `read_gpu_kernel_host_total=17.243ms`,
-  `read_replace_build_plan=12.009ms`,
-  `read_build_plan_total=11.041ms`,
-  `read_gpu_kernel_ctypes_launch=6.023ms`,
-  `read_gpu_kernel_select_stream=3.368ms`.
-- Top write host sections: `write_device_slot_kernel_precompile=78.714ms`,
-  `write_mirror_call_total=35.141ms`,
-  `write_select_stream=4.222ms`,
-  `write_ctypes_launch=3.776ms`,
-  `write_prepare_rows=2.705ms`,
-  `write_device_slot_table_lookup=2.296ms`,
-  `write_layer_for_cache=0.974ms`,
-  `write_validate_dtype=0.897ms`.
+- Request latency seconds: stock `1.852`, KCMM `1.823`, ratio `0.984`
+- Tokens per second: stock `17.279`, KCMM `17.553`, ratio `1.016`
+- Top read host sections: `read_gpu_kernel_precompile=94.257ms`,
+  `read_replace_call_total=33.352ms`,
+  `read_replace_gpu_kernel_host=18.259ms`,
+  `read_gpu_kernel_host_total=17.255ms`,
+  `read_replace_build_plan=12.060ms`,
+  `read_build_plan_total=11.123ms`,
+  `read_gpu_kernel_ctypes_launch=6.086ms`,
+  `read_gpu_kernel_select_stream=3.233ms`.
+- Top write host sections: `write_device_slot_kernel_precompile=76.782ms`,
+  `write_mirror_call_total=34.539ms`,
+  `write_select_stream=4.103ms`,
+  `write_ctypes_launch=3.906ms`,
+  `write_prepare_rows=2.394ms`,
+  `write_device_slot_table_lookup=2.210ms`,
+  `write_layer_for_cache=0.981ms`,
+  `write_validate_dtype=0.971ms`.
 - Compared with the host-profile run immediately before this issue,
-  `write_device_slot_prepare_tensor` dropped from `1.939ms` total to `0.790ms`
-  and no longer appears in the top eight write sections. The direct
-  `slot_mapping` prepare fast path covered `384/384` device-slot writes, with
-  zero reshape, dtype conversion, or contiguous-copy fallbacks.
+  `write_prepare_rows` dropped from `2.705ms` total to `2.394ms`, while
+  `write_mirror_call_total` dropped from `35.141ms` total to `34.539ms`.
 - GPU memory returned to 0 MiB on both RTX 3080 GPUs after the run.
 
 Latest local performance characterization on 2026-06-20:

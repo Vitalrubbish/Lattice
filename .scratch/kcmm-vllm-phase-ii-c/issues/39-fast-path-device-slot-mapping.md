@@ -118,8 +118,8 @@ Host-profile:
 
 ## Follow-up
 
-The next visible write-side costs are stream selection, ctypes launch, row
-preparation, and device-slot table lookup. Further improvements probably need a
-larger design choice: either reduce Python/ctypes launch overhead, cache or
-move more row-shape validation out of the hot path, or introduce a lower-level
-combined launch path.
+Completed by Issue 40: canonical contiguous K/V write rows now use a direct
+`view(batch, -1)` fast path, reducing `write_prepare_rows` from `2.705ms` total
+to `2.394ms` total in the local host-profile gate. Remaining follow-up should
+focus on stream selection and ctypes launch, likely through a lower-level
+combined launch path or stronger stream/launch ABI.

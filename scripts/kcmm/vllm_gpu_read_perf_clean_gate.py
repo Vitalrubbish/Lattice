@@ -300,6 +300,15 @@ def performance_clean_requirements(report: dict[str, Any]) -> dict[str, Any]:
         "write_device_slot_prepare_contiguous_copies": contract.get(
             "write_device_slot_prepare_contiguous_copies"
         ),
+        "write_row_prepare_direct_calls": contract.get(
+            "write_row_prepare_direct_calls"
+        ),
+        "write_row_prepare_fallback_calls": contract.get(
+            "write_row_prepare_fallback_calls"
+        ),
+        "write_row_prepare_contiguous_copies": contract.get(
+            "write_row_prepare_contiguous_copies"
+        ),
         "read_fast_current_context_launch": contract.get(
             "read_fast_current_context_launch"
         ),
@@ -827,6 +836,71 @@ def performance_clean_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
                     "value": contiguous_copies,
                 }
             )
+        row_direct_calls = contract.get("write_row_prepare_direct_calls")
+        row_fallback_calls = contract.get("write_row_prepare_fallback_calls")
+        row_contiguous_copies = contract.get(
+            "write_row_prepare_contiguous_copies"
+        )
+        single_request_gate = report.get("completion_concurrency") == 1
+        if not isinstance(row_direct_calls, int):
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_row_prepare_direct_calls_missing",
+                    "value": row_direct_calls,
+                }
+            )
+        elif single_request_gate and row_direct_calls <= 0:
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_row_prepare_direct_fast_path_unused",
+                    "value": row_direct_calls,
+                    "device_slot_write_calls": device_calls,
+                }
+            )
+        if not isinstance(row_fallback_calls, int):
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_row_prepare_fallback_calls_missing",
+                    "value": row_fallback_calls,
+                }
+            )
+        if not isinstance(row_contiguous_copies, int):
+            failures.append(
+                {
+                    "mode": "kcmm_gpu_read",
+                    "reason": "write_row_prepare_contiguous_copies_missing",
+                    "value": row_contiguous_copies,
+                }
+            )
+        if isinstance(row_direct_calls, int) and isinstance(row_fallback_calls, int):
+            if row_direct_calls + row_fallback_calls != device_calls:
+                failures.append(
+                    {
+                        "mode": "kcmm_gpu_read",
+                        "reason": "write_row_prepare_call_count_mismatch",
+                        "direct": row_direct_calls,
+                        "fallback": row_fallback_calls,
+                        "device_slot_write_calls": device_calls,
+                    }
+                )
+            if (
+                single_request_gate
+                and row_direct_calls <= row_fallback_calls
+            ):
+                failures.append(
+                    {
+                        "mode": "kcmm_gpu_read",
+                        "reason": (
+                            "write_row_prepare_direct_fast_path_not_dominant"
+                            "_in_single_request_gate"
+                        ),
+                        "direct": row_direct_calls,
+                        "fallback": row_fallback_calls,
+                    }
+                )
     status_checks = contract.get("write_device_slot_status_checks")
     if not isinstance(status_checks, int) or status_checks <= 0:
         failures.append(

@@ -169,6 +169,9 @@ class KcmmKvWriteMirrorTracker:
         self._device_slot_prepare_reshape_calls = 0
         self._device_slot_prepare_dtype_conversions = 0
         self._device_slot_prepare_contiguous_copies = 0
+        self._row_prepare_direct_calls = 0
+        self._row_prepare_fallback_calls = 0
+        self._row_prepare_contiguous_copies = 0
         self._device_slot_kernel_precompile_requested = self._should_use_device_slot_write()
         self._device_slot_kernel_precompile_calls = 0
         self._device_slot_kernel_precompile_succeeded = False
@@ -521,26 +524,48 @@ class KcmmKvWriteMirrorTracker:
         if str(getattr(value, "dtype", "")) != "torch.float16":
             raise KcmmError(f"KCMM KV write mirror requires FP16 value, got {value.dtype}")
 
-    @staticmethod
-    def _prepare_rows(key: Any, value: Any, batch: int) -> tuple[Any, Any]:
-        if _shape(key) is None or _shape(value) is None:
-            raise KcmmError("KCMM KV write mirror requires tensor-shaped key/value")
-        if int(key.shape[0]) != batch:
+    def _prepare_rows(self, key: Any, value: Any, batch: int) -> tuple[Any, Any]:
+        try:
+            key_batch = int(key.shape[0])
+            value_batch = int(value.shape[0])
+        except Exception as exc:
             raise KcmmError(
-                f"key batch {int(key.shape[0])} != slot_mapping batch {batch}"
+                "KCMM KV write mirror requires tensor-shaped key/value"
+            ) from exc
+        if key_batch != batch:
+            raise KcmmError(f"key batch {key_batch} != slot_mapping batch {batch}")
+        if value_batch != batch:
+            raise KcmmError(f"value batch {value_batch} != slot_mapping batch {batch}")
+
+        key_is_contiguous = self._is_contiguous_tensor(key)
+        value_is_contiguous = self._is_contiguous_tensor(value)
+        if key_is_contiguous and value_is_contiguous:
+            k_rows = key.view(batch, -1)
+            v_rows = value.view(batch, -1)
+            self._row_prepare_direct_calls += 1
+        else:
+            self._row_prepare_fallback_calls += 1
+            self._row_prepare_contiguous_copies += int(not key_is_contiguous) + int(
+                not value_is_contiguous
             )
-        if int(value.shape[0]) != batch:
-            raise KcmmError(
-                f"value batch {int(value.shape[0])} != slot_mapping batch {batch}"
-            )
-        k_rows = key.contiguous().view(batch, -1)
-        v_rows = value.contiguous().view(batch, -1)
+            k_rows = key.contiguous().view(batch, -1)
+            v_rows = value.contiguous().view(batch, -1)
         if int(k_rows.shape[1]) != int(v_rows.shape[1]):
             raise KcmmError(
                 "key/value row widths differ: "
                 f"key={int(k_rows.shape[1])} value={int(v_rows.shape[1])}"
             )
         return k_rows, v_rows
+
+    @staticmethod
+    def _is_contiguous_tensor(value: Any) -> bool:
+        method = getattr(value, "is_contiguous", None)
+        if not callable(method):
+            return False
+        try:
+            return bool(method())
+        except Exception:
+            return False
 
     def _verify_rows(
         self,
@@ -976,6 +1001,11 @@ class KcmmKvWriteMirrorTracker:
                 ),
                 "device_slot_prepare_contiguous_copies": (
                     self._device_slot_prepare_contiguous_copies
+                ),
+                "row_prepare_direct_calls": self._row_prepare_direct_calls,
+                "row_prepare_fallback_calls": self._row_prepare_fallback_calls,
+                "row_prepare_contiguous_copies": (
+                    self._row_prepare_contiguous_copies
                 ),
                 "stream_aware_write_calls": self._stream_aware_write_calls,
                 "forced_non_default_stream_calls": (
